@@ -582,7 +582,7 @@ mod tests {
             }
         });
 
-        let server = format!("http://{addr}");
+        let server = format!("http://{addr}").parse().unwrap();
         let (mut ctrl, _events) = Control::connect(&server, None).await.unwrap();
 
         assert_eq!(pick(&mut ctrl, None).await.unwrap(), "session:1111-aaaa");

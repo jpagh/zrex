@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::proto::{self, Incoming};
-use super::{CONNECT_TIME, control_url, frame, open};
+use super::{CONNECT_TIME, ServerAddress, frame};
 
 pub const SUBPROTOCOL: &str = "rex.control.v1";
 
@@ -26,9 +26,11 @@ pub struct Control {
 pub type Events = mpsc::UnboundedReceiver<(String, Value)>;
 
 impl Control {
-    pub async fn connect(server: &str, reconnect_token: Option<&str>) -> Result<(Self, Events)> {
-        let url = control_url(server)?;
-        let mut socket = open(&url, SUBPROTOCOL).await?;
+    pub async fn connect(
+        server: &ServerAddress,
+        reconnect_token: Option<&str>,
+    ) -> Result<(Self, Events)> {
+        let mut socket = server.open("/api/control", SUBPROTOCOL).await?;
 
         let hello = serde_json::to_string(&proto::hello(reconnect_token))?;
         tokio::time::timeout(CONNECT_TIME, socket.send(Message::text(hello)))
@@ -320,7 +322,7 @@ mod tests {
             .unwrap();
         });
 
-        let server = format!("http://{addr}");
+        let server = format!("http://{addr}").parse().unwrap();
         let (mut ctrl, mut events) = Control::connect(&server, Some("prev-tok")).await.unwrap();
         assert_eq!(ctrl.reconnect_token.as_deref(), Some("next-tok"));
 
