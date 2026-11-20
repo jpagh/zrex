@@ -5,7 +5,7 @@ _zrex() {
   local -a candidates
   while IFS= read -r candidate; do
     [[ -n $candidate ]] && candidates+=("$candidate")
-  done < <("${words[1]}" __complete "${words[2,-1]}" 2>/dev/null)
+  done < <("${words[1]}" __complete "${words[CURRENT]}" "${words[2,CURRENT-1]}" 2>/dev/null)
   compadd -- "${candidates[@]}"
 }
 
