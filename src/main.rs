@@ -59,43 +59,114 @@ enum Command {
     Kill {
         target: String,
     },
-    Completion(String),
+    Completion(Shell),
     Unknown(String),
 }
 
-fn parse_args<I>(args: I, env_server: Option<String>) -> Result<(Option<String>, Command)>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut server = env_server.filter(|address| !address.is_empty());
-    let mut command: Option<String> = None;
-    let mut target: Option<String> = None;
-    let mut window: Option<String> = None;
-    let mut block: Option<String> = None;
+#[derive(Debug, PartialEq, Eq)]
+enum Shell {
+    Zsh,
+    Bash,
+    Fish,
+}
 
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => return Ok((server, Command::Help)),
-            "-V" | "--version" => return Ok((server, Command::Version)),
-            "-S" | "--server" => match args.next() {
-                Some(value) => server = Some(value),
-                None => anyhow::bail!("--server needs an address"),
-            },
-            "-w" | "--window" => match args.next() {
-                Some(value) => window = Some(value),
-                None => anyhow::bail!("--window needs a window number, a label, or -"),
-            },
-            "-b" | "--block" => match args.next() {
-                Some(value) => block = Some(value),
-                None => anyhow::bail!("--block needs a block number, a label, or an ID"),
-            },
-            other if command.is_none() => command = Some(other.to_owned()),
-            other if target.is_none() => target = Some(other.to_owned()),
-            other => anyhow::bail!("unexpected argument {other}"),
+impl Shell {
+    fn script(&self) -> &'static str {
+        match self {
+            Self::Zsh => include_str!("../completions/zrex.zsh"),
+            Self::Bash => include_str!("../completions/zrex.bash"),
+            Self::Fish => include_str!("../completions/zrex.fish"),
         }
     }
+}
 
+#[derive(Clone, Copy)]
+enum ValueOption {
+    Server,
+    Window,
+    Block,
+}
+
+#[derive(Default)]
+struct Arguments {
+    server: Option<String>,
+    command: Option<String>,
+    target: Option<String>,
+    window: Option<String>,
+    block: Option<String>,
+    pending: Option<ValueOption>,
+    early_command: Option<Command>,
+}
+
+impl Arguments {
+    /// A value flag at the end is an error for execution, but completion
+    /// uses it to decide what kind of value to suggest.
+    fn scan(args: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut parsed = Self::default();
+        for arg in args {
+            if let Some(option) = parsed.pending.take() {
+                let slot = match option {
+                    ValueOption::Server => &mut parsed.server,
+                    ValueOption::Window => &mut parsed.window,
+                    ValueOption::Block => &mut parsed.block,
+                };
+                *slot = Some(arg);
+                continue;
+            }
+            match arg.as_str() {
+                "-h" | "--help" => parsed.early_command = Some(Command::Help),
+                "-V" | "--version" => parsed.early_command = Some(Command::Version),
+                "-S" | "--server" => parsed.pending = Some(ValueOption::Server),
+                "-w" | "--window" => parsed.pending = Some(ValueOption::Window),
+                "-b" | "--block" => parsed.pending = Some(ValueOption::Block),
+                _ if parsed.command.is_none() => parsed.command = Some(arg),
+                _ if parsed.target.is_none() => parsed.target = Some(arg),
+                _ => anyhow::bail!("unexpected argument {arg}"),
+            }
+            if parsed.early_command.is_some() {
+                break;
+            }
+        }
+        Ok(parsed)
+    }
+}
+
+fn configured_server(flag: Option<String>, env: Option<String>) -> Option<String> {
+    flag.or_else(|| env.filter(|address| !address.is_empty()))
+}
+
+async fn server_address(configured: Option<&str>) -> Result<ServerAddress> {
+    match configured {
+        Some(address) => address.parse(),
+        None => Ok(ServerAddress::local_or_loopback().await),
+    }
+}
+
+fn parse_args(
+    args: impl IntoIterator<Item = String>,
+    env_server: Option<String>,
+) -> Result<(Option<String>, Command)> {
+    let Arguments {
+        server,
+        command,
+        target,
+        window,
+        block,
+        pending,
+        early_command,
+    } = Arguments::scan(args)?;
+    let server = configured_server(server, env_server);
+    if let Some(command) = early_command {
+        return Ok((server, command));
+    }
+    match pending {
+        Some(ValueOption::Server) => anyhow::bail!("--server needs an address"),
+        Some(ValueOption::Window) => anyhow::bail!("--window needs a window number, a label, or -"),
+        Some(ValueOption::Block) => {
+            anyhow::bail!("--block needs a block number, a label, or an ID")
+        }
+        None => {}
+    }
     let cmd = match command.as_deref() {
         Some("ls") => Command::List,
         Some("a" | "attach") => Command::Attach {
@@ -108,7 +179,9 @@ where
             None => anyhow::bail!("kill needs a session"),
         },
         Some("completion") => match target.as_deref() {
-            Some(shell @ ("zsh" | "bash" | "fish")) => Command::Completion(shell.to_owned()),
+            Some("zsh") => Command::Completion(Shell::Zsh),
+            Some("bash") => Command::Completion(Shell::Bash),
+            Some("fish") => Command::Completion(Shell::Fish),
             Some(other) => {
                 anyhow::bail!("no completion script for {other}; use zsh, bash, or fish")
             }
@@ -127,15 +200,12 @@ async fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let first = args.next();
     if first.as_deref() == Some("__complete") {
-        complete(args.collect()).await;
+        complete(args).await;
         return Ok(());
     }
     let (configured_server, command) =
         parse_args(first.into_iter().chain(args), env::var("REX_SERVER").ok())?;
-    let server_address = || match configured_server.as_deref() {
-        Some(address) => address.parse(),
-        None => Ok(ServerAddress::local_or_loopback()),
-    };
+    let server = || server_address(configured_server.as_deref());
 
     match command {
         Command::Help => {
@@ -146,15 +216,15 @@ async fn main() -> Result<()> {
             println!("zrex {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::List => list(&server_address()?).await,
+        Command::List => list(&server().await?).await,
         Command::Attach {
             target,
             window,
             block,
-        } => app::attach(&server_address()?, target, window, block).await,
-        Command::Kill { target } => kill(&server_address()?, &target).await,
+        } => app::attach(&server().await?, target, window, block).await,
+        Command::Kill { target } => kill(&server().await?, &target).await,
         Command::Completion(shell) => {
-            print!("{}", completion_script(&shell));
+            print!("{}", shell.script());
             Ok(())
         }
         Command::Unknown(other) => {
@@ -198,7 +268,7 @@ async fn window_titles(
 ) -> HashMap<String, String> {
     let mut pending = Vec::new();
     for window in session::windows(view) {
-        let Some(block_id) = window.active_block_id else {
+        let Some(block_id) = window.focused_block_id else {
             continue;
         };
         let payload = json!({"session_id": session_id, "block_id": block_id});
@@ -313,76 +383,66 @@ enum Completion {
     Nothing,
 }
 
-/// Reads the words before the cursor the way `parse_args` does, but never fails.
-/// The shell passes the word being completed first, then the words before it.
-fn completion_context(current: &str, done: &[String]) -> Completion {
-    let mut command: Option<String> = None;
-    let mut target: Option<String> = None;
-    let mut window: Option<String> = None;
-    let mut index = 0;
-    while index < done.len() {
-        match done[index].as_str() {
-            "" => index += 1,
-            "-S" | "--server" | "-b" | "--block" => index += 2,
-            "-w" | "--window" => {
-                window = done.get(index + 1).cloned();
-                index += 2;
-            }
-            word if word.starts_with('-') => index += 1,
-            word if command.is_none() => {
-                command = Some(word.to_owned());
-                index += 1;
-            }
-            word if target.is_none() => {
-                target = Some(word.to_owned());
-                index += 1;
-            }
-            _ => index += 1,
-        }
+fn completion_context(current: &str, parsed: &Arguments) -> Completion {
+    if parsed.early_command.is_some() {
+        return Completion::Nothing;
     }
-    match done.last().map(String::as_str) {
-        Some("-S" | "--server") => return Completion::Nothing,
-        Some("-w" | "--window") => return Completion::Windows { session: target },
-        Some("-b" | "--block") => {
-            return Completion::Blocks {
-                session: target,
-                window,
+    match parsed.pending {
+        Some(ValueOption::Server) => return Completion::Nothing,
+        Some(ValueOption::Window) => {
+            return Completion::Windows {
+                session: parsed.target.clone(),
             };
         }
-        _ => {}
+        Some(ValueOption::Block) => {
+            return Completion::Blocks {
+                session: parsed.target.clone(),
+                window: parsed.window.clone(),
+            };
+        }
+        None => {}
     }
-    let attach = matches!(command.as_deref(), Some("a" | "attach"));
+    let command = parsed.command.as_deref();
+    let attach = matches!(command, Some("a" | "attach"));
     if current.starts_with('-') && current != "-" {
         return Completion::Flags { attach };
     }
-    match command.as_deref() {
+    match command {
         None => Completion::Commands,
-        Some("a" | "attach" | "kill") if target.is_none() => Completion::Sessions,
+        Some("a" | "attach" | "kill") if parsed.target.is_none() => Completion::Sessions,
         Some("a" | "attach") => Completion::Flags { attach: true },
         Some("kill" | "ls" | "completion") => Completion::Flags { attach: false },
         Some(_) => Completion::Nothing,
     }
 }
 
-async fn complete(args: Vec<String>) {
-    let Some((current, done)) = args.split_first() else {
+/// The shell passes the word being completed first, then the words before it.
+async fn complete(mut args: impl Iterator<Item = String>) {
+    let Some(current) = args.next() else {
         return;
     };
-    let context = completion_context(current, done);
-    if context == Completion::Nothing {
-        return;
-    }
-    let Some(server) = completion_server(done) else {
+    let Ok(parsed) = Arguments::scan(args) else {
         return;
     };
-    let candidates = match context {
+    let candidates = match completion_context(&current, &parsed) {
         Completion::Nothing => return,
         Completion::Commands => COMPLETION_COMMANDS.into_iter().map(str::to_owned).collect(),
         Completion::Flags { attach } => flags(attach),
-        Completion::Sessions => session_candidates(&server).await,
-        Completion::Windows { session } => window_candidates(&server, session.as_deref()).await,
-        Completion::Blocks { session, window } => {
-            block_candidates(&server, session.as_deref(), window.as_deref()).await
+        context => {
+            let configured = configured_server(parsed.server, env::var("REX_SERVER").ok());
+            let Ok(server) = server_address(configured.as_deref()).await else {
+                return;
+            };
+            match context {
+                Completion::Sessions => session_candidates(&server).await,
+                Completion::Windows { session } => {
+                    window_candidates(&server, session.as_deref()).await
+                }
+                Completion::Blocks { session, window } => {
+                    block_candidates(&server, session.as_deref(), window.as_deref()).await
+                }
+                _ => unreachable!(),
+            }
         }
     };
     let prefix = current.to_lowercase();
@@ -390,25 +450,6 @@ async fn complete(args: Vec<String>) {
         if candidate.to_lowercase().starts_with(&prefix) {
             println!("{candidate}");
         }
-    }
-}
-
-/// A completion runs in a fresh process, so it resolves the server the same way
-/// the command it completes will.
-fn completion_server(words: &[String]) -> Option<ServerAddress> {
-    let mut index = 0;
-    while index < words.len() {
-        if matches!(words[index].as_str(), "-S" | "--server") {
-            return words.get(index + 1)?.parse().ok();
-        }
-        index += 1;
-    }
-    match env::var("REX_SERVER")
-        .ok()
-        .filter(|address| !address.is_empty())
-    {
-        Some(address) => address.parse().ok(),
-        None => Some(ServerAddress::local_or_loopback()),
     }
 }
 
@@ -442,12 +483,7 @@ async fn session_candidates(server: &ServerAddress) -> Vec<String> {
 async fn view_for(server: &ServerAddress, target: Option<&str>) -> Option<Value> {
     let (mut ctrl, _events) = Control::connect(server, None).await.ok()?;
     let sessions = session::list_all(&mut ctrl).await.ok()?;
-    let session = match target {
-        Some(target) => sessions
-            .iter()
-            .find(|session| session::matches(session, target))?,
-        None => sessions.first()?,
-    };
+    let session = session::select_session(&sessions, target)?;
     session::view(&mut ctrl, &session::id_of(session))
         .await
         .ok()
@@ -481,31 +517,17 @@ async fn block_candidates(
     let Some(view) = view_for(server, target).await else {
         return Vec::new();
     };
+    // Completion runs after an explicit --block flag, so a dotted window
+    // label must resolve as-is, just as it will when the command runs.
     let windows = session::windows(&view);
-    let window = match window_selector {
-        Some(selector) => {
-            let window_id = session::find_window(&view, selector).or_else(|| {
-                selector
-                    .split_once('.')
-                    .and_then(|(window, _block)| session::find_window(&view, window))
-            });
-            window_id.and_then(|id| windows.into_iter().find(|window| window.id == id))
-        }
-        None => {
-            let active = session::active_window_id(&view);
-            windows
-                .into_iter()
-                .find(|window| Some(window.id.as_str()) == active)
-        }
-    };
-    let Some(window) = window else {
+    let Some(window) = session::select_window(&view, &windows, window_selector) else {
         return Vec::new();
     };
     let mut candidates = Vec::new();
-    for (number, block) in window.blocks.into_iter().enumerate() {
+    for (number, block) in window.blocks.iter().enumerate() {
         candidates.push((number + 1).to_string());
         if !block.label.is_empty() {
-            candidates.push(block.label);
+            candidates.push(block.label.clone());
         }
     }
     dedupe(candidates)
@@ -517,14 +539,6 @@ fn dedupe(items: Vec<String>) -> Vec<String> {
         .into_iter()
         .filter(|item| seen.insert(item.clone()))
         .collect()
-}
-
-fn completion_script(shell: &str) -> &'static str {
-    match shell {
-        "zsh" => include_str!("../completions/zrex.zsh"),
-        "bash" => include_str!("../completions/zrex.bash"),
-        _ => include_str!("../completions/zrex.fish"),
-    }
 }
 
 #[cfg(test)]
@@ -593,10 +607,33 @@ mod tests {
 
         assert_eq!(
             parse_args(args(&["completion", "zsh"]), None).unwrap().1,
-            Command::Completion("zsh".to_owned())
+            Command::Completion(Shell::Zsh)
         );
         assert!(parse_args(args(&["completion", "powershell"]), None).is_err());
         assert!(parse_args(args(&["completion"]), None).is_err());
+    }
+
+    #[test]
+    fn completion_uses_the_last_server_and_consumes_flag_values() {
+        let words = args(&[
+            "--server",
+            "http://first",
+            "attach",
+            "--window",
+            "--server",
+            "-S",
+            "https://last",
+            "--block",
+            "--window",
+        ]);
+        let parsed = Arguments::scan(words.clone()).unwrap();
+        assert_eq!(completion_context("", &parsed), Completion::Sessions);
+        assert_eq!(parsed.server.as_deref(), Some("https://last"));
+        assert_eq!(parsed.server, parse_args(words, None).unwrap().0);
+
+        let parsed = Arguments::scan(args(&["attach", "--window", "--server"])).unwrap();
+        assert_eq!(parsed.server, None);
+        assert_eq!(completion_context("", &parsed), Completion::Sessions);
     }
 
     #[test]
@@ -609,6 +646,7 @@ mod tests {
                     "window_id": "window:1",
                     "label": "Window one",
                     "focused_block_id": "block:2",
+                    "zoomed_block_id": "block:1",
                     "layers": [{
                         "layer_id": "layer:1",
                         "blocks": [
@@ -630,14 +668,16 @@ mod tests {
                 }
             ]
         });
+        let windows = session::windows(&view);
+        assert_eq!(windows[0].focused_block_id.as_deref(), Some("block:2"));
         let lines = format_session(&entry, Some(&view), 4, &HashMap::new());
         assert_eq!(
             lines,
             vec![
                 "work  session:1",
                 "  * 1  Window one",
-                "      1.1  Block one",
-                "    * 1.2  Block two",
+                "    * 1.1  Block one",
+                "      1.2  Block two",
                 "    2  Window two",
             ]
         );
@@ -658,6 +698,9 @@ mod tests {
 
     #[test]
     fn chooses_completion_from_the_words_so_far() {
+        fn completion_context(current: &str, words: &[String]) -> Completion {
+            super::completion_context(current, &Arguments::scan(words.iter().cloned()).unwrap())
+        }
         assert_eq!(completion_context("", &[]), Completion::Commands);
         assert_eq!(completion_context("", &args(&["a"])), Completion::Sessions);
         assert_eq!(

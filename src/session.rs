@@ -49,18 +49,14 @@ pub async fn ensure_window(
         return Ok((window_id, block.map(str::to_owned)));
     }
     let view = view(ctrl, session_id).await?;
-    if let Some(window_id) = find_window(&view, selector) {
-        return Ok((window_id, block.map(str::to_owned)));
+    if let Some((window, block)) = resolve_window(&windows(&view), selector, block) {
+        return Ok((window.id.clone(), block.map(str::to_owned)));
     }
     if block.is_none()
-        && let Some((win_sel, blk_sel)) = split_window_block(selector)
+        && let Some((win_sel, _)) = split_window_block(selector)
+        && win_sel.parse::<usize>().is_ok()
     {
-        if let Some(window_id) = find_window(&view, win_sel) {
-            return Ok((window_id, Some(blk_sel.to_owned())));
-        }
-        if win_sel.parse::<usize>().is_ok() {
-            bail!("the session has no window {win_sel}");
-        }
+        bail!("the session has no window {win_sel}");
     }
     if selector.parse::<usize>().is_ok() {
         bail!("the session has no window {selector}");
@@ -98,9 +94,16 @@ pub fn matches(session: &Value, target: &str) -> bool {
         || (target.len() >= 4 && id.ends_with(target))
 }
 
+pub fn select_session<'a>(sessions: &'a [Value], target: Option<&str>) -> Option<&'a Value> {
+    match target {
+        Some(target) => sessions.iter().find(|session| matches(session, target)),
+        None => sessions.first(),
+    }
+}
+
 pub async fn find_or_create(ctrl: &mut Control, target: &str) -> Result<String> {
     let sessions = list(ctrl).await?;
-    match sessions.iter().find(|session| matches(session, target)) {
+    match select_session(&sessions, Some(target)) {
         Some(session) => Ok(id_of(session)),
         None => create(ctrl, Some(target)).await,
     }
@@ -111,12 +114,10 @@ pub async fn pick(ctrl: &mut Control, target: Option<&str>) -> Result<String> {
     if sessions.is_empty() {
         bail!("the server has no sessions");
     }
-    let Some(target) = target else {
-        return Ok(id_of(&sessions[0]));
-    };
-    if let Some(session) = sessions.iter().find(|session| matches(session, target)) {
+    if let Some(session) = select_session(&sessions, target) {
         return Ok(id_of(session));
     }
+    let target = target.expect("a nonempty session list has a default");
     let known = sessions
         .iter()
         .map(|session| format!("  {} ({})", label_of(session), id_of(session)))
@@ -162,6 +163,7 @@ pub fn active_window_id(view: &Value) -> Option<&str> {
 pub struct WindowSummary {
     pub id: String,
     pub label: String,
+    pub focused_block_id: Option<String>,
     pub active_block_id: Option<String>,
     pub blocks: Vec<BlockSummary>,
 }
@@ -177,29 +179,17 @@ pub fn block_of(
     window_selector: Option<&str>,
     block_selector: Option<&str>,
 ) -> Option<String> {
-    let (window_id, block_sel) = match window_selector {
-        Some(selector) => {
-            if let Some(id) = find_window(view, selector) {
-                (id, block_selector)
-            } else if block_selector.is_none()
-                && let Some((win_sel, blk_sel)) = split_window_block(selector)
-                && let Some(id) = find_window(view, win_sel)
-            {
-                (id, Some(blk_sel))
-            } else {
-                return None;
-            }
-        }
-        None => (active_window_id(view)?.to_owned(), block_selector),
+    let windows = windows(view);
+    let (window, block_sel) = match window_selector {
+        Some(selector) => resolve_window(&windows, selector, block_selector)?,
+        None => (select_window(view, &windows, None)?, block_selector),
     };
-    let window = windows(view)
-        .into_iter()
-        .find(|window| window.id == window_id)?;
     match block_sel {
-        Some(selector) => find_block(&window, selector),
+        Some(selector) => find_block(window, selector),
         None => window
             .active_block_id
-            .or_else(|| window.blocks.into_iter().next().map(|block| block.id)),
+            .clone()
+            .or_else(|| window.blocks.first().map(|block| block.id.clone())),
     }
 }
 
@@ -216,11 +206,15 @@ pub fn windows(view: &Value) -> Vec<WindowSummary> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            let focused_block_id = window
+                .get("focused_block_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let active_block_id = window
                 .get("zoomed_block_id")
                 .and_then(Value::as_str)
-                .or_else(|| window.get("focused_block_id").and_then(Value::as_str))
-                .map(str::to_owned);
+                .map(str::to_owned)
+                .or_else(|| focused_block_id.clone());
             let mut blocks = Vec::new();
             if let Some(layers) = window.get("layers").and_then(Value::as_array) {
                 for layer in layers {
@@ -251,6 +245,7 @@ pub fn windows(view: &Value) -> Vec<WindowSummary> {
             Some(WindowSummary {
                 id,
                 label,
+                focused_block_id,
                 active_block_id,
                 blocks,
             })
@@ -314,25 +309,53 @@ fn layer_holds(layer: &Value, block_id: &str) -> bool {
     listed || drawn
 }
 
-pub fn find_window(view: &Value, selector: &str) -> Option<String> {
-    let windows = windows(view);
+pub fn select_window<'a>(
+    view: &Value,
+    windows: &'a [WindowSummary],
+    selector: Option<&str>,
+) -> Option<&'a WindowSummary> {
+    match selector {
+        Some("-") => None,
+        Some(selector) => find_window(windows, selector),
+        None => {
+            let id = active_window_id(view)?;
+            windows.iter().find(|window| window.id == id)
+        }
+    }
+}
+
+fn resolve_window<'a, 's>(
+    windows: &'a [WindowSummary],
+    selector: &'s str,
+    block: Option<&'s str>,
+) -> Option<(&'a WindowSummary, Option<&'s str>)> {
+    if let Some(window) = find_window(windows, selector) {
+        return Some((window, block));
+    }
+    if block.is_none() {
+        let (window, block) = split_window_block(selector)?;
+        return Some((find_window(windows, window)?, Some(block)));
+    }
+    None
+}
+
+fn find_window<'a>(windows: &'a [WindowSummary], selector: &str) -> Option<&'a WindowSummary> {
     if let Some(window) = windows.iter().find(|window| window.id == selector) {
-        return Some(window.id.clone());
+        return Some(window);
     }
     if let Ok(number) = selector.parse::<usize>()
         && let Some(window) = number.checked_sub(1).and_then(|idx| windows.get(idx))
     {
-        return Some(window.id.clone());
+        return Some(window);
     }
     if let Some(window) = windows.iter().find(|window| window.label == selector) {
-        return Some(window.id.clone());
+        return Some(window);
     }
     only(
         windows
             .iter()
             .filter(|window| window.label.starts_with(selector)),
     )
-    .map(|window| window.id.clone())
 }
 
 pub fn find_block(window: &WindowSummary, selector: &str) -> Option<String> {
@@ -449,13 +472,15 @@ mod tests {
     #[test]
     fn finds_a_window_by_number_or_label() {
         let view = sample_view(&["build", "logs", "logs-old"], "build");
-        assert_eq!(find_window(&view, "2").as_deref(), Some("window:logs"));
-        assert_eq!(find_window(&view, "0"), None);
-        assert_eq!(find_window(&view, "4"), None);
-        assert_eq!(find_window(&view, "logs").as_deref(), Some("window:logs"));
-        assert_eq!(find_window(&view, "log"), None);
-        assert_eq!(find_window(&view, "build").as_deref(), Some("window:build"));
-        assert_eq!(find_window(&view, "nope"), None);
+        let windows = windows(&view);
+        let id = |selector| select_window(&view, &windows, selector).map(|w| w.id.as_str());
+        assert_eq!(id(Some("2")), Some("window:logs"));
+        assert_eq!(id(Some("0")), None);
+        assert_eq!(id(Some("4")), None);
+        assert_eq!(id(Some("logs")), Some("window:logs"));
+        assert_eq!(id(Some("log")), None);
+        assert_eq!(id(Some("build")), Some("window:build"));
+        assert_eq!(id(Some("nope")), None);
     }
 
     #[test]
