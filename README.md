@@ -64,7 +64,7 @@ Run `zrex pick`, type to filter, and use the arrow keys (or `Tab`/`Shift-Tab`) a
 
 Use `Alt/Option-←` and `Alt/Option-→` to move by word. `Ctrl-←`/`Ctrl-→` and `Alt-B`/`Alt-F` also work, depending on what your terminal sends. `Home`/`End` or `Ctrl-A`/`Ctrl-E` go to the start or end of the query.
 
-Alongside the window and split labels, the picker shows the terminal title and OSC 7501 program status when Rex has them. You can search the displayed text, for example `blocked` or an agent name. If a pane reports multiple statuses, the picker shows the one that most needs attention. Titles and statuses are fetched when the picker opens.
+Each row shows the server, session, window/split index, foreground process (and any custom window or split label), plus the terminal title and OSC 7501 program status when Rex has them. You can search the displayed text, for example `blocked`, `zsh`, or `zrex 22`. If a pane reports multiple statuses, the picker shows the one that most needs attention. Metadata is fetched when the picker opens.
 
 To search multiple servers, save their names and addresses in `~/.config/zrex/config.toml` (or `$XDG_CONFIG_HOME/zrex/config.toml`):
 

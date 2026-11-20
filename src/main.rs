@@ -311,14 +311,19 @@ async fn window_titles(
         let Some(block_id) = window.focused_block_id else {
             continue;
         };
-        if let Ok(reply) = session::start_terminal_title(ctrl, session_id, &block_id) {
-            pending.push((window.id, reply));
+        if let Ok(title_reply) = session::start_terminal_title(ctrl, session_id, &block_id) {
+            let process_reply = session::start_terminal_process(ctrl, session_id, &block_id).ok();
+            pending.push((window.id, title_reply, process_reply));
         }
     }
     let mut titles = HashMap::new();
-    for (window_id, reply) in pending {
-        if let Ok(Ok(reply)) = reply.await
-            && let Some(title) = session::terminal_title_of(&reply)
+    for (window_id, title_reply, process_reply) in pending {
+        let process_reply = match process_reply {
+            Some(reply) => reply.await.ok().and_then(Result::ok),
+            None => None,
+        };
+        if let Ok(Ok(title_reply)) = title_reply.await
+            && let Some(title) = session::live_terminal_title(&title_reply, process_reply.as_ref())
         {
             titles.insert(window_id, title.to_owned());
         }

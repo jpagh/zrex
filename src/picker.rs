@@ -57,10 +57,45 @@ pub(super) struct StyledSpan {
 
 pub(super) struct Target {
     label: String,
+    label_parts: TargetLabel,
     title: String,
     status: Option<ProgramStatus>,
     session_id: String,
     block_id: String,
+}
+
+struct TargetLabel {
+    prefix: String,
+    window: Option<String>,
+    block: Option<String>,
+    fallback: String,
+}
+
+impl TargetLabel {
+    fn format(&self, process: Option<&str>) -> String {
+        let mut detail = Vec::new();
+        if let Some(window) = &self.window {
+            detail.push(window.as_str());
+        }
+        if let Some(block) = &self.block
+            && !detail.iter().any(|part| part.eq_ignore_ascii_case(block))
+        {
+            detail.push(block.as_str());
+        }
+        if let Some(process) = process
+            && !detail.iter().any(|part| part.eq_ignore_ascii_case(process))
+        {
+            detail.push(process);
+        }
+        if detail.is_empty() && !self.fallback.is_empty() {
+            detail.push(self.fallback.as_str());
+        }
+        if detail.is_empty() {
+            self.prefix.clone()
+        } else {
+            format!("{} {}", self.prefix, detail.join(" / "))
+        }
+    }
 }
 
 pub async fn run(server_config: &ServerConfig) -> Result<()> {
@@ -274,29 +309,34 @@ fn describe_targets(
                 "com.superlogical.terminal.program_status",
                 json!({"session_id": target.session_id, "block_id": target.block_id}),
             );
-            (title, status)
+            let process =
+                session::start_terminal_process(ctrl, &target.session_id, &target.block_id);
+            (title, status, process)
         });
     }
     async move {
         let details: HashMap<_, _> = join_all(requests.into_iter().map(
-            |(id, (title, status))| async move {
-                let (title, status) = tokio::join!(
+            |(id, (title, status, process))| async move {
+                let (title, status, process) = tokio::join!(
                     optional_reply(deadline, title),
-                    optional_reply(deadline, status)
+                    optional_reply(deadline, status),
+                    optional_reply(deadline, process)
                 );
                 let title = title
                     .as_ref()
-                    .and_then(session::terminal_title_of)
+                    .and_then(|reply| session::live_terminal_title(reply, process.as_ref()))
                     .map_or_else(String::new, |title| clean_truncated(title, 64));
                 let status = status.as_ref().and_then(status_summary);
-                (id, (title, status))
+                let process = process.as_ref().and_then(process_name);
+                (id, (title, status, process))
             },
         ))
         .await
         .into_iter()
         .collect();
         for target in &mut targets {
-            if let Some((title, status)) = details.get(&target.block_id) {
+            if let Some((title, status, process)) = details.get(&target.block_id) {
+                target.label = target.label_parts.format(process.as_deref());
                 target.title.clone_from(title);
                 target.status.clone_from(status);
             }
@@ -396,6 +436,72 @@ fn clean_json_field(value: &Value, key: &str, max_chars: usize) -> String {
     )
 }
 
+fn process_name(reply: &Value) -> Option<String> {
+    reply
+        .get("foreground")
+        .and_then(label_for_process)
+        .or_else(|| reply.get("child").and_then(label_for_process))
+}
+
+/// Follows Rex's `com.superlogical.terminal.process` guidance: prefer `script`,
+/// then `argv0`, then `name`, reduced to a short display name.
+fn label_for_process(process: &Value) -> Option<String> {
+    if process.is_null() {
+        return None;
+    }
+    for (key, strip_login_dash) in [("script", false), ("argv0", true), ("name", false)] {
+        let Some(raw) = process.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let cleaned = clean_one_line(raw);
+        let candidate = if strip_login_dash {
+            cleaned.strip_prefix('-').unwrap_or(&cleaned)
+        } else {
+            &cleaned
+        };
+        let base = basename(candidate);
+        let base = if strip_login_dash {
+            base.strip_prefix('-').unwrap_or(base)
+        } else {
+            base
+        };
+        let short = clean_truncated(base, 24);
+        if !short.is_empty() {
+            return Some(short);
+        }
+    }
+    None
+}
+
+fn basename(value: &str) -> &str {
+    let trimmed = value.trim_end_matches(['/', '\\']);
+    trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
+}
+
+fn custom_window_label(label: &str) -> Option<String> {
+    let clean = clean_one_line(label);
+    if clean.is_empty() || is_default_window_label(&clean) {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+fn is_default_window_label(label: &str) -> bool {
+    label
+        .strip_prefix("Window ")
+        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn custom_block_label(label: &str) -> Option<String> {
+    let clean = clean_one_line(label);
+    if clean.is_empty() || clean.eq_ignore_ascii_case("shell") {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
 fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<Target> {
     let session = format!(
         "[{}] {}",
@@ -403,9 +509,11 @@ fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<T
         label_or_id(session::label_of(entry), session_id)
     );
     let mut targets = Vec::new();
-    let mut add = |label: String, block_id: &str| {
+    let mut add = |label_parts: TargetLabel, block_id: &str| {
+        let label = label_parts.format(None);
         targets.push(Target {
             label,
+            label_parts,
             title: String::new(),
             status: None,
             session_id: session_id.to_owned(),
@@ -415,23 +523,44 @@ fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<T
     let windows = session::windows(view);
     for (index, window) in windows.iter().enumerate() {
         let number = index + 1;
-        let name = format!(
-            "{session} / {number} {}",
-            label_or_id(&window.label, &window.id)
-        );
+        let window_label = custom_window_label(&window.label);
         if window.blocks.len() > 1 {
-            for (index, block) in window.blocks.iter().enumerate() {
+            for (split_index, block) in window.blocks.iter().enumerate() {
+                let fallback = label_or_id(&block.label, &block.id);
                 add(
-                    format!(
-                        "{name} / {number}.{} {}",
-                        index + 1,
-                        label_or_id(&block.label, &block.id)
-                    ),
+                    TargetLabel {
+                        prefix: format!("{session} / {number}.{}", split_index + 1),
+                        window: window_label.clone(),
+                        block: custom_block_label(&block.label),
+                        fallback,
+                    },
                     &block.id,
                 );
             }
         } else if let Some(block_id) = window.active_or_first_block_id() {
-            add(name, block_id);
+            let block_label = window
+                .blocks
+                .iter()
+                .find(|block| block.id == block_id)
+                .map(|block| block.label.as_str())
+                .unwrap_or_default();
+            let fallback = {
+                let clean = clean_one_line(block_label);
+                if clean.is_empty() {
+                    label_or_id(&window.label, &window.id)
+                } else {
+                    clean
+                }
+            };
+            add(
+                TargetLabel {
+                    prefix: format!("{session} / {number}"),
+                    window: window_label,
+                    block: custom_block_label(block_label),
+                    fallback,
+                },
+                block_id,
+            );
         }
     }
     targets
@@ -696,6 +825,12 @@ mod tests {
         };
         Target {
             label: label.to_owned(),
+            label_parts: TargetLabel {
+                prefix: label.to_owned(),
+                window: None,
+                block: None,
+                fallback: String::new(),
+            },
             title: title.to_owned(),
             status,
             session_id: "session:1".to_owned(),
@@ -824,44 +959,122 @@ mod tests {
     }
 
     #[test]
-    fn targets_list_each_attachable_block_once() {
-        let entry = json!({"session_id": "session:1", "label": "work"});
+    fn process_name_prefers_script_then_argv0_then_name() {
+        assert_eq!(
+            process_name(&json!({
+                "foreground": {
+                    "script": "/opt/homebrew/bin/agy",
+                    "argv0": "node",
+                    "name": "node"
+                }
+            }))
+            .as_deref(),
+            Some("agy")
+        );
+        assert_eq!(
+            process_name(&json!({
+                "foreground": {
+                    "argv0": "-zsh",
+                    "name": "zsh"
+                }
+            }))
+            .as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(
+            process_name(&json!({
+                "foreground": {
+                    "argv0": "/bin/zsh",
+                    "name": "zsh"
+                }
+            }))
+            .as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(
+            process_name(&json!({
+                "foreground": null,
+                "child": {
+                    "argv0": "",
+                    "name": "fish"
+                }
+            }))
+            .as_deref(),
+            Some("fish")
+        );
+        assert_eq!(
+            process_name(&json!({"foreground": null, "child": null})),
+            None
+        );
+    }
+
+    #[test]
+    fn targets_hide_default_window_and_shell_labels_and_show_process() {
+        let entry = json!({"session_id": "session:1", "label": "zrex"});
         let view = json!({
             "active_window_id": "window:1",
             "windows": [
                 {
                     "window_id": "window:1",
-                    "label": "dev",
-                    "focused_block_id": "block:2",
+                    "label": "Window 3926b0bc",
+                    "focused_block_id": "block:1",
                     "layers": [{
                         "blocks": [
-                            {"block_id": "block:1", "label": "editor"},
-                            {"block_id": "block:2", "label": ""}
+                            {"block_id": "block:1", "label": "shell"}
                         ]
                     }]
                 },
                 {
                     "window_id": "window:2",
-                    "label": "",
+                    "label": "Window 1133dbdb",
+                    "focused_block_id": "block:3",
                     "layers": [{
                         "blocks": [
-                            {"block_id": "block:3", "label": "logs"}
+                            {"block_id": "block:2", "label": "shell"},
+                            {"block_id": "block:3", "label": "shell"}
+                        ]
+                    }]
+                },
+                {
+                    "window_id": "window:3",
+                    "label": "dev",
+                    "focused_block_id": "block:4",
+                    "layers": [{
+                        "blocks": [
+                            {"block_id": "block:4", "label": "editor"},
+                            {"block_id": "block:5", "label": "shell"}
                         ]
                     }]
                 }
             ]
         });
-        let list = targets("office", &entry, "session:1", &view);
-        let pairs: Vec<_> = list
+        let list = targets("local", &entry, "session:1", &view);
+        assert_eq!(
+            list.iter()
+                .map(|t| (t.label.as_str(), t.block_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("[local] zrex / 1 shell", "block:1"),
+                ("[local] zrex / 2.1 shell", "block:2"),
+                ("[local] zrex / 2.2 shell", "block:3"),
+                ("[local] zrex / 3.1 dev / editor", "block:4"),
+                ("[local] zrex / 3.2 dev", "block:5"),
+            ]
+        );
+
+        let with_processes: Vec<_> = list
             .iter()
-            .map(|t| (t.label.as_str(), t.block_id.as_str()))
+            .zip(["agy", "zsh", "zsh", "nvim", "zsh"])
+            .map(|(target, proc)| target.label_parts.format(Some(proc)))
             .collect();
         assert_eq!(
-            pairs,
+            with_processes,
             vec![
-                ("[office] work / 1 dev / 1.1 editor", "block:1"),
-                ("[office] work / 1 dev / 1.2 block:2", "block:2"),
-                ("[office] work / 2 window:2", "block:3"),
+                "[local] zrex / 1 agy",
+                "[local] zrex / 2.1 zsh",
+                "[local] zrex / 2.2 zsh",
+                "[local] zrex / 3.1 dev / editor / nvim",
+                "[local] zrex / 3.2 dev / zsh",
             ]
         );
     }

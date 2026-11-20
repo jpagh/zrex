@@ -48,11 +48,71 @@ pub fn start_terminal_title(
     )
 }
 
+pub fn start_terminal_process(
+    ctrl: &mut Control,
+    session_id: &str,
+    block_id: &str,
+) -> Result<PendingCall> {
+    ctrl.start_call(
+        "com.superlogical.terminal.process",
+        json!({"session_id": session_id, "block_id": block_id}),
+    )
+}
+
 pub fn terminal_title_of(reply: &Value) -> Option<&str> {
     reply
         .get("title")
         .and_then(Value::as_str)
         .filter(|title| !title.is_empty())
+}
+
+/// Returns the terminal title unless its `owner` is known to have exited from
+/// the pane's live process tree.
+pub fn live_terminal_title<'a>(
+    title_reply: &'a Value,
+    process_reply: Option<&Value>,
+) -> Option<&'a str> {
+    let title = terminal_title_of(title_reply)?;
+    let Some(owner) = title_reply.get("owner").and_then(process_identity) else {
+        return Some(title);
+    };
+    let Some(process_reply) = process_reply else {
+        return Some(title);
+    };
+
+    let mut saw_live = false;
+    let live = [process_reply.get("foreground"), process_reply.get("child")]
+        .into_iter()
+        .flatten()
+        .chain(
+            process_reply
+                .get("ancestors")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+        .filter_map(process_identity);
+    for identity in live {
+        saw_live = true;
+        if identity == owner {
+            return Some(title);
+        }
+    }
+
+    let exited = process_reply
+        .get("last_exit")
+        .is_some_and(|value| !value.is_null());
+    if saw_live || exited {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn process_identity(value: &Value) -> Option<(i64, &str)> {
+    let pid = value.get("pid")?.as_i64()?;
+    let name = value.get("name")?.as_str()?;
+    Some((pid, name))
 }
 
 pub async fn destroy(ctrl: &mut Control, session_id: &str) -> Result<()> {
@@ -699,6 +759,69 @@ mod tests {
                 .await
                 .unwrap(),
             ("window:2".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn filters_stale_terminal_titles_using_process_owner() {
+        let pi_title = json!({
+            "title": "π - jack",
+            "owner": {"pid": 420, "name": "node"}
+        });
+        let pi_running = json!({
+            "last_exit": null,
+            "foreground": {"pid": 420, "name": "node"},
+            "child": {"pid": 100, "name": "login"},
+            "ancestors": [{"pid": 200, "name": "zsh"}]
+        });
+        assert_eq!(
+            live_terminal_title(&pi_title, Some(&pi_running)),
+            Some("π - jack")
+        );
+
+        let pi_in_ancestors = json!({
+            "last_exit": null,
+            "foreground": {"pid": 500, "name": "cargo"},
+            "ancestors": [{"pid": 420, "name": "node"}, {"pid": 200, "name": "zsh"}]
+        });
+        assert_eq!(
+            live_terminal_title(&pi_title, Some(&pi_in_ancestors)),
+            Some("π - jack")
+        );
+
+        // Process exited back to zsh -> stale title is dropped.
+        let back_to_zsh = json!({
+            "last_exit": null,
+            "foreground": {"pid": 200, "name": "zsh"},
+            "child": {"pid": 100, "name": "login"}
+        });
+        assert_eq!(live_terminal_title(&pi_title, Some(&back_to_zsh)), None);
+
+        // PID reused by a different executable name -> still stale.
+        let reused_pid = json!({
+            "last_exit": null,
+            "foreground": {"pid": 420, "name": "zsh"}
+        });
+        assert_eq!(live_terminal_title(&pi_title, Some(&reused_pid)), None);
+
+        // Terminal exited completely -> stale.
+        let exited = json!({
+            "last_exit": {"exit_code": 0},
+            "foreground": null,
+            "child": null
+        });
+        assert_eq!(live_terminal_title(&pi_title, Some(&exited)), None);
+
+        // Missing owner or unreadable process list preserves the title.
+        let unowned = json!({"title": "manual title"});
+        assert_eq!(
+            live_terminal_title(&unowned, Some(&back_to_zsh)),
+            Some("manual title")
+        );
+        assert_eq!(live_terminal_title(&pi_title, None), Some("π - jack"));
+        assert_eq!(
+            live_terminal_title(&pi_title, Some(&json!({"last_exit": null}))),
+            Some("π - jack")
         );
     }
 }
