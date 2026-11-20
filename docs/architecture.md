@@ -9,7 +9,7 @@
 | `src/main.rs` | CLI parsing (`ls`, `a`/`attach`, `kill`) and session/window/split listing |
 | `src/app.rs` | Attach lifecycle: bootstrap, block ownership, sizing, VT stream priming, raw I/O pass-through, events, and reconnection |
 | `src/session.rs` | Session lookup/creation and `session.view` queries for windows and split blocks |
-| `src/rex/mod.rs` | WebSocket connection setup, URL construction, and frame helpers |
+| `src/rex/mod.rs` | Server address parsing, local socket discovery, WebSocket connection setup, and frame helpers |
 | `src/rex/proto.rs` | Control connection JSON messages, responses, and event envelope unwrapping |
 | `src/rex/control.rs` | Multiplexed `/api/control` client with background reader and writer tasks |
 | `src/rex/data.rs` | `/api/data` stream client, binary handshake (`HELLO`/`WELCOME`), and `RESUME` support |
@@ -24,7 +24,7 @@ curl https://server.example/llms.txt      # protocol guide
 curl https://server.example/api/help      # method reference and JSON schemas
 ```
 
-A client uses two WebSockets:
+A client uses two WebSockets, over TCP/TLS or a Unix socket:
 
 1. **Control (`/api/control`, subprotocol `rex.control.v1`)**:
    Carries JSON messages (`hello`, `welcome`, `request`, `response`, and `event`). All RPC method calls and server/session events travel over this connection.

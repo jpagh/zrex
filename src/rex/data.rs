@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{CONNECT_TIME, data_url, frame, open as open_socket};
+use super::{CONNECT_TIME, ServerAddress, frame};
 
 pub const SUBPROTOCOL: &str = "rex.data.terminal.v1";
 
@@ -46,17 +46,16 @@ pub struct Data {
 }
 
 impl Data {
-    pub async fn open(server: &str, ticket: &str) -> Result<Self> {
+    pub async fn open(server: &ServerAddress, ticket: &str) -> Result<Self> {
         Self::connect(server, encode_hello(ticket)?).await
     }
 
-    pub async fn resume(server: &str, token: [u8; 16], received: u64) -> Result<Self> {
+    pub async fn resume(server: &ServerAddress, token: [u8; 16], received: u64) -> Result<Self> {
         Self::connect(server, encode_resume(token, received)).await
     }
 
-    async fn connect(server: &str, handshake: Vec<u8>) -> Result<Self> {
-        let url = data_url(server)?;
-        let mut ws = open_socket(&url, SUBPROTOCOL).await?;
+    async fn connect(server: &ServerAddress, handshake: Vec<u8>) -> Result<Self> {
+        let mut ws = server.open("/api/data", SUBPROTOCOL).await?;
         tokio::time::timeout(CONNECT_TIME, ws.send(Message::Binary(handshake.into())))
             .await
             .map_err(|_| {
@@ -250,7 +249,7 @@ mod tests {
             .unwrap();
         });
 
-        let server = format!("http://{addr}");
+        let server = format!("http://{addr}").parse().unwrap();
         let ticket = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([1u8; 16]);
         let mut data = Data::open(&server, &ticket).await.unwrap();
         assert_eq!(data.nonce, 12345);

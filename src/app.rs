@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
+use crate::rex::ServerAddress;
 use crate::rex::control::{Control, Events};
 use crate::rex::data::{self, Data, StreamClosed};
 use crate::rex::proto;
@@ -108,7 +109,7 @@ pub fn ensure_terminal() -> Result<()> {
 }
 
 pub async fn attach(
-    server: &str,
+    server: &ServerAddress,
     target: Option<String>,
     window: Option<String>,
     block: Option<String>,
@@ -323,7 +324,6 @@ impl Ending {
 }
 
 struct Attached {
-    server: String,
     session_id: String,
     block_id: String,
     client_id: String,
@@ -344,7 +344,7 @@ impl Attached {
     async fn start(
         ctrl: &mut Control,
         session_id: &str,
-        server: &str,
+        server: &ServerAddress,
         window: Option<&str>,
         block: Option<&str>,
         (cols, rows): (u16, u16),
@@ -391,7 +391,6 @@ impl Attached {
         let data = Data::open(server, &ticket).await?;
         let filter = Filter::new(data.nonce);
         let attached = Self {
-            server: server.to_owned(),
             session_id: session_id.to_owned(),
             block_id,
             client_id,
@@ -682,7 +681,11 @@ impl Attached {
         Ok(())
     }
 
-    async fn reconnect(&mut self, ctrl: &mut Control) -> Result<Option<Ending>> {
+    async fn reconnect(
+        &mut self,
+        ctrl: &mut Control,
+        server: &ServerAddress,
+    ) -> Result<Option<Ending>> {
         let bootstrap = ctrl
             .call(
                 "session.bootstrap",
@@ -710,7 +713,7 @@ impl Attached {
         let owner = session::owner_of(view, &self.block_id);
         if owner.is_some_and(|owner| owner != self.client_id) {
             self.owns = false;
-            self.reconnect_data(ctrl).await?;
+            self.reconnect_data(ctrl, server).await?;
             return Ok(None);
         }
         if let Err(error) = finish_call(start_take(ctrl, &self.session_id, &self.block_id)?).await {
@@ -723,12 +726,12 @@ impl Attached {
         }
         self.owns = true;
         self.sync(ctrl, Push::Both).await?;
-        self.reconnect_data(ctrl).await?;
+        self.reconnect_data(ctrl, server).await?;
         Ok(None)
     }
 
-    async fn reconnect_data(&mut self, ctrl: &mut Control) -> Result<()> {
-        match Data::resume(&self.server, self.data.token, self.data.received).await {
+    async fn reconnect_data(&mut self, ctrl: &mut Control, server: &ServerAddress) -> Result<()> {
+        match Data::resume(server, self.data.token, self.data.received).await {
             Ok(data) => {
                 self.filter = Filter::new(data.nonce);
                 self.data = data;
@@ -736,7 +739,7 @@ impl Attached {
             }
             Err(_) => {
                 let ticket = ticket(ctrl, &self.session_id, &self.block_id).await?;
-                self.data = Data::open(&self.server, &ticket).await?;
+                self.data = Data::open(server, &ticket).await?;
                 self.filter = Filter::new(self.data.nonce);
                 self.pending.clear();
                 self.primed = false;
@@ -1283,7 +1286,7 @@ enum Recovered {
 }
 
 async fn recover(
-    server: &str,
+    server: &ServerAddress,
     token: &mut Option<String>,
     ctrl: &mut Control,
     events: &mut Events,
@@ -1317,7 +1320,7 @@ async fn recover(
 }
 
 async fn attempt(
-    server: &str,
+    server: &ServerAddress,
     token: &mut Option<String>,
     ctrl: &mut Control,
     events: &mut Events,
@@ -1329,7 +1332,7 @@ async fn attempt(
         *ctrl = new_ctrl;
         *events = new_events;
     }
-    attached.reconnect(ctrl).await
+    attached.reconnect(ctrl, server).await
 }
 
 fn backoff(delay: Duration) -> Duration {
@@ -1926,9 +1929,8 @@ mod tests {
             (wrote, theme_calls, take_calls)
         });
 
-        let (mut ctrl, _events) = Control::connect(&format!("http://{addr}"), None)
-            .await
-            .unwrap();
+        let address = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, _events) = Control::connect(&address, None).await.unwrap();
         let theme = Theme {
             foreground: Some("#000000".to_owned()),
             background: Some("#ffffff".to_owned()),
@@ -1939,7 +1941,7 @@ mod tests {
         let mut attached = Attached::start(
             &mut ctrl,
             "session:1",
-            &format!("http://{addr}"),
+            &address,
             None,
             None,
             (40, 10),
