@@ -262,7 +262,7 @@ fn describe_targets(
                 );
                 let title = title
                     .as_ref()
-                    .map_or_else(String::new, |reply| field(reply, "title", 64));
+                    .map_or_else(String::new, |reply| clean_json_field(reply, "title", 64));
                 let status = status.as_ref().and_then(status_summary);
                 (id, (title, status))
             },
@@ -282,47 +282,80 @@ fn describe_targets(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProgramState {
+    Blocked,
+    Error,
+    Working,
+    Done,
+    Idle,
+}
+
+impl ProgramState {
+    fn from_str(state: &str) -> Self {
+        match state {
+            "blocked" => Self::Blocked,
+            "error" => Self::Error,
+            "working" => Self::Working,
+            "done" => Self::Done,
+            _ => Self::Idle,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Error => "error",
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Idle => "idle",
+        }
+    }
+
+    fn shows_kind(self) -> bool {
+        self == Self::Blocked
+    }
+
+    fn shows_progress(self) -> bool {
+        matches!(self, Self::Working | Self::Blocked)
+    }
+}
+
 fn status_summary(reply: &Value) -> Option<String> {
     let records = reply.get("records")?.as_array()?;
     // Surface the record most likely to need attention. Keep the server's
     // root-first order when records have the same priority.
-    let (record, state, _) = records
+    let (record, state) = records
         .iter()
         .filter_map(|record| {
-            let (state, priority) = match record.get("state")?.as_str()? {
-                "blocked" => ("blocked", 0),
-                "error" => ("error", 1),
-                "working" => ("working", 2),
-                "done" => ("done", 3),
-                _ => ("idle", 4),
-            };
-            Some((record, state, priority))
+            let state = ProgramState::from_str(record.get("state")?.as_str()?);
+            Some((record, state))
         })
-        .min_by_key(|(_, _, priority)| *priority)?;
-    let app = field(record, "effective_app", 24);
+        .min_by_key(|(_, state)| *state)?;
+    let app = clean_json_field(record, "effective_app", 24);
     let app = if app.is_empty() {
-        field(record, "app", 24)
+        clean_json_field(record, "app", 24)
     } else {
         app
     };
     let mut summary = if app.is_empty() {
-        state.to_owned()
+        state.label().to_owned()
     } else {
-        format!("{state} {app}")
+        format!("{} {app}", state.label())
     };
-    if state == "blocked"
+    if state.shows_kind()
         && let Some(kind @ ("permission" | "question" | "auth")) =
             record.get("kind").and_then(Value::as_str)
     {
         summary.push_str(&format!(" ({kind})"));
     }
-    if matches!(state, "working" | "blocked")
+    if state.shows_progress()
         && let Some(progress @ 0..=100) = record.get("progress").and_then(Value::as_u64)
     {
         summary.push_str(&format!(" {progress}%"));
     }
-    let title = field(record, "title", 40);
-    let message = field(record, "msg", 50);
+    let title = clean_json_field(record, "title", 40);
+    let message = clean_json_field(record, "msg", 50);
     for detail in [&title, &message]
         .into_iter()
         .filter(|detail| !detail.is_empty())
@@ -333,7 +366,7 @@ fn status_summary(reply: &Value) -> Option<String> {
     Some(summary)
 }
 
-fn field(value: &Value, key: &str, max_chars: usize) -> String {
+fn clean_json_field(value: &Value, key: &str, max_chars: usize) -> String {
     let clean = one_line(value.get(key).and_then(Value::as_str).unwrap_or_default());
     let mut chars = clean.chars();
     let mut short: String = chars.by_ref().take(max_chars).collect();
@@ -462,6 +495,34 @@ fn one_line(text: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn status_summary_picks_highest_priority_and_formats_details() {
+        let reply = json!({
+            "records": [
+                {"state": "working", "app": "cargo", "progress": 42, "title": "build"},
+                {"state": "blocked", "app": "claude", "effective_app": "claude-code", "kind": "permission", "progress": 80, "title": "shell", "msg": "allow\nrun?"},
+                {"state": "blocked", "app": "other", "kind": "question"}
+            ]
+        });
+        assert_eq!(
+            status_summary(&reply).as_deref(),
+            Some("blocked claude-code (permission) 80%: shell: allow run?")
+        );
+
+        let fallback = json!({
+            "records": [
+                {"state": "done", "app": "pytest", "progress": 100, "kind": "permission", "msg": "ok"}
+            ]
+        });
+        // Progress and kind are omitted for non-working/non-blocked states.
+        assert_eq!(
+            status_summary(&fallback).as_deref(),
+            Some("done pytest: ok")
+        );
+
+        assert_eq!(status_summary(&json!({"records": []})), None);
+    }
 
     #[test]
     fn targets_include_session_windows_and_splits() {
