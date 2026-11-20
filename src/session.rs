@@ -1,7 +1,10 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
 use crate::rex::control::Control;
+
+pub type PendingCall = oneshot::Receiver<Result<Value>>;
 
 pub async fn list(ctrl: &mut Control) -> Result<Vec<Value>> {
     let reply = ctrl.call("session.list", Value::Null).await?;
@@ -28,6 +31,10 @@ fn sessions_of(reply: &Value) -> Vec<Value> {
 pub async fn view(ctrl: &mut Control, session_id: &str) -> Result<Value> {
     ctrl.call("session.view", json!({"session_id": session_id}))
         .await
+}
+
+pub fn start_view(ctrl: &mut Control, session_id: &str) -> Result<PendingCall> {
+    ctrl.start_call("session.view", json!({"session_id": session_id}))
 }
 
 pub async fn destroy(ctrl: &mut Control, session_id: &str) -> Result<()> {

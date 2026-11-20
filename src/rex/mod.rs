@@ -31,6 +31,32 @@ pub const CONNECT_TIME: Duration = Duration::from_secs(10);
 
 const OPEN_TRIES: u32 = 3;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerConfig {
+    Explicit(String),
+    Env(String),
+    Default,
+}
+
+impl ServerConfig {
+    pub fn from_sources(flag: Option<String>, env: Option<String>) -> Self {
+        if let Some(address) = flag {
+            Self::Explicit(address)
+        } else if let Some(address) = env.filter(|address| !address.is_empty()) {
+            Self::Env(address)
+        } else {
+            Self::Default
+        }
+    }
+
+    pub async fn resolve(&self) -> Result<ServerAddress> {
+        match self {
+            Self::Explicit(address) | Self::Env(address) => address.parse(),
+            Self::Default => Ok(ServerAddress::local_or_loopback().await),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ServerAddress {
     Network(String),

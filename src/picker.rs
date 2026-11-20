@@ -9,11 +9,11 @@ use anyhow::{Context, Result, bail};
 use dialoguer::{FuzzySelect, console::Term};
 use futures_util::future::join_all;
 use serde::Deserialize;
-use serde_json::{Value, json};
-use tokio::time::{Instant, timeout, timeout_at};
+use serde_json::Value;
+use tokio::time::{Instant, timeout_at};
 
 use crate::app;
-use crate::rex::{ServerAddress, control::Control};
+use crate::rex::{ServerAddress, ServerConfig, control::Control};
 use crate::session;
 
 const DISCOVERY_TIME: Duration = Duration::from_secs(3);
@@ -35,12 +35,55 @@ struct Target {
     block_id: String,
 }
 
-pub async fn run(configured: Option<&str>, explicit_server: bool) -> Result<()> {
+pub async fn run(server_config: &ServerConfig) -> Result<()> {
     app::ensure_terminal()?;
-    let servers = servers(configured, explicit_server).await?;
-    let discovered = join_all(servers.iter().map(discover)).await;
+    let (servers, discover_local) = load_servers(server_config)?;
+    let deadline = Instant::now() + DISCOVERY_TIME;
+
+    // Resolve and query the default local server in parallel with saved servers
+    // so a hung local socket never delays remote discovery.
+    let local_future = async {
+        if !discover_local {
+            return Ok(None);
+        }
+        let address = timeout_at(deadline, ServerAddress::local_or_loopback())
+            .await
+            .context("local server detection timed out")?;
+        if servers.iter().any(|server| server.address == address) {
+            return Ok(None);
+        }
+        let server = Server {
+            name: "local".to_owned(),
+            address,
+        };
+        let result = discover_until(&server, deadline).await;
+        Ok::<_, anyhow::Error>(Some((server, result)))
+    };
+
+    let (local_outcome, discovered) = tokio::join!(
+        local_future,
+        join_all(
+            servers
+                .iter()
+                .map(|server| discover_until(server, deadline))
+        )
+    );
+
+    let mut all_servers = Vec::with_capacity(servers.len() + 1);
+    let mut all_results = Vec::with_capacity(servers.len() + 1);
+    match local_outcome {
+        Ok(Some((server, result))) => {
+            all_servers.push(server);
+            all_results.push(result);
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("zrex pick: {}", one_line(&format!("{error:#}"))),
+    }
+    all_servers.extend(servers);
+    all_results.extend(discovered);
+
     let mut choices = Vec::new();
-    for (server, result) in servers.iter().zip(discovered) {
+    for (server, result) in all_servers.iter().zip(all_results) {
         match result {
             Ok((targets, missing_views)) => {
                 if missing_views > 0 {
@@ -94,13 +137,15 @@ pub async fn run(configured: Option<&str>, explicit_server: bool) -> Result<()> 
     Ok(())
 }
 
-async fn servers(configured: Option<&str>, explicit_server: bool) -> Result<Vec<Server>> {
-    if explicit_server {
-        let address = configured.expect("an explicit server has an address");
-        return Ok(vec![Server {
-            name: address.to_owned(),
-            address: address.parse()?,
-        }]);
+fn load_servers(server_config: &ServerConfig) -> Result<(Vec<Server>, bool)> {
+    if let ServerConfig::Explicit(address) = server_config {
+        return Ok((
+            vec![Server {
+                name: address.clone(),
+                address: address.parse()?,
+            }],
+            false,
+        ));
     }
 
     let config = config_path()
@@ -120,27 +165,26 @@ async fn servers(configured: Option<&str>, explicit_server: bool) -> Result<Vec<
         }
     }
 
-    let default = match configured {
-        Some(address) => address.parse().map(|address| ("REX_SERVER", address)),
-        None => timeout(DISCOVERY_TIME, ServerAddress::local_or_loopback())
-            .await
-            .context("local server detection timed out")
-            .map(|address| ("local", address)),
-    };
-    match default {
-        Ok((name, address)) if !servers.iter().any(|server| server.address == address) => {
-            servers.insert(
-                0,
-                Server {
-                    name: name.to_owned(),
-                    address,
-                },
-            );
+    match server_config {
+        ServerConfig::Explicit(_) => unreachable!(),
+        ServerConfig::Env(address) => {
+            match address.parse() {
+                Ok(address) if !servers.iter().any(|server| server.address == address) => {
+                    servers.insert(
+                        0,
+                        Server {
+                            name: "REX_SERVER".to_owned(),
+                            address,
+                        },
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("zrex pick: {}", one_line(&format!("{error:#}"))),
+            }
+            Ok((servers, false))
         }
-        Ok(_) => {}
-        Err(error) => eprintln!("zrex pick: {}", one_line(&format!("{error:#}"))),
+        ServerConfig::Default => Ok((servers, true)),
     }
-    Ok(servers)
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -159,8 +203,7 @@ fn read_config(path: &Path) -> Result<Config> {
     }
 }
 
-async fn discover(server: &Server) -> Result<(Vec<Target>, usize)> {
-    let deadline = Instant::now() + DISCOVERY_TIME;
+async fn discover_until(server: &Server, deadline: Instant) -> Result<(Vec<Target>, usize)> {
     let (mut ctrl, entries) = timeout_at(deadline, async {
         let (mut ctrl, _events) = Control::connect(&server.address, None).await?;
         let entries = session::list_all(&mut ctrl).await?;
@@ -176,7 +219,7 @@ async fn discover(server: &Server) -> Result<(Vec<Target>, usize)> {
         if id.is_empty() {
             return None;
         }
-        let reply = ctrl.start_call("session.view", json!({"session_id": id}));
+        let reply = session::start_view(&mut ctrl, &id);
         Some(async move {
             let reply = reply.ok()?;
             let view = timeout_at(deadline, reply).await.ok()?.ok()?.ok()?;
@@ -254,4 +297,73 @@ fn one_line(text: &str) -> String {
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn targets_include_session_windows_and_splits() {
+        let entry = json!({"session_id": "session:1", "label": "work"});
+        let view = json!({
+            "active_window_id": "window:1",
+            "windows": [
+                {
+                    "window_id": "window:1",
+                    "label": "dev",
+                    "focused_block_id": "block:2",
+                    "layers": [{
+                        "blocks": [
+                            {"block_id": "block:1", "label": "editor"},
+                            {"block_id": "block:2", "label": ""}
+                        ]
+                    }]
+                },
+                {
+                    "window_id": "window:2",
+                    "label": "",
+                    "layers": [{
+                        "blocks": [
+                            {"block_id": "block:3", "label": "logs"}
+                        ]
+                    }]
+                }
+            ]
+        });
+        let list = targets("office", &entry, "session:1", &view);
+        let pairs: Vec<_> = list
+            .iter()
+            .map(|t| (t.display.as_str(), t.block_id.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("[office] work", "block:2"),
+                ("[office] work / 1 dev", "block:2"),
+                ("[office] work / 1 dev / 1.1 editor", "block:1"),
+                ("[office] work / 1 dev / 1.2 block:2", "block:2"),
+                ("[office] work / 2 window:2", "block:3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_config_parses_servers_and_handles_missing_file() {
+        let missing = env::temp_dir().join(format!("zrex-missing-{}.toml", std::process::id()));
+        assert!(read_config(&missing).unwrap().servers.is_empty());
+
+        let path = env::temp_dir().join(format!("zrex-config-{}.toml", std::process::id()));
+        fs::write(
+            &path,
+            "[servers]\noffice = \"https://office.example\"\nlab = \"http://127.0.0.1:7297\"\n",
+        )
+        .unwrap();
+        let config = read_config(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(config.servers.len(), 2);
+        assert_eq!(config.servers["office"], "https://office.example");
+        assert_eq!(config.servers["lab"], "http://127.0.0.1:7297");
+    }
 }

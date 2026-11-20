@@ -9,8 +9,8 @@ use std::env;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::rex::ServerAddress;
 use crate::rex::control::Control;
+use crate::rex::{ServerAddress, ServerConfig};
 
 const USAGE: &str = "\
 zrex: use a session on a Rex server from a terminal
@@ -56,9 +56,7 @@ enum Command {
     Help,
     Version,
     List,
-    Pick {
-        explicit_server: bool,
-    },
+    Pick,
     Attach {
         target: Option<String>,
         window: Option<String>,
@@ -139,21 +137,10 @@ impl Arguments {
     }
 }
 
-fn configured_server(flag: Option<String>, env: Option<String>) -> Option<String> {
-    flag.or_else(|| env.filter(|address| !address.is_empty()))
-}
-
-async fn server_address(configured: Option<&str>) -> Result<ServerAddress> {
-    match configured {
-        Some(address) => address.parse(),
-        None => Ok(ServerAddress::local_or_loopback().await),
-    }
-}
-
 fn parse_args(
     args: impl IntoIterator<Item = String>,
     env_server: Option<String>,
-) -> Result<(Option<String>, Command)> {
+) -> Result<(ServerConfig, Command)> {
     let Arguments {
         server,
         command,
@@ -163,8 +150,7 @@ fn parse_args(
         pending,
         early_command,
     } = Arguments::scan(args)?;
-    let explicit_server = server.is_some();
-    let server = configured_server(server, env_server);
+    let server = ServerConfig::from_sources(server, env_server);
     if let Some(command) = early_command {
         return Ok((server, command));
     }
@@ -182,7 +168,7 @@ fn parse_args(
             if target.is_some() || window.is_some() || block.is_some() {
                 anyhow::bail!("usage: zrex [--server ADDRESS] pick");
             }
-            Command::Pick { explicit_server }
+            Command::Pick
         }
         Some("a" | "attach") => Command::Attach {
             target,
@@ -218,9 +204,8 @@ async fn main() -> Result<()> {
         complete(args).await;
         return Ok(());
     }
-    let (configured_server, command) =
+    let (server_config, command) =
         parse_args(first.into_iter().chain(args), env::var("REX_SERVER").ok())?;
-    let server = || server_address(configured_server.as_deref());
 
     match command {
         Command::Help => {
@@ -231,16 +216,14 @@ async fn main() -> Result<()> {
             println!("zrex {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::List => list(&server().await?).await,
-        Command::Pick { explicit_server } => {
-            picker::run(configured_server.as_deref(), explicit_server).await
-        }
+        Command::List => list(&server_config.resolve().await?).await,
+        Command::Pick => picker::run(&server_config).await,
         Command::Attach {
             target,
             window,
             block,
-        } => app::attach(&server().await?, target, window, block).await,
-        Command::Kill { target } => kill(&server().await?, &target).await,
+        } => app::attach(&server_config.resolve().await?, target, window, block).await,
+        Command::Kill { target } => kill(&server_config.resolve().await?, &target).await,
         Command::Completion(shell) => {
             print!("{}", shell.script());
             Ok(())
@@ -447,8 +430,9 @@ async fn complete(mut args: impl Iterator<Item = String>) {
         Completion::Commands => COMPLETION_COMMANDS.into_iter().map(str::to_owned).collect(),
         Completion::Flags { attach } => flags(attach),
         context => {
-            let configured = configured_server(parsed.server, env::var("REX_SERVER").ok());
-            let Ok(server) = server_address(configured.as_deref()).await else {
+            let server_config =
+                ServerConfig::from_sources(parsed.server, env::var("REX_SERVER").ok());
+            let Ok(server) = server_config.resolve().await else {
                 return;
             };
             match context {
@@ -574,19 +558,15 @@ mod tests {
         assert_eq!(
             parse_args(args(&["pick"]), env.clone()).unwrap(),
             (
-                env.clone(),
-                Command::Pick {
-                    explicit_server: false
-                }
+                ServerConfig::Env("https://default.example".to_owned()),
+                Command::Pick
             )
         );
         assert_eq!(
             parse_args(args(&["pick", "-S", "https://only.example"]), env).unwrap(),
             (
-                Some("https://only.example".to_owned()),
-                Command::Pick {
-                    explicit_server: true
-                }
+                ServerConfig::Explicit("https://only.example".to_owned()),
+                Command::Pick
             )
         );
         assert!(parse_args(args(&["pick", "--window", "1"]), None).is_err());
@@ -595,11 +575,11 @@ mod tests {
     #[test]
     fn parses_cli_flags_and_commands() {
         let (server, cmd) = parse_args(args(&["ls"]), None).unwrap();
-        assert_eq!(server, None);
+        assert_eq!(server, ServerConfig::Default);
         assert_eq!(cmd, Command::List);
         assert_eq!(
             parse_args(args(&["ls"]), Some(String::new())).unwrap().0,
-            None
+            ServerConfig::Default
         );
 
         let (server, cmd) = parse_args(
@@ -607,7 +587,10 @@ mod tests {
             Some("http://env:7297".to_owned()),
         )
         .unwrap();
-        assert_eq!(server.as_deref(), Some("https://example.com"));
+        assert_eq!(
+            server,
+            ServerConfig::Explicit("https://example.com".to_owned())
+        );
         assert_eq!(
             cmd,
             Command::Attach {
@@ -633,7 +616,7 @@ mod tests {
 
         let (server, cmd) =
             parse_args(args(&["kill", "work"]), Some("http://env:7297".to_owned())).unwrap();
-        assert_eq!(server.as_deref(), Some("http://env:7297"));
+        assert_eq!(server, ServerConfig::Env("http://env:7297".to_owned()));
         assert_eq!(
             cmd,
             Command::Kill {
@@ -671,7 +654,10 @@ mod tests {
         let parsed = Arguments::scan(words.clone()).unwrap();
         assert_eq!(completion_context("", &parsed), Completion::Sessions);
         assert_eq!(parsed.server.as_deref(), Some("https://last"));
-        assert_eq!(parsed.server, parse_args(words, None).unwrap().0);
+        assert_eq!(
+            ServerConfig::from_sources(parsed.server, None),
+            parse_args(words, None).unwrap().0
+        );
 
         let parsed = Arguments::scan(args(&["attach", "--window", "--server"])).unwrap();
         assert_eq!(parsed.server, None);
