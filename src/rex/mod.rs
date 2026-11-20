@@ -45,19 +45,22 @@ impl FromStr for ServerAddress {
             Some((scheme, rest)) => (scheme.to_lowercase(), rest),
             None => ("http".to_owned(), address),
         };
-        if rest.is_empty() {
-            bail!("no server address");
-        }
         let scheme = match scheme.as_str() {
             "https" | "wss" => "wss",
             "http" | "ws" => "ws",
-            "unix" => return Ok(Self::Unix(OsString::from_vec(decode_percent(rest)?).into())),
+            "unix" => {
+                if rest.is_empty() {
+                    bail!("no server address");
+                }
+                return Ok(Self::Unix(OsString::from_vec(decode_percent(rest)?).into()));
+            }
             other => bail!("unknown server scheme {other}"),
         };
-        Ok(Self::Network(format!(
-            "{scheme}://{}",
-            rest.trim_end_matches('/')
-        )))
+        let rest = rest.trim_end_matches('/');
+        if rest.is_empty() {
+            bail!("no server address");
+        }
+        Ok(Self::Network(format!("{scheme}://{rest}")))
     }
 }
 
@@ -145,13 +148,25 @@ impl Endpoint<'_> {
 
 /// Finds the local server's socket even outside a terminal started by Rex.
 fn local_socket_candidates() -> Vec<PathBuf> {
+    local_socket_candidates_from(env::var_os("HOME"), env::var_os("XDG_RUNTIME_DIR"))
+}
+
+fn local_socket_candidates_from(
+    home: Option<OsString>,
+    xdg_runtime_dir: Option<OsString>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     #[cfg(target_os = "macos")]
-    if let Some(home) = env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join("Library/Application Support/rex/server.sock"));
+    if let Some(home) = home.map(PathBuf::from).filter(|path| path.is_absolute()) {
+        candidates.push(home.join("Library/Application Support/rex/server.sock"));
     }
-    if let Some(runtime) = env::var_os("XDG_RUNTIME_DIR") {
-        candidates.push(PathBuf::from(runtime).join("rex/server.sock"));
+    #[cfg(not(target_os = "macos"))]
+    let _ = home;
+    if let Some(runtime) = xdg_runtime_dir
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        candidates.push(runtime.join("rex/server.sock"));
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -251,7 +266,28 @@ mod tests {
             );
         }
         assert!("".parse::<ServerAddress>().is_err());
+        assert!("http:///".parse::<ServerAddress>().is_err());
+        assert!("https:///".parse::<ServerAddress>().is_err());
+        assert!("ws:///".parse::<ServerAddress>().is_err());
         assert!("ftp://example.com".parse::<ServerAddress>().is_err());
+    }
+
+    #[test]
+    fn ignores_empty_or_relative_socket_env_dirs() {
+        let empty = local_socket_candidates_from(Some(OsString::new()), Some(OsString::new()));
+        assert!(empty.iter().all(|path| path.is_absolute()));
+
+        let relative = local_socket_candidates_from(
+            Some(OsString::from("relative/home")),
+            Some(OsString::from("relative/run")),
+        );
+        assert!(relative.iter().all(|path| path.is_absolute()));
+
+        let absolute = local_socket_candidates_from(
+            Some(OsString::from("/Users/test")),
+            Some(OsString::from("/run/user/1000")),
+        );
+        assert!(absolute.contains(&PathBuf::from("/run/user/1000/rex/server.sock")));
     }
 
     #[test]

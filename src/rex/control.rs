@@ -260,6 +260,10 @@ mod tests {
 
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
             let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
                 if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
                     res.headers_mut()
