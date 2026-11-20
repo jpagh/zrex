@@ -1800,6 +1800,10 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (ctrl_tcp, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
             let mut ctrl_ws = tokio_tungstenite::accept_hdr_async(
                 ctrl_tcp,
                 |req: &Request, mut res: Response| {
@@ -1829,6 +1833,10 @@ mod tests {
 
             let data_task = tokio::spawn(async move {
                 let (data_tcp, _) = listener.accept().await.unwrap();
+                #[allow(
+                    clippy::result_large_err,
+                    reason = "tungstenite fixes the callback error type"
+                )]
                 let mut data_ws = tokio_tungstenite::accept_hdr_async(
                     data_tcp,
                     |req: &Request, mut res: Response| {
