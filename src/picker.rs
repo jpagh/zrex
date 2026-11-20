@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+mod prompt;
+
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
@@ -6,11 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use dialoguer::{FuzzySelect, console::Term};
 use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout, timeout_at};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app;
 use crate::rex::{ServerAddress, control::Control};
@@ -64,33 +66,8 @@ pub async fn run(configured: Option<&str>, explicit_server: bool) -> Result<()> 
         bail!("no attachable sessions found");
     }
 
-    // FuzzySelect identifies the chosen item by its display string. Keep each
-    // row unique even when the same server has sessions with identical labels.
-    let term = Term::stdout();
-    let columns = usize::from(term.size().1);
-    let mut seen = HashSet::new();
-    let rows: Vec<_> = choices
-        .iter()
-        .map(|(_, target)| {
-            let mut row = target.row(columns, "");
-            let mut copy = 2;
-            while !seen.insert(row.clone()) {
-                row = target.row(columns, &format!(" ({copy})"));
-                copy += 1;
-            }
-            row
-        })
-        .collect();
-    let selected = FuzzySelect::new()
-        .with_prompt("Attach (Esc to cancel)")
-        .default(0)
-        .report(false)
-        .items(&rows)
-        .interact_on_opt(&term);
-    if selected.is_err() {
-        let _ = term.show_cursor();
-    }
-    if let Some(index) = selected? {
+    let targets: Vec<_> = choices.iter().map(|(_, target)| target).collect();
+    if let Some(index) = prompt::select(&targets)? {
         let (server, target) = &choices[index];
         app::attach_existing(&server.address, &target.session_id, &target.block_id).await?;
     }
@@ -374,7 +351,7 @@ fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<T
 }
 
 impl Target {
-    fn row(&self, columns: usize, suffix: &str) -> String {
+    fn row(&self, columns: usize) -> String {
         let parts = [
             ("", &self.label),
             (" — ", &self.title),
@@ -385,10 +362,12 @@ impl Target {
             .filter(|(_, text)| !text.is_empty())
             .map(|(separator, text)| (separator, text, 0))
             .collect();
-        // Dialoguer's erase logic counts bytes, not display cells. Fit every
-        // row with room for its selection marker, sharing space across fields.
-        let separators: usize = parts.iter().map(|(separator, _, _)| separator.len()).sum();
-        let budget = columns.saturating_sub(3 + separators + suffix.len());
+        // Share display space across the label, title, and status.
+        let separators: usize = parts
+            .iter()
+            .map(|(separator, _, _)| separator.width())
+            .sum();
+        let budget = columns.saturating_sub(separators);
         for _ in 0..budget {
             let Some((_, _, limit)) = parts
                 .iter_mut()
@@ -414,7 +393,6 @@ impl Target {
                 row.push_str(marker);
             }
         }
-        row.push_str(suffix);
         row
     }
 }

@@ -60,7 +60,7 @@ To reach a Rex server on another machine over Tailscale, use the HTTPS address t
 
 ### Attach Picker
 
-Run `zrex pick`, type to filter, and use the arrow keys and Enter to attach in the same terminal. Esc cancels. `Ctrl-\` detaches straight back to your shell. The picker never creates a session or window.
+Run `zrex pick`, type to filter, and use the arrow keys and Enter to attach in the same terminal. `Ctrl-U` clears the entire search query, and Esc cancels. `Ctrl-\` detaches straight back to your shell. The picker never creates a session or window.
 
 Alongside the window and split labels, the picker shows the terminal title and OSC 7501 program status when Rex has them. You can search the displayed text, for example `blocked` or an agent name. If a pane reports multiple statuses, the picker shows the one that most needs attention. Titles and statuses are fetched when the picker opens.
 
