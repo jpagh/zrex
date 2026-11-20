@@ -50,7 +50,9 @@ zrex -S https://server.example kill work
 
 ### Server Address
 
-The server address is read from `--server` (`-S`), then `REX_SERVER`, and defaults to `http://127.0.0.1:7297`.
+The server address is read from `--server` (`-S`), then `REX_SERVER`, and defaults to `http://127.0.0.1:7297`. An address without a port uses the scheme's default port: 80 for HTTP, 443 for HTTPS.
+
+To reach a Rex server on another machine over Tailscale, use the HTTPS address that `rex server status` reports (for example `https://my-mac.tail1234.ts.net`). The Tailscale node serves HTTPS on port 443, so a bare IP with no port falls back to HTTP on port 80 and is refused.
 
 ### Selecting Sessions, Windows, and Blocks
 
