@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::proto::{self, Incoming};
@@ -19,11 +20,20 @@ pub struct Control {
     out: mpsc::UnboundedSender<Message>,
     pending: Pending,
     alive: Arc<AtomicBool>,
+    reader: JoinHandle<()>,
     next_id: u64,
     pub reconnect_token: Option<String>,
 }
 
 pub type Events = mpsc::UnboundedReceiver<(String, Value)>;
+
+impl Drop for Control {
+    fn drop(&mut self) {
+        // Release the reader's pong sender so the writer can finish after
+        // draining queued messages, even if the server leaves its socket open.
+        self.reader.abort();
+    }
+}
 
 impl Control {
     pub async fn connect(
@@ -89,7 +99,7 @@ impl Control {
         let reader_pending = Arc::clone(&pending);
         let reader_alive = Arc::clone(&alive);
         let pong_tx = out_tx.clone();
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             let _mark = MarkDead(reader_alive);
             while let Some(message) = stream.next().await {
                 let message = match message {
@@ -141,6 +151,7 @@ impl Control {
                 out: out_tx,
                 pending,
                 alive,
+                reader,
                 next_id: 0,
                 reconnect_token,
             },
