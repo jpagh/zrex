@@ -32,10 +32,33 @@ struct Server {
     address: ServerAddress,
 }
 
-struct Target {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgramStatus {
+    state: ProgramState,
+    summary: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StyleRole {
+    Server,
+    Label,
+    Separator,
+    Title,
+    Status(ProgramState),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct StyledSpan {
+    pub(super) role: StyleRole,
+    pub(super) text: String,
+    /// Starting char index in `Target::search_text()`, or `None` for a synthetic ellipsis.
+    pub(super) search_offset: Option<usize>,
+}
+
+pub(super) struct Target {
     label: String,
     title: String,
-    status: String,
+    status: Option<ProgramStatus>,
     session_id: String,
     block_id: String,
 }
@@ -244,7 +267,7 @@ fn describe_targets(
 ) -> impl Future<Output = (usize, Vec<Target>)> + use<> {
     let mut requests = HashMap::new();
     for target in &targets {
-        // Session, window, and split rows can all point to the same block.
+        // Deduplicate metadata queries per block ID.
         requests.entry(target.block_id.clone()).or_insert_with(|| {
             let title = session::start_terminal_title(ctrl, &target.session_id, &target.block_id);
             let status = ctrl.start_call(
@@ -275,17 +298,15 @@ fn describe_targets(
         for target in &mut targets {
             if let Some((title, status)) = details.get(&target.block_id) {
                 target.title.clone_from(title);
-                if let Some(status) = status {
-                    target.status.clone_from(status);
-                }
+                target.status.clone_from(status);
             }
         }
         (index, targets)
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ProgramState {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ProgramState {
     Blocked,
     Error,
     Working,
@@ -323,7 +344,7 @@ impl ProgramState {
     }
 }
 
-fn status_summary(reply: &Value) -> Option<String> {
+fn status_summary(reply: &Value) -> Option<ProgramStatus> {
     let records = reply.get("records")?.as_array()?;
     // Surface the record most likely to need attention. Keep the server's
     // root-first order when records have the same priority.
@@ -365,7 +386,7 @@ fn status_summary(reply: &Value) -> Option<String> {
         summary.push_str(": ");
         summary.push_str(detail);
     }
-    Some(summary)
+    Some(ProgramStatus { state, summary })
 }
 
 fn clean_json_field(value: &Value, key: &str, max_chars: usize) -> String {
@@ -386,14 +407,11 @@ fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<T
         targets.push(Target {
             label,
             title: String::new(),
-            status: String::new(),
+            status: None,
             session_id: session_id.to_owned(),
             block_id: block_id.to_owned(),
         });
     };
-    if let Some(block_id) = session::block_of(view, None, None) {
-        add(session.clone(), &block_id);
-    }
     let windows = session::windows(view);
     for (index, window) in windows.iter().enumerate() {
         let number = index + 1;
@@ -401,9 +419,6 @@ fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<T
             "{session} / {number} {}",
             label_or_id(&window.label, &window.id)
         );
-        if let Some(block_id) = window.active_or_first_block_id() {
-            add(name.clone(), block_id);
-        }
         if window.blocks.len() > 1 {
             for (index, block) in window.blocks.iter().enumerate() {
                 add(
@@ -415,18 +430,24 @@ fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<T
                     &block.id,
                 );
             }
+        } else if let Some(block_id) = window.active_or_first_block_id() {
+            add(name, block_id);
         }
     }
     targets
 }
 
 impl Target {
-    fn search_text(&self) -> String {
+    pub(super) fn search_text(&self) -> String {
         let mut text = String::new();
+        let status = self
+            .status
+            .as_ref()
+            .map_or("", |status| status.summary.as_str());
         for (separator, part) in [
-            ("", &self.label),
-            (" — ", &self.title),
-            (" · ", &self.status),
+            ("", self.label.as_str()),
+            (" — ", self.title.as_str()),
+            (" · ", status),
         ] {
             if !part.is_empty() {
                 text.push_str(separator);
@@ -436,88 +457,218 @@ impl Target {
         text
     }
 
-    fn row(&self, columns: usize) -> String {
+    pub(super) fn styled_row(&self, columns: usize) -> Vec<StyledSpan> {
         if columns == 0 {
-            return String::new();
+            return Vec::new();
         }
-        let mut parts: Vec<_> = [
-            ("", self.label.as_str()),
-            (" — ", self.title.as_str()),
-            (" · ", self.status.as_str()),
-        ]
-        .into_iter()
-        .filter(|(_, text)| !text.is_empty())
-        .map(|(separator, text)| (separator, text, text.width(), 0usize))
-        .collect();
+        struct Part<'a> {
+            separator: &'static str,
+            sep_offset: usize,
+            text: &'a str,
+            text_offset: usize,
+            role: StyleRole,
+            width: usize,
+            limit: usize,
+        }
+
+        let mut parts = Vec::with_capacity(3);
+        let mut char_pos = 0usize;
+        let candidates = [
+            ("", self.label.as_str(), StyleRole::Label),
+            (" — ", self.title.as_str(), StyleRole::Title),
+            (
+                " · ",
+                self.status
+                    .as_ref()
+                    .map_or("", |status| status.summary.as_str()),
+                StyleRole::Status(
+                    self.status
+                        .as_ref()
+                        .map_or(ProgramState::Idle, |status| status.state),
+                ),
+            ),
+        ];
+        for (separator, text, role) in candidates {
+            if text.is_empty() {
+                continue;
+            }
+            let sep_offset = char_pos;
+            char_pos += separator.chars().count();
+            let text_offset = char_pos;
+            char_pos += text.chars().count();
+            parts.push(Part {
+                separator,
+                sep_offset,
+                text,
+                text_offset,
+                role,
+                width: text.width(),
+                limit: 0,
+            });
+        }
         if parts.is_empty() {
-            return String::new();
+            return Vec::new();
         }
 
         // Drop trailing parts until each kept part can show its separator plus
         // at least one non-ellipsis character (or its full width if shorter).
         while parts.len() > 1 {
-            let separators: usize = parts.iter().map(|(sep, _, _, _)| sep.width()).sum();
-            let min_text: usize = parts.iter().map(|(_, _, width, _)| (*width).min(2)).sum();
+            let separators: usize = parts.iter().map(|part| part.separator.width()).sum();
+            let min_text: usize = parts.iter().map(|part| part.width.min(2)).sum();
             if columns >= separators + min_text {
                 break;
             }
             parts.pop();
         }
 
-        let separators: usize = parts.iter().map(|(sep, _, _, _)| sep.width()).sum();
+        let separators: usize = parts.iter().map(|part| part.separator.width()).sum();
         let budget = columns.saturating_sub(separators);
-        let total_width: usize = parts.iter().map(|(_, _, width, _)| *width).sum();
+        let total_width: usize = parts.iter().map(|part| part.width).sum();
         if total_width <= budget {
-            for (_, _, width, limit) in &mut parts {
-                *limit = *width;
+            for part in &mut parts {
+                part.limit = part.width;
             }
         } else {
             // Share display columns evenly across the kept parts.
             for _ in 0..budget {
-                let Some((_, _, _, limit)) = parts
+                let Some(part) = parts
                     .iter_mut()
-                    .filter(|(_, _, width, limit)| *limit < *width)
-                    .min_by_key(|(_, _, _, limit)| *limit)
+                    .filter(|part| part.limit < part.width)
+                    .min_by_key(|part| part.limit)
                 else {
                     break;
                 };
-                *limit += 1;
+                part.limit += 1;
             }
         }
 
-        let mut row = String::new();
-        for (separator, text, width, limit) in parts {
-            if limit == 0 {
+        let mut spans = Vec::new();
+        for part in parts {
+            if part.limit == 0 {
                 continue;
             }
-            row.push_str(separator);
-            if width <= limit {
-                row.push_str(text);
+            if !part.separator.is_empty() {
+                spans.push(StyledSpan {
+                    role: StyleRole::Separator,
+                    text: part.separator.to_owned(),
+                    search_offset: Some(part.sep_offset),
+                });
+            }
+            let (visible, truncated) = if part.width <= part.limit {
+                (part.text.to_owned(), false)
             } else {
-                truncate_to_columns(&mut row, text, limit);
+                let ellipsis_width = '…'.width().unwrap_or(1);
+                (
+                    prefix_to_columns(part.text, part.limit.saturating_sub(ellipsis_width)),
+                    true,
+                )
+            };
+            if part.role == StyleRole::Label {
+                push_label_spans(&mut spans, &visible, part.text_offset, truncated);
+            } else {
+                if !visible.is_empty() {
+                    spans.push(StyledSpan {
+                        role: part.role,
+                        text: visible,
+                        search_offset: Some(part.text_offset),
+                    });
+                }
+                if truncated {
+                    spans.push(StyledSpan {
+                        role: part.role,
+                        text: "…".to_owned(),
+                        search_offset: None,
+                    });
+                }
             }
         }
-        row
+        spans
+    }
+
+    #[cfg(test)]
+    fn row(&self, columns: usize) -> String {
+        self.styled_row(columns)
+            .into_iter()
+            .map(|span| span.text)
+            .collect()
     }
 }
 
-fn truncate_to_columns(out: &mut String, text: &str, max_columns: usize) {
-    if max_columns == 0 {
-        return;
+fn push_label_spans(
+    spans: &mut Vec<StyledSpan>,
+    visible: &str,
+    mut offset: usize,
+    truncated: bool,
+) {
+    let mut rest = visible;
+    if rest.starts_with('[') {
+        if let Some(end) = rest.find(']') {
+            let server = &rest[..=end];
+            spans.push(StyledSpan {
+                role: StyleRole::Server,
+                text: server.to_owned(),
+                search_offset: Some(offset),
+            });
+            offset += server.chars().count();
+            rest = &rest[end + 1..];
+        } else {
+            spans.push(StyledSpan {
+                role: StyleRole::Server,
+                text: rest.to_owned(),
+                search_offset: Some(offset),
+            });
+            if truncated {
+                spans.push(StyledSpan {
+                    role: StyleRole::Server,
+                    text: "…".to_owned(),
+                    search_offset: None,
+                });
+            }
+            return;
+        }
     }
-    let ellipsis = '…';
-    let ellipsis_width = ellipsis.width().unwrap_or(1);
-    let prefix_budget = max_columns.saturating_sub(ellipsis_width);
+
+    let mut first = true;
+    for segment in rest.split(" / ") {
+        if !first {
+            spans.push(StyledSpan {
+                role: StyleRole::Separator,
+                text: " / ".to_owned(),
+                search_offset: Some(offset),
+            });
+            offset += 3;
+        }
+        first = false;
+        if !segment.is_empty() {
+            spans.push(StyledSpan {
+                role: StyleRole::Label,
+                text: segment.to_owned(),
+                search_offset: Some(offset),
+            });
+            offset += segment.chars().count();
+        }
+    }
+    if truncated {
+        spans.push(StyledSpan {
+            role: StyleRole::Label,
+            text: "…".to_owned(),
+            search_offset: None,
+        });
+    }
+}
+
+fn prefix_to_columns(text: &str, max_columns: usize) -> String {
+    let mut out = String::new();
     let mut used = 0;
     for ch in text.chars() {
         let ch_width = ch.width().unwrap_or(0);
-        if used + ch_width > prefix_budget {
+        if used + ch_width > max_columns {
             break;
         }
         out.push(ch);
         used += ch_width;
     }
-    out.push(ellipsis);
+    out
 }
 
 fn label_or_id(label: &str, id: &str) -> String {
@@ -535,10 +686,18 @@ mod tests {
     use serde_json::json;
 
     fn sample_target(label: &str, title: &str, status: &str) -> Target {
+        let status = if status.is_empty() {
+            None
+        } else {
+            Some(ProgramStatus {
+                state: ProgramState::from_str(status.split_whitespace().next().unwrap_or_default()),
+                summary: status.to_owned(),
+            })
+        };
         Target {
             label: label.to_owned(),
             title: title.to_owned(),
-            status: status.to_owned(),
+            status,
             session_id: "session:1".to_owned(),
             block_id: "block:1".to_owned(),
         }
@@ -579,6 +738,58 @@ mod tests {
     }
 
     #[test]
+    fn styled_row_assigns_semantic_roles_and_aligned_search_offsets() {
+        let target = sample_target(
+            "[office] work / 1 dev",
+            "vim README.md",
+            "blocked claude-code",
+        );
+        let search: Vec<char> = target.search_text().chars().collect();
+        let spans = target.styled_row(100);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| (span.role, span.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (StyleRole::Server, "[office]"),
+                (StyleRole::Label, " work"),
+                (StyleRole::Separator, " / "),
+                (StyleRole::Label, "1 dev"),
+                (StyleRole::Separator, " — "),
+                (StyleRole::Title, "vim README.md"),
+                (StyleRole::Separator, " · "),
+                (
+                    StyleRole::Status(ProgramState::Blocked),
+                    "blocked claude-code"
+                ),
+            ]
+        );
+        for span in &spans {
+            if let Some(offset) = span.search_offset {
+                let actual: String = search[offset..offset + span.text.chars().count()]
+                    .iter()
+                    .collect();
+                assert_eq!(actual, span.text);
+            }
+        }
+
+        // Truncated spans keep valid offsets for prefix chars and None for synthetic ellipses.
+        let truncated = target.styled_row(28);
+        assert!(truncated.iter().any(|span| span.search_offset.is_none()));
+        for span in &truncated {
+            if let Some(offset) = span.search_offset {
+                let actual: String = search[offset..offset + span.text.chars().count()]
+                    .iter()
+                    .collect();
+                assert_eq!(actual, span.text);
+            } else {
+                assert_eq!(span.text, "…");
+            }
+        }
+    }
+
+    #[test]
     fn status_summary_picks_highest_priority_and_formats_details() {
         let reply = json!({
             "records": [
@@ -588,8 +799,11 @@ mod tests {
             ]
         });
         assert_eq!(
-            status_summary(&reply).as_deref(),
-            Some("blocked claude-code (permission) 80%: shell: allow run?")
+            status_summary(&reply),
+            Some(ProgramStatus {
+                state: ProgramState::Blocked,
+                summary: "blocked claude-code (permission) 80%: shell: allow run?".to_owned(),
+            })
         );
 
         let fallback = json!({
@@ -599,15 +813,18 @@ mod tests {
         });
         // Progress and kind are omitted for non-working/non-blocked states.
         assert_eq!(
-            status_summary(&fallback).as_deref(),
-            Some("done pytest: ok")
+            status_summary(&fallback),
+            Some(ProgramStatus {
+                state: ProgramState::Done,
+                summary: "done pytest: ok".to_owned(),
+            })
         );
 
         assert_eq!(status_summary(&json!({"records": []})), None);
     }
 
     #[test]
-    fn targets_include_session_windows_and_splits() {
+    fn targets_list_each_attachable_block_once() {
         let entry = json!({"session_id": "session:1", "label": "work"});
         let view = json!({
             "active_window_id": "window:1",
@@ -642,8 +859,6 @@ mod tests {
         assert_eq!(
             pairs,
             vec![
-                ("[office] work", "block:2"),
-                ("[office] work / 1 dev", "block:2"),
                 ("[office] work / 1 dev / 1.1 editor", "block:1"),
                 ("[office] work / 1 dev / 1.2 block:2", "block:2"),
                 ("[office] work / 2 window:2", "block:3"),

@@ -1,16 +1,17 @@
+use std::env;
 use std::io::{self, Write};
 
 use crossterm::{
     cursor::MoveTo,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, queue,
-    style::{Attribute, Print, SetAttribute},
+    style::{Attribute, Color, Print, SetAttribute, SetForegroundColor},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::Target;
+use super::{ProgramState, StyleRole, StyledSpan, Target};
 
 const PROMPT: &str = "Attach (Esc to cancel)> ";
 
@@ -18,9 +19,17 @@ struct Screen;
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            SetAttribute(Attribute::Reset),
+            LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
     }
+}
+
+fn color_enabled() -> bool {
+    env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 pub(super) fn select(targets: &[&Target]) -> io::Result<Option<usize>> {
@@ -28,6 +37,7 @@ pub(super) fn select(targets: &[&Target]) -> io::Result<Option<usize>> {
     let _screen = Screen;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen)?;
+    let use_color = color_enabled();
     let matcher = SkimMatcherV2::default();
     let labels: Vec<_> = targets.iter().map(|target| target.search_text()).collect();
     let mut query = Vec::<char>::new();
@@ -41,11 +51,11 @@ pub(super) fn select(targets: &[&Target]) -> io::Result<Option<usize>> {
             .enumerate()
             .filter_map(|(index, label)| {
                 matcher
-                    .fuzzy_match(label, &pattern)
-                    .map(|score| (std::cmp::Reverse(score), index))
+                    .fuzzy_indices(label, &pattern)
+                    .map(|(score, indices)| (std::cmp::Reverse(score), index, indices))
             })
             .collect();
-        matches.sort_unstable();
+        matches.sort_unstable_by_key(|&(score, index, _)| (score, index));
 
         let (columns, rows) = terminal::size()?;
         let width = usize::from(columns.saturating_sub(1));
@@ -55,20 +65,13 @@ pub(super) fn select(targets: &[&Target]) -> io::Result<Option<usize>> {
             .max((selected + 1).saturating_sub(visible));
         queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
         if rows > 1 && width > 2 {
-            for (line, &(_, index)) in matches.iter().skip(first).take(visible).enumerate() {
+            for (line, &(_, index, ref indices)) in
+                matches.iter().skip(first).take(visible).enumerate()
+            {
                 let active = first + line == selected;
-                queue!(
-                    out,
-                    MoveTo(0, (line + 1) as u16),
-                    Print(if active { "> " } else { "  " })
-                )?;
-                if active {
-                    queue!(out, SetAttribute(Attribute::Reverse))?;
-                }
-                queue!(out, Print(targets[index].row(width - 2)))?;
-                if active {
-                    queue!(out, SetAttribute(Attribute::Reset))?;
-                }
+                queue!(out, MoveTo(0, (line + 1) as u16))?;
+                let spans = targets[index].styled_row(width - 2);
+                render_row(&mut out, &spans, indices, active, use_color)?;
             }
         }
         let prompt = if width > PROMPT.len() {
@@ -102,13 +105,9 @@ pub(super) fn select(targets: &[&Target]) -> io::Result<Option<usize>> {
                 true
             })
             .collect();
-        queue!(
-            out,
-            MoveTo(0, 0),
-            Print(prompt),
-            Print(displayed),
-            MoveTo((prompt.width() + offset) as u16, 0)
-        )?;
+        queue!(out, MoveTo(0, 0))?;
+        render_prompt(&mut out, prompt, &displayed, use_color)?;
+        queue!(out, MoveTo((prompt.width() + offset) as u16, 0))?;
         out.flush()?;
 
         let Event::Key(key) = event::read()? else {
@@ -184,6 +183,134 @@ pub(super) fn select(targets: &[&Target]) -> io::Result<Option<usize>> {
     }
 }
 
+fn render_prompt(
+    out: &mut impl Write,
+    prompt: &str,
+    query: &str,
+    use_color: bool,
+) -> io::Result<()> {
+    if !prompt.is_empty() {
+        if use_color {
+            queue!(out, SetForegroundColor(Color::DarkCyan))?;
+        }
+        queue!(
+            out,
+            SetAttribute(Attribute::Bold),
+            Print(prompt),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+    queue!(out, Print(query))
+}
+
+fn render_row(
+    out: &mut impl Write,
+    spans: &[StyledSpan],
+    match_indices: &[usize],
+    active: bool,
+    use_color: bool,
+) -> io::Result<()> {
+    if active {
+        if use_color {
+            queue!(out, SetForegroundColor(Color::DarkCyan))?;
+        }
+        queue!(
+            out,
+            SetAttribute(Attribute::Bold),
+            Print("> "),
+            SetAttribute(Attribute::Reset)
+        )?;
+    } else {
+        queue!(out, Print("  "))?;
+    }
+
+    for span in spans {
+        let mut run = String::new();
+        let mut run_matched = None;
+        for (char_index, ch) in span.text.chars().enumerate() {
+            let matched = !match_indices.is_empty()
+                && span
+                    .search_offset
+                    .is_some_and(|base| match_indices.binary_search(&(base + char_index)).is_ok());
+            if run_matched == Some(matched) {
+                run.push(ch);
+            } else {
+                if let Some(prev_matched) = run_matched {
+                    render_run(out, &run, span.role, prev_matched, active, use_color)?;
+                    run.clear();
+                }
+                run.push(ch);
+                run_matched = Some(matched);
+            }
+        }
+        if let Some(prev_matched) = run_matched {
+            render_run(out, &run, span.role, prev_matched, active, use_color)?;
+        }
+    }
+    queue!(out, SetAttribute(Attribute::Reset))
+}
+
+fn render_run(
+    out: &mut impl Write,
+    text: &str,
+    role: StyleRole,
+    matched: bool,
+    active: bool,
+    use_color: bool,
+) -> io::Result<()> {
+    queue!(out, SetAttribute(Attribute::Reset))?;
+    if active {
+        queue!(out, SetAttribute(Attribute::Reverse))?;
+    }
+    if use_color && let Some(color) = foreground_color(role, matched) {
+        queue!(out, SetForegroundColor(color))?;
+    }
+    if matched {
+        queue!(
+            out,
+            SetAttribute(Attribute::Bold),
+            SetAttribute(Attribute::Underlined)
+        )?;
+    } else if active {
+        if matches!(
+            role,
+            StyleRole::Label | StyleRole::Status(ProgramState::Blocked | ProgramState::Error)
+        ) {
+            queue!(out, SetAttribute(Attribute::Bold))?;
+        }
+    } else {
+        match role {
+            StyleRole::Separator | StyleRole::Title | StyleRole::Status(ProgramState::Idle) => {
+                queue!(out, SetAttribute(Attribute::Dim))?;
+            }
+            StyleRole::Status(ProgramState::Blocked | ProgramState::Error) => {
+                queue!(out, SetAttribute(Attribute::Bold))?;
+            }
+            StyleRole::Server
+            | StyleRole::Label
+            | StyleRole::Status(ProgramState::Working | ProgramState::Done) => {}
+        }
+    }
+    queue!(out, Print(text))
+}
+
+// Use the standard 8 ANSI palette colors (Dark*) so contrast adapts cleanly
+// across both dark and light terminal themes.
+fn foreground_color(role: StyleRole, matched: bool) -> Option<Color> {
+    if matched {
+        return Some(Color::DarkYellow);
+    }
+    match role {
+        StyleRole::Server => Some(Color::DarkCyan),
+        StyleRole::Label | StyleRole::Separator | StyleRole::Title => None,
+        StyleRole::Status(ProgramState::Blocked) => Some(Color::DarkYellow),
+        StyleRole::Status(ProgramState::Error) => Some(Color::DarkRed),
+        StyleRole::Status(ProgramState::Working) => Some(Color::DarkCyan),
+        StyleRole::Status(ProgramState::Done) => Some(Color::DarkGreen),
+        StyleRole::Status(ProgramState::Idle) => None,
+    }
+}
+
 fn word_left(query: &[char], cursor: usize) -> usize {
     cursor - word_distance(query[..cursor].iter().rev())
 }
@@ -239,5 +366,55 @@ mod tests {
         assert_eq!(word_right(&unicode, 1), 4);
         assert_eq!(word_left(&unicode, 4), 2);
         assert_eq!(word_left(&unicode, 2), 0);
+    }
+
+    #[test]
+    fn render_row_applies_semantic_colors_match_highlights_and_no_color() {
+        let spans = vec![
+            StyledSpan {
+                role: StyleRole::Server,
+                text: "[local]".to_owned(),
+                search_offset: Some(0),
+            },
+            StyledSpan {
+                role: StyleRole::Label,
+                text: " work".to_owned(),
+                search_offset: Some(7),
+            },
+            StyledSpan {
+                role: StyleRole::Separator,
+                text: " · ".to_owned(),
+                search_offset: Some(12),
+            },
+            StyledSpan {
+                role: StyleRole::Status(ProgramState::Error),
+                text: "error build".to_owned(),
+                search_offset: Some(15),
+            },
+        ];
+
+        let mut colored = Vec::new();
+        render_row(&mut colored, &spans, &[8, 9], false, true).unwrap();
+        let colored = String::from_utf8(colored).unwrap();
+        // Server cyan (ANSI 6), matched "wo" yellow+bold+underline (ANSI 3), error red (ANSI 1).
+        assert!(colored.contains("\x1b[38;5;6m") || colored.contains("\x1b[36m"));
+        assert!(colored.contains("\x1b[38;5;3m") || colored.contains("\x1b[33m"));
+        assert!(colored.contains("\x1b[38;5;1m") || colored.contains("\x1b[31m"));
+        assert!(colored.contains("\x1b[4m"));
+        assert!(colored.contains("wo"));
+        assert!(colored.contains("rk"));
+        assert!(colored.ends_with("\x1b[0m"));
+
+        let mut active_plain = Vec::new();
+        render_row(&mut active_plain, &spans, &[8, 9], true, false).unwrap();
+        let active_plain = String::from_utf8(active_plain).unwrap();
+        // NO_COLOR mode emits no foreground color escapes, but keeps reverse, bold, and underline.
+        assert!(!active_plain.contains("\x1b[38;"));
+        assert!(!active_plain.contains("\x1b[31m"));
+        assert!(!active_plain.contains("\x1b[33m"));
+        assert!(!active_plain.contains("\x1b[36m"));
+        assert!(active_plain.contains("\x1b[7m"));
+        assert!(active_plain.contains("\x1b[4m"));
+        assert!(active_plain.contains("> "));
     }
 }
