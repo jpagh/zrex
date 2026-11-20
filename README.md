@@ -26,7 +26,7 @@ cargo build --release
 ## Usage
 
 ```sh
-# List sessions, windows, and split blocks
+# List sessions, windows, split blocks, and terminal titles
 zrex -S https://server.example ls
 
 # Attach to a session (creates it if no session matches)
@@ -59,6 +59,23 @@ To reach a Rex server on another machine over Tailscale, use the HTTPS address t
 - **`SESSION`**: Matches a session label, full ID, or the last 4+ characters of an ID. On `attach` (`a`), if no session matches, `zrex` creates a new session with that label. If omitted, `zrex` attaches to the first session on the server.
 - **`--window` (`-w`)**: Selects a window by its 1-based number from `zrex ls`, its `window.block` index (such as `1.2`), its label, or `-` for a new window with a default Rex label. Passing a label that no window has creates a new window with that label and one shell block.
 - **`--block` (`-b`)**: Selects a block within the target (or active) window by its 1-based number, label, full ID, or 4+ character ID suffix.
+
+`ls` prints each window's label and, beside it, the terminal title its focused block reports — the same title Rex.app shows on the tab.
+
+### Shell Completion
+
+`zrex completion` prints a script that completes session labels, window numbers and labels, and block numbers and labels from the live server.
+
+```sh
+# zsh (after compinit, in ~/.zshrc)
+source <(zrex completion zsh)
+
+# bash (in ~/.bashrc)
+source <(zrex completion bash)
+
+# fish
+zrex completion fish | source
+```
 
 ## Controls While Attached
 
