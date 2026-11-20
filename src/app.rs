@@ -115,7 +115,7 @@ pub async fn attach(
     block: Option<String>,
 ) -> Result<()> {
     ensure_terminal()?;
-    let (mut ctrl, mut events) = Control::connect(server, None).await?;
+    let (mut ctrl, events) = Control::connect(server, None).await?;
     let session_id = match target.as_deref() {
         Some(target) => session::find_or_create(&mut ctrl, target).await?,
         None => session::pick(&mut ctrl, None).await?,
@@ -130,19 +130,54 @@ pub async fn attach(
         }
         None => (None, block),
     };
+    attach_block(
+        server,
+        ctrl,
+        events,
+        &session_id,
+        BlockSelection::Selectors(window.as_deref(), block.as_deref()),
+    )
+    .await
+}
+
+/// Picker targets are a snapshot of existing IDs, never creation selectors.
+pub async fn attach_existing(
+    server: &ServerAddress,
+    session_id: &str,
+    block_id: &str,
+) -> Result<()> {
+    ensure_terminal()?;
+    let (mut ctrl, events) = Control::connect(server, None).await?;
+    ctrl.call("session.attach", json!({"session_id": session_id}))
+        .await?;
+    attach_block(
+        server,
+        ctrl,
+        events,
+        session_id,
+        BlockSelection::Exact(block_id),
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum BlockSelection<'a> {
+    Selectors(Option<&'a str>, Option<&'a str>),
+    Exact(&'a str),
+}
+
+async fn attach_block(
+    server: &ServerAddress,
+    mut ctrl: Control,
+    mut events: Events,
+    session_id: &str,
+    selection: BlockSelection<'_>,
+) -> Result<()> {
     let size = crossterm::terminal::size()?;
     let mut guard = Screen::enter()?;
     let (theme, probe_tail) = guard.probe_theme();
-    let mut attached = Attached::start(
-        &mut ctrl,
-        &session_id,
-        server,
-        window.as_deref(),
-        block.as_deref(),
-        size,
-        theme,
-    )
-    .await?;
+    let mut attached =
+        Attached::start(&mut ctrl, session_id, server, selection, size, theme).await?;
     // Replies the probe deadline cut off arrive after it returns, so the reader
     // that takes over stdin starts out holding the fragment it left.
     attached.replies.hold(probe_tail);
@@ -345,8 +380,7 @@ impl<'a> Attached<'a> {
         ctrl: &mut Control,
         session_id: &str,
         server: &'a ServerAddress,
-        window: Option<&str>,
-        block: Option<&str>,
+        selection: BlockSelection<'_>,
         (cols, rows): (u16, u16),
         theme: Theme,
     ) -> Result<Self> {
@@ -369,12 +403,16 @@ impl<'a> Attached<'a> {
             .and_then(|selected| selected.get("view"))
             .cloned()
             .ok_or_else(|| anyhow!("bootstrap attached to no session"))?;
-        let block_id =
-            session::block_of(&view, window, block).ok_or_else(|| match (window, block) {
-                (_, Some(blk)) => anyhow!("the window has no block {blk}"),
-                (Some(win), None) => anyhow!("the session has no window {win}"),
-                (None, None) => anyhow!("the session's active window shows no block"),
-            })?;
+        let block_id = match selection {
+            BlockSelection::Exact(id) if session::has_block(&view, id) => id.to_owned(),
+            BlockSelection::Exact(id) => bail!("the selected block {id} is no longer available"),
+            BlockSelection::Selectors(window, block) => session::block_of(&view, window, block)
+                .ok_or_else(|| match (window, block) {
+                    (_, Some(blk)) => anyhow!("the window has no block {blk}"),
+                    (Some(win), None) => anyhow!("the session has no window {win}"),
+                    (None, None) => anyhow!("the session's active window shows no block"),
+                })?,
+        };
 
         finish_call(start_take(ctrl, session_id, &block_id)?).await?;
         let ticket_rx = start_ticket(ctrl, session_id, &block_id)?;
@@ -1517,9 +1555,9 @@ fn has_da1_reply(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attached, Ending, Flow, RETRY_FIRST, RETRY_MAX, Replies, Theme, backoff, closed_block,
-        detach, has_da1_reply, is_detach, parse_theme_reply, reports_scheme, split_replies,
-        take_utf8, theme_query,
+        Attached, BlockSelection, Ending, Flow, RETRY_FIRST, RETRY_MAX, Replies, Theme, backoff,
+        closed_block, detach, has_da1_reply, is_detach, parse_theme_reply, reports_scheme,
+        split_replies, take_utf8, theme_query,
     };
     use crate::rex::control::Control;
     use crate::rex::data::StreamClosed;
@@ -1937,8 +1975,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            None,
-            None,
+            BlockSelection::Selectors(None, None),
             (40, 10),
             theme,
         )

@@ -1,4 +1,5 @@
 mod app;
+mod picker;
 mod rex;
 mod session;
 
@@ -16,6 +17,7 @@ zrex: use a session on a Rex server from a terminal
 
 Usage:
   zrex [--server ADDRESS] ls
+  zrex [--server ADDRESS] pick
   zrex [--server ADDRESS] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
   zrex [--server ADDRESS] kill SESSION
   zrex [--server ADDRESS] completion zsh|bash|fish
@@ -38,7 +40,10 @@ lists every session, its windows, and any splits (1.1, 1.2, ...) with a star on
 the active window and block, and the terminal title a window's focused block
 reports beside the window's label. completion prints a shell completion script
 that completes session labels, window numbers and labels, and block numbers and
-labels from the live server.
+labels from the live server. pick fuzzy-searches existing sessions, windows,
+and splits on the default and saved servers (~/.config/zrex/config.toml,
+or $XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that
+address. Enter attaches, and Esc cancels.
 
 While attached:
   Ctrl-backslash          detach, and leave the session running
@@ -51,6 +56,9 @@ enum Command {
     Help,
     Version,
     List,
+    Pick {
+        explicit_server: bool,
+    },
     Attach {
         target: Option<String>,
         window: Option<String>,
@@ -155,6 +163,7 @@ fn parse_args(
         pending,
         early_command,
     } = Arguments::scan(args)?;
+    let explicit_server = server.is_some();
     let server = configured_server(server, env_server);
     if let Some(command) = early_command {
         return Ok((server, command));
@@ -169,6 +178,12 @@ fn parse_args(
     }
     let cmd = match command.as_deref() {
         Some("ls") => Command::List,
+        Some("pick") => {
+            if target.is_some() || window.is_some() || block.is_some() {
+                anyhow::bail!("usage: zrex [--server ADDRESS] pick");
+            }
+            Command::Pick { explicit_server }
+        }
         Some("a" | "attach") => Command::Attach {
             target,
             window,
@@ -217,6 +232,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::List => list(&server().await?).await,
+        Command::Pick { explicit_server } => {
+            picker::run(configured_server.as_deref(), explicit_server).await
+        }
         Command::Attach {
             target,
             window,
@@ -364,7 +382,7 @@ fn clean_title(title: &str) -> String {
     short
 }
 
-const COMPLETION_COMMANDS: [&str; 5] = ["a", "attach", "kill", "ls", "completion"];
+const COMPLETION_COMMANDS: [&str; 6] = ["a", "attach", "kill", "ls", "pick", "completion"];
 
 #[derive(Debug, PartialEq, Eq)]
 enum Completion {
@@ -411,7 +429,7 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
         None => Completion::Commands,
         Some("a" | "attach" | "kill") if parsed.target.is_none() => Completion::Sessions,
         Some("a" | "attach") => Completion::Flags { attach: true },
-        Some("kill" | "ls" | "completion") => Completion::Flags { attach: false },
+        Some("kill" | "ls" | "pick" | "completion") => Completion::Flags { attach: false },
         Some(_) => Completion::Nothing,
     }
 }
@@ -548,6 +566,30 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn pick_distinguishes_a_server_override_from_the_environment_default() {
+        let env = Some("https://default.example".to_owned());
+        assert_eq!(
+            parse_args(args(&["pick"]), env.clone()).unwrap(),
+            (
+                env.clone(),
+                Command::Pick {
+                    explicit_server: false
+                }
+            )
+        );
+        assert_eq!(
+            parse_args(args(&["pick", "-S", "https://only.example"]), env).unwrap(),
+            (
+                Some("https://only.example".to_owned()),
+                Command::Pick {
+                    explicit_server: true
+                }
+            )
+        );
+        assert!(parse_args(args(&["pick", "--window", "1"]), None).is_err());
     }
 
     #[test]

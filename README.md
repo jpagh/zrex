@@ -7,6 +7,7 @@ A lightweight command-line client for a [Rex](https://www.superlogical.com/rex/d
 ## Features
 
 - **Session management**: List, create, attach to, and destroy sessions by label, full ID, or 4+ character ID suffix.
+- **Attach picker**: Fuzzy-search existing sessions, windows, and splits across saved Rex servers.
 - **Window and split selection**: List windows and split panes (`1.1`, `1.2`, ...), attach to any window or split with `--window` (`-w`) and `--block` (`-b`), or create new windows on demand without changing the active window shown in Rex.app.
 - **Direct terminal pass-through**: Runs in your terminal's normal screen buffer so native scrollback, native mouse text selection, clickable URLs, Kitty graphics, and OSC escape sequences work directly without an intermediate renderer.
 - **Full state rehydration**: Restores scrollback history, cursor state, colors, and terminal modes from the server on attach, and resets terminal modes cleanly on detach.
@@ -26,6 +27,9 @@ cargo build --release
 ## Usage
 
 ```sh
+# Fuzzy-pick an existing session, window, or split
+zrex pick
+
 # List sessions, windows, split blocks, and terminal titles
 zrex -S https://server.example ls
 
@@ -53,6 +57,20 @@ zrex -S https://server.example kill work
 The server address is read from `--server` (`-S`), then `REX_SERVER`. Without either, `zrex` uses a local Rex server's Unix socket when one is running, and otherwise defaults to `http://127.0.0.1:7297`. An address may be an HTTP(S) URL or a Unix socket address such as `unix:///Users/you/Library/Application%20Support/rex/server.sock`. An address without a port uses the scheme's default port: 80 for HTTP, 443 for HTTPS.
 
 To reach a Rex server on another machine over Tailscale, use the HTTPS address that `rex server status` reports (for example `https://my-mac.tail1234.ts.net`). The Tailscale node serves HTTPS on port 443, so a bare IP with no port falls back to HTTP on port 80 and is refused.
+
+### Attach Picker
+
+Run `zrex pick`, type to filter, and use the arrow keys and Enter to attach in the same terminal. Esc cancels. `Ctrl-\` detaches straight back to your shell. The picker never creates a session or window.
+
+To search multiple servers, save their names and addresses in `~/.config/zrex/config.toml` (or `$XDG_CONFIG_HOME/zrex/config.toml`):
+
+```toml
+[servers]
+office = "https://office.example.com"
+lab = "https://lab.example.com"
+```
+
+Each choice shows its server name. `zrex pick` searches the saved servers alongside the local server (or `REX_SERVER`, if set). Servers are queried in parallel with a short timeout, so an unreachable server doesn't prevent you from picking from another one. Use `zrex -S ADDRESS pick` to search just one server without reading the config file.
 
 ### Selecting Sessions, Windows, and Blocks
 
