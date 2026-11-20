@@ -62,6 +62,8 @@ To reach a Rex server on another machine over Tailscale, use the HTTPS address t
 
 Run `zrex pick`, type to filter, and use the arrow keys and Enter to attach in the same terminal. `Ctrl-U` clears the entire search query, and Esc cancels. `Ctrl-\` detaches straight back to your shell. The picker never creates a session or window.
 
+Use `Alt/Option-←` and `Alt/Option-→` to move by word. `Ctrl-←`/`Ctrl-→` and `Alt-B`/`Alt-F` also work, depending on what your terminal sends. `Home`/`End` or `Ctrl-A`/`Ctrl-E` go to the start or end of the query.
+
 Alongside the window and split labels, the picker shows the terminal title and OSC 7501 program status when Rex has them. You can search the displayed text, for example `blocked` or an agent name. If a pane reports multiple statuses, the picker shows the one that most needs attention. Titles and statuses are fetched when the picker opens.
 
 To search multiple servers, save their names and addresses in `~/.config/zrex/config.toml` (or `$XDG_CONFIG_HOME/zrex/config.toml`):

@@ -137,6 +137,24 @@ pub(super) fn select(targets: &[&Target]) -> io::Result<Option<usize>> {
                 query.remove(cursor);
                 true
             }
+            (KeyCode::Left, KeyModifiers::ALT | KeyModifiers::CONTROL)
+            | (KeyCode::Char('b'), KeyModifiers::ALT) => {
+                cursor = word_left(&query, cursor);
+                false
+            }
+            (KeyCode::Right, KeyModifiers::ALT | KeyModifiers::CONTROL)
+            | (KeyCode::Char('f'), KeyModifiers::ALT) => {
+                cursor = word_right(&query, cursor);
+                false
+            }
+            (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                cursor = 0;
+                false
+            }
+            (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                cursor = query.len();
+                false
+            }
             (KeyCode::Left, _) => {
                 cursor = cursor.saturating_sub(1);
                 false
@@ -167,4 +185,24 @@ pub(super) fn select(targets: &[&Target]) -> io::Result<Option<usize>> {
             first = 0;
         }
     }
+}
+
+fn word_left(query: &[char], cursor: usize) -> usize {
+    cursor - word_distance(query[..cursor].iter().rev())
+}
+
+fn word_right(query: &[char], cursor: usize) -> usize {
+    cursor + word_distance(query[cursor..].iter())
+}
+
+fn word_distance<'a>(chars: impl Iterator<Item = &'a char>) -> usize {
+    let mut chars = chars.peekable();
+    let mut distance = 0;
+    while chars.next_if(|ch| !ch.is_alphanumeric()).is_some() {
+        distance += 1;
+    }
+    while chars.next_if(|ch| ch.is_alphanumeric()).is_some() {
+        distance += 1;
+    }
+    distance
 }
