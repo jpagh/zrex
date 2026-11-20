@@ -314,10 +314,8 @@ enum Completion {
 }
 
 /// Reads the words before the cursor the way `parse_args` does, but never fails.
-fn completion_context(words: &[String]) -> Completion {
-    let Some((current, done)) = words.split_last() else {
-        return Completion::Commands;
-    };
+/// The shell passes the word being completed first, then the words before it.
+fn completion_context(current: &str, done: &[String]) -> Completion {
     let mut command: Option<String> = None;
     let mut target: Option<String> = None;
     let mut window: Option<String> = None;
@@ -366,13 +364,15 @@ fn completion_context(words: &[String]) -> Completion {
     }
 }
 
-async fn complete(words: Vec<String>) {
-    let current = words.last().cloned().unwrap_or_default();
-    let context = completion_context(&words);
+async fn complete(args: Vec<String>) {
+    let Some((current, done)) = args.split_first() else {
+        return;
+    };
+    let context = completion_context(current, done);
     if context == Completion::Nothing {
         return;
     }
-    let Some(server) = completion_server(&words) else {
+    let Some(server) = completion_server(done) else {
         return;
     };
     let candidates = match context {
@@ -658,33 +658,44 @@ mod tests {
 
     #[test]
     fn chooses_completion_from_the_words_so_far() {
-        assert_eq!(completion_context(&args(&[""])), Completion::Commands);
-        assert_eq!(completion_context(&args(&["a", ""])), Completion::Sessions);
+        assert_eq!(completion_context("", &[]), Completion::Commands);
+        assert_eq!(completion_context("", &args(&["a"])), Completion::Sessions);
         assert_eq!(
-            completion_context(&args(&["kill", ""])),
+            completion_context("", &args(&["kill"])),
             Completion::Sessions
         );
         assert_eq!(
-            completion_context(&args(&["a", "work", "-w", ""])),
+            completion_context("", &args(&["a", "work", "-w"])),
             Completion::Windows {
                 session: Some("work".to_owned())
             }
         );
         assert_eq!(
-            completion_context(&args(&["a", "work", "-w", "1", "-b", ""])),
+            completion_context("", &args(&["a", "work", "-w", "1", "-b"])),
             Completion::Blocks {
                 session: Some("work".to_owned()),
                 window: Some("1".to_owned())
             }
         );
         assert_eq!(
-            completion_context(&args(&["a", "work", "--w"])),
+            completion_context("--w", &args(&["a", "work"])),
             Completion::Flags { attach: true }
         );
         assert_eq!(
-            completion_context(&args(&["-S", "http://example.com", ""])),
+            completion_context("--server", &[]),
+            Completion::Flags { attach: false }
+        );
+        assert_eq!(
+            completion_context("", &args(&["--server", "http://example.com"])),
             Completion::Commands
         );
-        assert_eq!(completion_context(&args(&["-S", ""])), Completion::Nothing);
+        assert_eq!(
+            completion_context("", &args(&["--server", "http://example.com", "a"])),
+            Completion::Sessions
+        );
+        assert_eq!(
+            completion_context("", &args(&["--server"])),
+            Completion::Nothing
+        );
     }
 }
