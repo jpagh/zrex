@@ -5,9 +5,11 @@ mod session;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::time::Duration;
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::Value;
+use tokio::time::timeout;
 
 use crate::rex::ServerAddress;
 use crate::rex::control::Control;
@@ -20,7 +22,7 @@ Usage:
   zrex [--server ADDRESS] pick
   zrex [--server ADDRESS] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
   zrex [--server ADDRESS] kill SESSION
-  zrex [--server ADDRESS] completion zsh|bash|fish
+  zrex completion zsh|bash|fish
   zrex --version
 
 The server address comes from --server, or from REX_SERVER. Without either, zrex
@@ -71,6 +73,30 @@ enum Command {
     Unknown(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Subcommand {
+    List,
+    Pick,
+    Attach,
+    Kill,
+    Completion,
+}
+
+impl Subcommand {
+    const COMPLETION_NAMES: [&str; 6] = ["a", "attach", "kill", "ls", "pick", "completion"];
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "ls" => Some(Self::List),
+            "pick" => Some(Self::Pick),
+            "a" | "attach" => Some(Self::Attach),
+            "kill" => Some(Self::Kill),
+            "completion" => Some(Self::Completion),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Shell {
     Zsh,
@@ -79,6 +105,17 @@ enum Shell {
 }
 
 impl Shell {
+    const NAMES: [&str; 3] = ["zsh", "bash", "fish"];
+
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "zsh" => Some(Self::Zsh),
+            "bash" => Some(Self::Bash),
+            "fish" => Some(Self::Fish),
+            _ => None,
+        }
+    }
+
     fn script(&self) -> &'static str {
         match self {
             Self::Zsh => include_str!("../completions/zrex.zsh"),
@@ -177,32 +214,34 @@ fn parse_args(
         None => {}
     }
     let cmd = match command.as_deref() {
-        Some("ls") => Command::List,
-        Some("pick") => {
-            if target.is_some() || window.is_some() || block.is_some() {
-                anyhow::bail!("usage: zrex [--server ADDRESS] pick");
+        Some(name) => match Subcommand::parse(name) {
+            Some(Subcommand::List) => Command::List,
+            Some(Subcommand::Pick) => {
+                if target.is_some() || window.is_some() || block.is_some() {
+                    anyhow::bail!("usage: zrex [--server ADDRESS] pick");
+                }
+                Command::Pick { explicit_server }
             }
-            Command::Pick { explicit_server }
-        }
-        Some("a" | "attach") => Command::Attach {
-            target,
-            window,
-            block,
+            Some(Subcommand::Attach) => Command::Attach {
+                target,
+                window,
+                block,
+            },
+            Some(Subcommand::Kill) => match target {
+                Some(target) => Command::Kill { target },
+                None => anyhow::bail!("kill needs a session"),
+            },
+            Some(Subcommand::Completion) => match target.as_deref() {
+                Some(other) => match Shell::parse(other) {
+                    Some(shell) => Command::Completion(shell),
+                    None => {
+                        anyhow::bail!("no completion script for {other}; use zsh, bash, or fish")
+                    }
+                },
+                None => anyhow::bail!("completion needs zsh, bash, or fish"),
+            },
+            None => Command::Unknown(name.to_owned()),
         },
-        Some("kill") => match target {
-            Some(target) => Command::Kill { target },
-            None => anyhow::bail!("kill needs a session"),
-        },
-        Some("completion") => match target.as_deref() {
-            Some("zsh") => Command::Completion(Shell::Zsh),
-            Some("bash") => Command::Completion(Shell::Bash),
-            Some("fish") => Command::Completion(Shell::Fish),
-            Some(other) => {
-                anyhow::bail!("no completion script for {other}; use zsh, bash, or fish")
-            }
-            None => anyhow::bail!("completion needs zsh, bash, or fish"),
-        },
-        Some(other) => Command::Unknown(other.to_owned()),
         None => Command::Help,
     };
     Ok((server, cmd))
@@ -289,16 +328,14 @@ async fn window_titles(
         let Some(block_id) = window.focused_block_id else {
             continue;
         };
-        let payload = json!({"session_id": session_id, "block_id": block_id});
-        if let Ok(reply) = ctrl.start_call("com.superlogical.terminal.title", payload) {
+        if let Ok(reply) = session::start_terminal_title(ctrl, session_id, &block_id) {
             pending.push((window.id, reply));
         }
     }
     let mut titles = HashMap::new();
     for (window_id, reply) in pending {
         if let Ok(Ok(reply)) = reply.await
-            && let Some(title) = reply.get("title").and_then(Value::as_str)
-            && !title.is_empty()
+            && let Some(title) = session::terminal_title_of(&reply)
         {
             titles.insert(window_id, title.to_owned());
         }
@@ -360,11 +397,10 @@ async fn kill(server: &ServerAddress, target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Terminal titles come from programs, so strip control characters and keep a
-/// listing to one line before printing one.
-fn clean_title(title: &str) -> String {
-    let cleaned: String = title
-        .chars()
+/// Server- and program-provided text must not send terminal escapes or span
+/// multiple lines.
+pub(crate) fn clean_one_line(text: &str) -> String {
+    text.chars()
         .map(|character| {
             if character.is_control() {
                 ' '
@@ -372,21 +408,32 @@ fn clean_title(title: &str) -> String {
                 character
             }
         })
-        .collect();
-    let cleaned = cleaned.trim();
-    let mut short: String = cleaned.chars().take(80).collect();
-    if cleaned.chars().count() > 80 {
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+pub(crate) fn clean_truncated(text: &str, max_chars: usize) -> String {
+    let cleaned = clean_one_line(text);
+    let mut chars = cleaned.chars();
+    let mut short: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
         short.pop();
         short.push('…');
     }
     short
 }
 
-const COMPLETION_COMMANDS: [&str; 6] = ["a", "attach", "kill", "ls", "pick", "completion"];
+fn clean_title(title: &str) -> String {
+    clean_truncated(title, 80)
+}
+
+const COMPLETION_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
 enum Completion {
     Commands,
+    Shells,
     Sessions,
     Flags {
         attach: bool,
@@ -420,17 +467,22 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
         }
         None => {}
     }
-    let command = parsed.command.as_deref();
-    let attach = matches!(command, Some("a" | "attach"));
-    if current.starts_with('-') && current != "-" {
+    let subcommand = parsed.command.as_deref().map(Subcommand::parse);
+    let attach = matches!(subcommand, Some(Some(Subcommand::Attach)));
+    if current.starts_with('-') {
         return Completion::Flags { attach };
     }
-    match command {
+    match subcommand {
         None => Completion::Commands,
-        Some("a" | "attach" | "kill") if parsed.target.is_none() => Completion::Sessions,
-        Some("a" | "attach") => Completion::Flags { attach: true },
-        Some("kill" | "ls" | "pick" | "completion") => Completion::Flags { attach: false },
-        Some(_) => Completion::Nothing,
+        Some(Some(Subcommand::Completion)) if parsed.target.is_none() => Completion::Shells,
+        Some(Some(Subcommand::Attach | Subcommand::Kill)) if parsed.target.is_none() => {
+            Completion::Sessions
+        }
+        Some(Some(Subcommand::Attach)) => Completion::Flags { attach: true },
+        Some(Some(
+            Subcommand::Kill | Subcommand::List | Subcommand::Pick | Subcommand::Completion,
+        )) => Completion::Flags { attach: false },
+        Some(None) => Completion::Nothing,
     }
 }
 
@@ -444,23 +496,32 @@ async fn complete(mut args: impl Iterator<Item = String>) {
     };
     let candidates = match completion_context(&current, &parsed) {
         Completion::Nothing => return,
-        Completion::Commands => COMPLETION_COMMANDS.into_iter().map(str::to_owned).collect(),
+        Completion::Commands => Subcommand::COMPLETION_NAMES
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        Completion::Shells => Shell::NAMES.into_iter().map(str::to_owned).collect(),
         Completion::Flags { attach } => flags(attach),
         context => {
             let configured = configured_server(parsed.server, env::var("REX_SERVER").ok());
-            let Ok(server) = server_address(configured.as_deref()).await else {
+            let Ok(Some(candidates)) = timeout(COMPLETION_TIME, async {
+                let server = server_address(configured.as_deref()).await.ok()?;
+                Some(match context {
+                    Completion::Sessions => session_candidates(&server).await,
+                    Completion::Windows { session } => {
+                        window_candidates(&server, session.as_deref()).await
+                    }
+                    Completion::Blocks { session, window } => {
+                        block_candidates(&server, session.as_deref(), window.as_deref()).await
+                    }
+                    _ => unreachable!(),
+                })
+            })
+            .await
+            else {
                 return;
             };
-            match context {
-                Completion::Sessions => session_candidates(&server).await,
-                Completion::Windows { session } => {
-                    window_candidates(&server, session.as_deref()).await
-                }
-                Completion::Blocks { session, window } => {
-                    block_candidates(&server, session.as_deref(), window.as_deref()).await
-                }
-                _ => unreachable!(),
-            }
+            candidates
         }
     };
     let prefix = current.to_lowercase();
@@ -768,6 +829,32 @@ mod tests {
         );
         assert_eq!(
             completion_context("--server", &[]),
+            Completion::Flags { attach: false }
+        );
+        assert_eq!(
+            completion_context("-", &[]),
+            Completion::Flags { attach: false }
+        );
+        assert_eq!(
+            completion_context("-", &args(&["a"])),
+            Completion::Flags { attach: true }
+        );
+        assert_eq!(
+            completion_context("-", &args(&["a", "work", "-w"])),
+            Completion::Windows {
+                session: Some("work".to_owned())
+            }
+        );
+        assert_eq!(
+            completion_context("", &args(&["completion"])),
+            Completion::Shells
+        );
+        assert_eq!(
+            completion_context("z", &args(&["completion"])),
+            Completion::Shells
+        );
+        assert_eq!(
+            completion_context("", &args(&["completion", "zsh"])),
             Completion::Flags { attach: false }
         );
         assert_eq!(
