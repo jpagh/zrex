@@ -33,6 +33,10 @@ pub async fn view(ctrl: &mut Control, session_id: &str) -> Result<Value> {
         .await
 }
 
+pub fn start_view(ctrl: &mut Control, session_id: &str) -> Result<PendingCall> {
+    ctrl.start_call("session.view", json!({"session_id": session_id}))
+}
+
 pub fn start_terminal_title(
     ctrl: &mut Control,
     session_id: &str,
