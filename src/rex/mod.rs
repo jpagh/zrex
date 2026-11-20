@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileTypeExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -12,7 +12,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, client_async_tls};
 
@@ -63,74 +62,89 @@ impl FromStr for ServerAddress {
 }
 
 impl ServerAddress {
-    pub fn local_or_loopback() -> Self {
-        discover_local_socket()
-            .map(Self::Unix)
-            .unwrap_or_else(|| Self::Network("ws://127.0.0.1:7297".to_owned()))
+    pub async fn local_or_loopback() -> Self {
+        Self::first_reachable_local(local_socket_candidates()).await
     }
 
-    fn websocket_url(&self, route: &str) -> String {
-        let base = match self {
-            Self::Network(base) => base,
+    async fn first_reachable_local(candidates: impl IntoIterator<Item = PathBuf>) -> Self {
+        for path in candidates {
+            if path.metadata().is_ok_and(|m| m.file_type().is_socket())
+                && with_connect_timeout(UnixStream::connect(&path))
+                    .await
+                    .is_ok()
+            {
+                return Self::Unix(path);
+            }
+        }
+        Self::Network("ws://127.0.0.1:7297".to_owned())
+    }
+
+    async fn open(&self, route: &str, protocol: &'static str) -> Result<Socket> {
+        self.endpoint(route).open(protocol).await
+    }
+
+    fn endpoint(&self, route: &str) -> Endpoint<'_> {
+        let (base, unix_path) = match self {
+            Self::Network(base) => (base.as_str(), None),
             // The host is only used in the WebSocket handshake over Unix.
-            Self::Unix(_) => "ws://localhost",
+            Self::Unix(path) => ("ws://localhost", Some(path.as_path())),
         };
-        format!("{base}{route}")
+        Endpoint {
+            url: format!("{base}{route}"),
+            unix_path,
+        }
     }
+}
 
+struct Endpoint<'a> {
+    url: String,
+    unix_path: Option<&'a Path>,
+}
+
+impl Endpoint<'_> {
     /// Retry initial socket opens because mobile links often drop the first
     /// SYN or TLS packet.
-    async fn open(&self, route: &str, protocol: &'static str) -> Result<Socket> {
-        let url = self.websocket_url(route);
+    async fn open(&self, protocol: &'static str) -> Result<Socket> {
         let mut last = None;
         for try_number in 1..=OPEN_TRIES {
             if try_number > 1 {
                 tokio::time::sleep(Duration::from_millis(200 * u64::from(try_number))).await;
             }
-            match self.try_open(&url, protocol).await {
+            match self.try_open(protocol).await {
                 Ok(socket) => return Ok(socket),
                 Err(error) => last = Some(error),
             }
         }
-        match last {
-            Some(error) => Err(error.context(format!("could not reach {}", self.target(route)))),
-            None => Err(anyhow!("could not reach {}", self.target(route))),
-        }
+        let target = self
+            .unix_path
+            .map_or_else(|| self.url.clone(), |path| path.display().to_string());
+        let message = format!("could not reach {target}");
+        Err(match last {
+            Some(error) => error.context(message),
+            None => anyhow!(message),
+        })
     }
 
-    /// The address to show in errors: the WebSocket URL for a network server,
-    /// or the socket path for a Unix socket, where the URL's host is a stand-in.
-    fn target(&self, route: &str) -> String {
-        match self {
-            Self::Network(_) => self.websocket_url(route),
-            Self::Unix(path) => path.display().to_string(),
-        }
-    }
-
-    async fn try_open(&self, url: &str, protocol: &'static str) -> Result<Socket> {
-        let mut request = url.into_client_request()?;
+    async fn try_open(&self, protocol: &'static str) -> Result<Socket> {
+        let mut request = self.url.as_str().into_client_request()?;
         request
             .headers_mut()
             .insert("Sec-WebSocket-Protocol", HeaderValue::from_static(protocol));
 
-        match self {
-            Self::Network(_) => {
-                with_connect_timeout(async {
-                    let stream = connect_tcp(request.uri()).await?;
-                    websocket(request, stream).await
-                })
-                .await
-            }
-            Self::Unix(path) => {
-                let stream = with_connect_timeout(UnixStream::connect(path)).await?;
-                with_connect_timeout(websocket(request, stream)).await
-            }
-        }
+        with_connect_timeout(async {
+            let stream: Box<dyn Transport> = match self.unix_path {
+                Some(path) => Box::new(UnixStream::connect(path).await?),
+                None => Box::new(connect_tcp(request.uri()).await?),
+            };
+            let (socket, _) = client_async_tls(request, stream).await?;
+            Ok::<_, anyhow::Error>(socket)
+        })
+        .await
     }
 }
 
 /// Finds the local server's socket even outside a terminal started by Rex.
-fn discover_local_socket() -> Option<PathBuf> {
+fn local_socket_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     #[cfg(target_os = "macos")]
     if let Some(home) = env::var_os("HOME") {
@@ -144,10 +158,7 @@ fn discover_local_socket() -> Option<PathBuf> {
         candidates.push(PathBuf::from("/run/rex/server.sock"));
         candidates.push(PathBuf::from("/var/run/rex/server.sock"));
     }
-    candidates.into_iter().find(|path| {
-        path.metadata()
-            .is_ok_and(|metadata| metadata.file_type().is_socket())
-    })
+    candidates
 }
 
 fn decode_percent(text: &str) -> Result<Vec<u8>> {
@@ -188,12 +199,6 @@ async fn connect_tcp(uri: &Uri) -> Result<TcpStream> {
     Ok(stream)
 }
 
-async fn websocket(request: Request, stream: impl Transport + 'static) -> Result<Socket> {
-    let stream: Box<dyn Transport> = Box::new(stream);
-    let (socket, _) = client_async_tls(request, stream).await?;
-    Ok(socket)
-}
-
 async fn with_connect_timeout<T, E: Into<anyhow::Error>>(
     operation: impl Future<Output = std::result::Result<T, E>>,
 ) -> Result<T> {
@@ -225,7 +230,7 @@ mod tests {
     use futures_util::SinkExt;
     use tokio::net::UnixListener;
     use tokio_tungstenite::accept_hdr_async;
-    use tokio_tungstenite::tungstenite::handshake::server::Response;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
     #[test]
     fn builds_websocket_urls_from_network_addresses() {
@@ -237,11 +242,11 @@ mod tests {
         ] {
             let address: ServerAddress = address.parse().unwrap();
             assert_eq!(
-                address.websocket_url("/api/control"),
+                address.endpoint("/api/control").url,
                 format!("{base}/api/control")
             );
             assert_eq!(
-                address.websocket_url("/api/data"),
+                address.endpoint("/api/data").url,
                 format!("{base}/api/data")
             );
         }
@@ -257,15 +262,24 @@ mod tests {
             ServerAddress::Unix(PathBuf::from("/tmp/100% rex.sock"))
         );
         assert_eq!(
-            address.websocket_url("/api/control"),
+            address.endpoint("/api/control").url,
             "ws://localhost/api/control"
         );
-        assert_eq!(
-            address.websocket_url("/api/data"),
-            "ws://localhost/api/data"
-        );
+        assert_eq!(address.endpoint("/api/data").url, "ws://localhost/api/data");
         assert!("unix://".parse::<ServerAddress>().is_err());
         assert!("unix:///tmp/bad%2.sock".parse::<ServerAddress>().is_err());
+    }
+
+    #[tokio::test]
+    async fn skips_stale_local_socket_files() {
+        let path = env::temp_dir().join(format!("zrex-stale-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let live = ServerAddress::first_reachable_local([path.clone()]).await;
+        drop(listener);
+        let stale = ServerAddress::first_reachable_local([path.clone()]).await;
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(live, ServerAddress::Unix(path));
+        assert_eq!(stale, "127.0.0.1:7297".parse().unwrap());
     }
 
     #[tokio::test]

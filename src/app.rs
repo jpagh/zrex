@@ -275,7 +275,6 @@ pub async fn attach(
                 return Err(error);
             }
             match recover(
-                server,
                 &mut token,
                 &mut ctrl,
                 &mut events,
@@ -323,7 +322,8 @@ impl Ending {
     }
 }
 
-struct Attached {
+struct Attached<'a> {
+    server: &'a ServerAddress,
     session_id: String,
     block_id: String,
     client_id: String,
@@ -340,11 +340,11 @@ struct Attached {
     owns: bool,
 }
 
-impl Attached {
+impl<'a> Attached<'a> {
     async fn start(
         ctrl: &mut Control,
         session_id: &str,
-        server: &ServerAddress,
+        server: &'a ServerAddress,
         window: Option<&str>,
         block: Option<&str>,
         (cols, rows): (u16, u16),
@@ -391,6 +391,7 @@ impl Attached {
         let data = Data::open(server, &ticket).await?;
         let filter = Filter::new(data.nonce);
         let attached = Self {
+            server,
             session_id: session_id.to_owned(),
             block_id,
             client_id,
@@ -681,11 +682,7 @@ impl Attached {
         Ok(())
     }
 
-    async fn reconnect(
-        &mut self,
-        ctrl: &mut Control,
-        server: &ServerAddress,
-    ) -> Result<Option<Ending>> {
+    async fn reconnect(&mut self, ctrl: &mut Control) -> Result<Option<Ending>> {
         let bootstrap = ctrl
             .call(
                 "session.bootstrap",
@@ -713,7 +710,7 @@ impl Attached {
         let owner = session::owner_of(view, &self.block_id);
         if owner.is_some_and(|owner| owner != self.client_id) {
             self.owns = false;
-            self.reconnect_data(ctrl, server).await?;
+            self.reconnect_data(ctrl).await?;
             return Ok(None);
         }
         if let Err(error) = finish_call(start_take(ctrl, &self.session_id, &self.block_id)?).await {
@@ -726,12 +723,12 @@ impl Attached {
         }
         self.owns = true;
         self.sync(ctrl, Push::Both).await?;
-        self.reconnect_data(ctrl, server).await?;
+        self.reconnect_data(ctrl).await?;
         Ok(None)
     }
 
-    async fn reconnect_data(&mut self, ctrl: &mut Control, server: &ServerAddress) -> Result<()> {
-        match Data::resume(server, self.data.token, self.data.received).await {
+    async fn reconnect_data(&mut self, ctrl: &mut Control) -> Result<()> {
+        match Data::resume(self.server, self.data.token, self.data.received).await {
             Ok(data) => {
                 self.filter = Filter::new(data.nonce);
                 self.data = data;
@@ -739,7 +736,7 @@ impl Attached {
             }
             Err(_) => {
                 let ticket = ticket(ctrl, &self.session_id, &self.block_id).await?;
-                self.data = Data::open(server, &ticket).await?;
+                self.data = Data::open(self.server, &ticket).await?;
                 self.filter = Filter::new(self.data.nonce);
                 self.pending.clear();
                 self.primed = false;
@@ -1286,16 +1283,15 @@ enum Recovered {
 }
 
 async fn recover(
-    server: &ServerAddress,
     token: &mut Option<String>,
     ctrl: &mut Control,
     events: &mut Events,
-    attached: &mut Attached,
+    attached: &mut Attached<'_>,
     input: &mut mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> Result<Recovered> {
     let mut delay = RETRY_FIRST;
     loop {
-        match attempt(server, token, ctrl, events, attached).await {
+        match attempt(token, ctrl, events, attached).await {
             Ok(None) => {
                 // Keys pressed while the link was down have nowhere to go,
                 // and the reply a held fragment belonged to is gone with them.
@@ -1320,19 +1316,18 @@ async fn recover(
 }
 
 async fn attempt(
-    server: &ServerAddress,
     token: &mut Option<String>,
     ctrl: &mut Control,
     events: &mut Events,
-    attached: &mut Attached,
+    attached: &mut Attached<'_>,
 ) -> Result<Option<Ending>> {
     if ctrl.call("server.version", Value::Null).await.is_err() {
-        let (new_ctrl, new_events) = Control::connect(server, token.as_deref()).await?;
+        let (new_ctrl, new_events) = Control::connect(attached.server, token.as_deref()).await?;
         *token = new_ctrl.reconnect_token.clone();
         *ctrl = new_ctrl;
         *events = new_events;
     }
-    attached.reconnect(ctrl, server).await
+    attached.reconnect(ctrl).await
 }
 
 fn backoff(delay: Duration) -> Duration {
@@ -1366,7 +1361,7 @@ fn stream_lost(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-async fn detach(ctrl: &mut Control, attached: &Attached) {
+async fn detach(ctrl: &mut Control, attached: &Attached<'_>) {
     let _ = ctrl
         .call("session.detach", json!({"session_id": attached.session_id}))
         .await;
