@@ -7,7 +7,8 @@
 | File | Role |
 | --- | --- |
 | `src/main.rs` | CLI parsing (`ls`, `pick`, `a`/`attach`, `kill`, `completion`), session/window/split listing with terminal titles, and shell completion |
-| `src/picker.rs` | Saved-server config, parallel session discovery, and one-shot fuzzy selection of an existing block |
+| `src/picker.rs` | Saved-server config, parallel session discovery, and target/status formatting for `zrex pick` |
+| `src/picker/prompt.rs` | Alternate-screen fuzzy prompt UI, key and word navigation, and rendering for `zrex pick` |
 | `src/app.rs` | Attach lifecycle: bootstrap, block ownership, sizing, VT stream priming, raw I/O pass-through, events, and reconnection |
 | `src/session.rs` | Session lookup/creation and `session.view` queries for windows and split blocks |
 | `src/rex/mod.rs` | Server address parsing, local socket discovery, WebSocket connection setup, and frame helpers |

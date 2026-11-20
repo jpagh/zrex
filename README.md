@@ -60,7 +60,7 @@ To reach a Rex server on another machine over Tailscale, use the HTTPS address t
 
 ### Attach Picker
 
-Run `zrex pick`, type to filter, and use the arrow keys and Enter to attach in the same terminal. `Ctrl-U` clears the entire search query, and Esc cancels. `Ctrl-\` detaches straight back to your shell. The picker never creates a session or window.
+Run `zrex pick`, type to filter, and use the arrow keys (or `Tab`/`Shift-Tab`) and Enter to attach in the same terminal. `Ctrl-U` clears the entire search query, and `Esc` or `Ctrl-C` cancels. `Ctrl-\` detaches straight back to your shell. The picker never creates a session or window.
 
 Use `Alt/Option-←` and `Alt/Option-→` to move by word. `Ctrl-←`/`Ctrl-→` and `Alt-B`/`Alt-F` also work, depending on what your terminal sends. `Home`/`End` or `Ctrl-A`/`Ctrl-E` go to the start or end of the query.
 

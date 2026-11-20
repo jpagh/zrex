@@ -29,10 +29,7 @@ pub(super) fn select(targets: &[&Target]) -> io::Result<Option<usize>> {
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen)?;
     let matcher = SkimMatcherV2::default();
-    let labels: Vec<_> = targets
-        .iter()
-        .map(|target| target.row(usize::MAX))
-        .collect();
+    let labels: Vec<_> = targets.iter().map(|target| target.search_text()).collect();
     let mut query = Vec::<char>::new();
     let mut cursor = 0;
     let mut selected: usize = 0;
@@ -205,4 +202,42 @@ fn word_distance<'a>(chars: impl Iterator<Item = &'a char>) -> usize {
         distance += 1;
     }
     distance
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chars(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn word_navigation_moves_across_delimiters_and_words() {
+        let query = chars("  office / dev-1  ");
+        assert_eq!(word_left(&query, 0), 0);
+        assert_eq!(word_left(&query, query.len()), 15);
+        assert_eq!(word_left(&query, 15), 11);
+        assert_eq!(word_left(&query, 11), 2);
+        assert_eq!(word_left(&query, 2), 0);
+
+        assert_eq!(word_right(&query, 0), 8);
+        assert_eq!(word_right(&query, 8), 14);
+        assert_eq!(word_right(&query, 14), 16);
+        assert_eq!(word_right(&query, 16), query.len());
+        assert_eq!(word_right(&query, query.len()), query.len());
+    }
+
+    #[test]
+    fn word_navigation_handles_empty_and_unicode_queries() {
+        let empty = chars("");
+        assert_eq!(word_left(&empty, 0), 0);
+        assert_eq!(word_right(&empty, 0), 0);
+
+        let unicode = chars("π-αβ");
+        assert_eq!(word_right(&unicode, 0), 1);
+        assert_eq!(word_right(&unicode, 1), 4);
+        assert_eq!(word_left(&unicode, 4), 2);
+        assert_eq!(word_left(&unicode, 2), 0);
+    }
 }
