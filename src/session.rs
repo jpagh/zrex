@@ -1,7 +1,10 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
 use crate::rex::control::Control;
+
+pub type PendingCall = oneshot::Receiver<Result<Value>>;
 
 pub async fn list(ctrl: &mut Control) -> Result<Vec<Value>> {
     let reply = ctrl.call("session.list", Value::Null).await?;
@@ -28,6 +31,24 @@ fn sessions_of(reply: &Value) -> Vec<Value> {
 pub async fn view(ctrl: &mut Control, session_id: &str) -> Result<Value> {
     ctrl.call("session.view", json!({"session_id": session_id}))
         .await
+}
+
+pub fn start_terminal_title(
+    ctrl: &mut Control,
+    session_id: &str,
+    block_id: &str,
+) -> Result<PendingCall> {
+    ctrl.start_call(
+        "com.superlogical.terminal.title",
+        json!({"session_id": session_id, "block_id": block_id}),
+    )
+}
+
+pub fn terminal_title_of(reply: &Value) -> Option<&str> {
+    reply
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty())
 }
 
 pub async fn destroy(ctrl: &mut Control, session_id: &str) -> Result<()> {
@@ -168,6 +189,14 @@ pub struct WindowSummary {
     pub blocks: Vec<BlockSummary>,
 }
 
+impl WindowSummary {
+    pub fn active_or_first_block_id(&self) -> Option<&str> {
+        self.active_block_id
+            .as_deref()
+            .or_else(|| self.blocks.first().map(|block| block.id.as_str()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockSummary {
     pub id: String,
@@ -186,10 +215,7 @@ pub fn block_of(
     };
     match block_sel {
         Some(selector) => find_block(window, selector),
-        None => window
-            .active_block_id
-            .clone()
-            .or_else(|| window.blocks.first().map(|block| block.id.clone())),
+        None => window.active_or_first_block_id().map(str::to_owned),
     }
 }
 
