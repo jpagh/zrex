@@ -91,7 +91,7 @@ pub async fn new_window(
         .ok_or_else(|| anyhow!("session.new_window returned no window"))
 }
 
-fn names(session: &Value, target: &str) -> bool {
+pub fn matches(session: &Value, target: &str) -> bool {
     let id = id_of(session);
     id == target
         || label_of(session).eq_ignore_ascii_case(target)
@@ -100,7 +100,7 @@ fn names(session: &Value, target: &str) -> bool {
 
 pub async fn find_or_create(ctrl: &mut Control, target: &str) -> Result<String> {
     let sessions = list(ctrl).await?;
-    match sessions.iter().find(|session| names(session, target)) {
+    match sessions.iter().find(|session| matches(session, target)) {
         Some(session) => Ok(id_of(session)),
         None => create(ctrl, Some(target)).await,
     }
@@ -114,7 +114,7 @@ pub async fn pick(ctrl: &mut Control, target: Option<&str>) -> Result<String> {
     let Some(target) = target else {
         return Ok(id_of(&sessions[0]));
     };
-    if let Some(session) = sessions.iter().find(|session| names(session, target)) {
+    if let Some(session) = sessions.iter().find(|session| matches(session, target)) {
         return Ok(id_of(session));
     }
     let known = sessions
@@ -430,12 +430,12 @@ mod tests {
     #[test]
     fn names_match_a_label_an_id_or_the_tail_of_an_id() {
         let work = session("session:01a1a9ff-0560", "work");
-        assert!(names(&work, "work"));
-        assert!(names(&work, "WORK"));
-        assert!(names(&work, "session:01a1a9ff-0560"));
-        assert!(names(&work, "0560"));
-        assert!(!names(&work, "056"));
-        assert!(!names(&work, "rest"));
+        assert!(matches(&work, "work"));
+        assert!(matches(&work, "WORK"));
+        assert!(matches(&work, "session:01a1a9ff-0560"));
+        assert!(matches(&work, "0560"));
+        assert!(!matches(&work, "056"));
+        assert!(!matches(&work, "rest"));
     }
 
     #[test]
