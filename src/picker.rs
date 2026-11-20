@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use dialoguer::{FuzzySelect, console::Term};
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout, timeout_at};
@@ -30,7 +30,9 @@ struct Server {
 }
 
 struct Target {
-    display: String,
+    label: String,
+    title: String,
+    status: String,
     session_id: String,
     block_id: String,
 }
@@ -64,20 +66,21 @@ pub async fn run(configured: Option<&str>, explicit_server: bool) -> Result<()> 
 
     // FuzzySelect identifies the chosen item by its display string. Keep each
     // row unique even when the same server has sessions with identical labels.
+    let term = Term::stdout();
+    let columns = usize::from(term.size().1);
     let mut seen = HashSet::new();
     let rows: Vec<_> = choices
         .iter()
         .map(|(_, target)| {
-            let mut row = target.display.clone();
+            let mut row = target.row(columns, "");
             let mut copy = 2;
             while !seen.insert(row.clone()) {
-                row = format!("{} ({copy})", target.display);
+                row = target.row(columns, &format!(" ({copy})"));
                 copy += 1;
             }
             row
         })
         .collect();
-    let term = Term::stdout();
     let selected = FuzzySelect::new()
         .with_prompt("Attach (Esc to cancel)")
         .default(0)
@@ -171,24 +174,154 @@ async fn discover(server: &Server) -> Result<(Vec<Target>, usize)> {
 
     // Send all view requests before waiting, so one slow session does not
     // prevent other sessions on the same server from appearing.
-    let views = entries.iter().filter_map(|entry| {
-        let id = session::id_of(entry);
-        if id.is_empty() {
-            return None;
-        }
-        let reply = ctrl.start_call("session.view", json!({"session_id": id}));
-        Some(async move {
-            let reply = reply.ok()?;
-            let view = timeout_at(deadline, reply).await.ok()?.ok()?.ok()?;
-            Some(targets(&server.name, entry, &id, &view))
+    let mut views: FuturesUnordered<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let id = session::id_of(entry);
+            if id.is_empty() {
+                return None;
+            }
+            let reply = ctrl.start_call("session.view", json!({"session_id": id}));
+            Some(async move {
+                let view = optional_reply(deadline, reply).await?;
+                Some((index, targets(&server.name, entry, &id, &view)))
+            })
         })
-    });
-    let views = join_all(views).await;
-    let missing_views = views.iter().filter(|view| view.is_none()).count();
+        .collect();
+    let mut missing_views = 0;
+    let mut pending = Vec::new();
+    while let Some(view) = views.next().await {
+        if let Some((index, targets)) = view {
+            // Start metadata queries as soon as this session's view arrives,
+            // without waiting for other views or extending the server deadline.
+            pending.push(describe_targets(&mut ctrl, deadline, index, targets));
+        } else {
+            missing_views += 1;
+        }
+    }
+    let mut groups = join_all(pending).await;
+    groups.sort_unstable_by_key(|(index, _)| *index);
     Ok((
-        views.into_iter().flatten().flatten().collect(),
+        groups
+            .into_iter()
+            .flat_map(|(_, targets)| targets)
+            .collect(),
         missing_views,
     ))
+}
+
+type Reply = Result<tokio::sync::oneshot::Receiver<Result<Value>>>;
+
+async fn optional_reply(deadline: Instant, reply: Reply) -> Option<Value> {
+    timeout_at(deadline, reply.ok()?).await.ok()?.ok()?.ok()
+}
+
+fn describe_targets(
+    ctrl: &mut Control,
+    deadline: Instant,
+    index: usize,
+    mut targets: Vec<Target>,
+) -> impl Future<Output = (usize, Vec<Target>)> + use<> {
+    let mut requests = HashMap::new();
+    for target in &targets {
+        // Session, window, and split rows can all point to the same block.
+        requests.entry(target.block_id.clone()).or_insert_with(|| {
+            let payload = json!({"session_id": target.session_id, "block_id": target.block_id});
+            let title = ctrl.start_call("com.superlogical.terminal.title", payload.clone());
+            let status = ctrl.start_call("com.superlogical.terminal.program_status", payload);
+            (title, status)
+        });
+    }
+    async move {
+        let details: HashMap<_, _> = join_all(requests.into_iter().map(
+            |(id, (title, status))| async move {
+                let (title, status) = tokio::join!(
+                    optional_reply(deadline, title),
+                    optional_reply(deadline, status)
+                );
+                let title = title
+                    .as_ref()
+                    .map_or_else(String::new, |reply| field(reply, "title", 64));
+                let status = status.as_ref().and_then(status_summary);
+                (id, (title, status))
+            },
+        ))
+        .await
+        .into_iter()
+        .collect();
+        for target in &mut targets {
+            if let Some((title, status)) = details.get(&target.block_id) {
+                target.title.clone_from(title);
+                if let Some(status) = status {
+                    target.status.clone_from(status);
+                }
+            }
+        }
+        (index, targets)
+    }
+}
+
+fn status_summary(reply: &Value) -> Option<String> {
+    let records = reply.get("records")?.as_array()?;
+    // Surface the record most likely to need attention. Keep the server's
+    // root-first order when records have the same priority.
+    let (record, state, _) = records
+        .iter()
+        .filter_map(|record| {
+            let (state, priority) = match record.get("state")?.as_str()? {
+                "blocked" => ("blocked", 0),
+                "error" => ("error", 1),
+                "working" => ("working", 2),
+                "done" => ("done", 3),
+                _ => ("idle", 4),
+            };
+            Some((record, state, priority))
+        })
+        .min_by_key(|(_, _, priority)| *priority)?;
+    let app = field(record, "effective_app", 24);
+    let app = if app.is_empty() {
+        field(record, "app", 24)
+    } else {
+        app
+    };
+    let mut summary = if app.is_empty() {
+        state.to_owned()
+    } else {
+        format!("{state} {app}")
+    };
+    if state == "blocked"
+        && let Some(kind @ ("permission" | "question" | "auth")) =
+            record.get("kind").and_then(Value::as_str)
+    {
+        summary.push_str(&format!(" ({kind})"));
+    }
+    if matches!(state, "working" | "blocked")
+        && let Some(progress @ 0..=100) = record.get("progress").and_then(Value::as_u64)
+    {
+        summary.push_str(&format!(" {progress}%"));
+    }
+    let title = field(record, "title", 40);
+    let message = field(record, "msg", 50);
+    for detail in [&title, &message]
+        .into_iter()
+        .filter(|detail| !detail.is_empty())
+    {
+        summary.push_str(": ");
+        summary.push_str(detail);
+    }
+    Some(summary)
+}
+
+fn field(value: &Value, key: &str, max_chars: usize) -> String {
+    let clean = one_line(value.get(key).and_then(Value::as_str).unwrap_or_default());
+    let mut chars = clean.chars();
+    let mut short: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        short.pop();
+        short.push('…');
+    }
+    short
 }
 
 fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<Target> {
@@ -198,9 +331,11 @@ fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<T
         label_or_id(session::label_of(entry), session_id)
     );
     let mut targets = Vec::new();
-    let mut add = |display: String, block_id: &str| {
+    let mut add = |label: String, block_id: &str| {
         targets.push(Target {
-            display,
+            label,
+            title: String::new(),
+            status: String::new(),
             session_id: session_id.to_owned(),
             block_id: block_id.to_owned(),
         });
@@ -236,6 +371,52 @@ fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<T
         }
     }
     targets
+}
+
+impl Target {
+    fn row(&self, columns: usize, suffix: &str) -> String {
+        let parts = [
+            ("", &self.label),
+            (" — ", &self.title),
+            (" · ", &self.status),
+        ];
+        let mut parts: Vec<_> = parts
+            .into_iter()
+            .filter(|(_, text)| !text.is_empty())
+            .map(|(separator, text)| (separator, text, 0))
+            .collect();
+        // Dialoguer's erase logic counts bytes, not display cells. Fit every
+        // row with room for its selection marker, sharing space across fields.
+        let separators: usize = parts.iter().map(|(separator, _, _)| separator.len()).sum();
+        let budget = columns.saturating_sub(3 + separators + suffix.len());
+        for _ in 0..budget {
+            let Some((_, _, limit)) = parts
+                .iter_mut()
+                .filter(|(_, text, limit)| *limit < text.len())
+                .min_by_key(|(_, _, limit)| *limit)
+            else {
+                break;
+            };
+            *limit += 1;
+        }
+        let mut row = String::new();
+        for (separator, text, limit) in parts {
+            if limit == 0 {
+                continue;
+            }
+            row.push_str(separator);
+            if text.len() <= limit {
+                row.push_str(text);
+            } else {
+                let marker = if limit >= 3 { "…" } else { "." };
+                let cutoff = text.floor_char_boundary(limit - marker.len());
+                row.push_str(&text[..cutoff]);
+                row.push_str(marker);
+            }
+        }
+        row.push_str(suffix);
+        row
+    }
 }
 
 fn label_or_id(label: &str, id: &str) -> String {
