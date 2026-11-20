@@ -58,7 +58,10 @@ pub async fn open(url: &str, protocol: &'static str) -> Result<Socket> {
             Err(error) => last = Some(error),
         }
     }
-    Err(last.unwrap_or_else(|| anyhow!("could not reach {url}")))
+    match last {
+        Some(error) => Err(error.context(format!("could not reach {url}"))),
+        None => Err(anyhow!("could not reach {url}")),
+    }
 }
 
 async fn try_open(url: &str, protocol: &'static str) -> Result<Socket> {
@@ -69,7 +72,12 @@ async fn try_open(url: &str, protocol: &'static str) -> Result<Socket> {
     let (socket, _response) =
         tokio::time::timeout(CONNECT_TIME, connect_async_with_config(request, None, true))
             .await
-            .map_err(|_| anyhow!("{url} did not answer within {}s", CONNECT_TIME.as_secs()))??;
+            .map_err(|_| {
+                anyhow!(
+                    "the server did not answer within {}s",
+                    CONNECT_TIME.as_secs()
+                )
+            })??;
     Ok(socket)
 }
 
