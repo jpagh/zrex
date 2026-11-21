@@ -13,44 +13,47 @@ use futures_util::future::join_all;
 use serde_json::Value;
 use tokio::time::{Instant, timeout, timeout_at};
 
-use crate::config::{DISCOVERY_TIME, Server};
+use crate::config::{DISCOVERY_TIME, Server, ServerConfig};
+use crate::rex::ServerAddress;
 use crate::rex::control::Control;
-use crate::rex::{ServerAddress, ServerConfig};
 
 const USAGE: &str = "\
 zrex: use a session on a Rex server from a terminal
 
 Usage:
-  zrex [--server ADDRESS] ls
-  zrex [--server ADDRESS] pick
-  zrex [--server ADDRESS] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
-  zrex [--server ADDRESS] kill SESSION
+  zrex [--server SERVER] ls
+  zrex [--server SERVER] pick
+  zrex [--server SERVER] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
+  zrex [--server SERVER] kill SESSION
   zrex completion zsh|bash|fish
   zrex --version
 
-The server address comes from --server, or from REX_SERVER. Without either, zrex
-uses a local Rex server's Unix socket when one is running, and otherwise
-http://127.0.0.1:7297. An address may be an HTTP(S) URL or a Unix socket URL
-such as unix:///Users/you/Library/Application%20Support/rex/server.sock. a is
-short for attach. SESSION is a label, a full ID, or the last four or more
-characters of an ID. When no session matches, attach makes one with that label,
-so the same command opens a session and returns to it later. Without SESSION,
-attach uses the first session. --window, or -w, picks the window: its number from
-one, its label, window.block (such as 1.2), or - for a new window with the label
-Rex picks. A label that no window has makes a window with that label, with one
-shell in it. --block, or -b, picks a block inside the window by its number from
-one, its label, or its ID. Without --window the client shows the window the
-session already has, and never changes it, leaving what Rex.app shows alone. ls lists every session, its windows, and any splits (1.1, 1.2, ...) with a star
-on the active window and block, and the terminal title a window's focused block
-reports beside the window's label. Without --server or REX_SERVER, ls also lists
-saved servers from ~/.config/zrex/config.toml (or $XDG_CONFIG_HOME/zrex/config.toml)
-and skips the local server when none is running. completion prints a shell
-completion script that completes session labels, window numbers and labels, and
-block numbers and labels from the live server. pick fuzzy-searches existing
-sessions, windows, and splits on the default (when running) and saved servers
-(~/.config/zrex/config.toml, or $XDG_CONFIG_HOME/zrex/config.toml). With --server
-it searches only that address. Enter attaches, Ctrl-N creates a new session,
-Ctrl-T creates a new window in a session, and Esc cancels.
+The server comes from --server (-S), or from REX_SERVER, and may be a saved
+server name from ~/.config/zrex/config.toml (or $XDG_CONFIG_HOME/zrex/config.toml),
+local, an HTTP(S) URL, or a Unix socket URL such as
+unix:///Users/you/Library/Application%20Support/rex/server.sock. Without either,
+zrex uses a local Rex server's Unix socket when one is running, and otherwise
+http://127.0.0.1:7297. a is short for attach. SESSION is a label, a full ID, or
+the last four or more characters of an ID. When no session matches, attach makes
+one with that label, so the same command opens a session and returns to it later.
+Without SESSION, attach uses the first session. --window, or -w, picks the
+window: its number from one, its label, window.block (such as 1.2), or - for a
+new window with the label Rex picks. A label that no window has makes a window
+with that label, with one shell in it. --block, or -b, picks a block inside the
+window by its number from one, its label, or its ID. Without --window the client
+shows the window the session already has, and never changes it, leaving what
+Rex.app shows alone. ls lists every session, its windows, and any splits (1.1,
+1.2, ...) with a star on the active window and block, and the terminal title a
+window's focused block reports beside the window's label. Without --server or
+REX_SERVER, ls also lists saved servers from ~/.config/zrex/config.toml (or
+$XDG_CONFIG_HOME/zrex/config.toml) and skips the local server when none is
+running. completion prints a shell completion script that completes server names,
+session labels, window numbers and labels, and block numbers and labels. pick
+fuzzy-searches existing sessions, windows, and splits on the default (when
+running) and saved servers (~/.config/zrex/config.toml, or
+$XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that server.
+Enter attaches, Ctrl-N creates a new session, Ctrl-T creates a new window in a
+session, and Esc cancels.
 
 While attached:
   Ctrl-backslash          detach, and leave the session running
@@ -197,7 +200,7 @@ fn parse_args(
         return Ok((server, command));
     }
     match pending {
-        Some(ValueOption::Server) => anyhow::bail!("--server needs an address"),
+        Some(ValueOption::Server) => anyhow::bail!("--server needs a server name or address"),
         Some(ValueOption::Window) => anyhow::bail!("--window needs a window number, a label, or -"),
         Some(ValueOption::Block) => {
             anyhow::bail!("--block needs a block number, a label, or an ID")
@@ -209,7 +212,7 @@ fn parse_args(
             Some(Subcommand::List) => Command::List,
             Some(Subcommand::Pick) => {
                 if target.is_some() || window.is_some() || block.is_some() {
-                    anyhow::bail!("usage: zrex [--server ADDRESS] pick");
+                    anyhow::bail!("usage: zrex [--server SERVER] pick");
                 }
                 Command::Pick
             }
@@ -287,8 +290,8 @@ struct MultiListReport {
 
 async fn list(server_config: &ServerConfig) -> Result<()> {
     match server_config {
-        ServerConfig::Explicit(address) | ServerConfig::Env(address) => {
-            let server = address.parse()?;
+        ServerConfig::Explicit(_) | ServerConfig::Env(_) => {
+            let server = server_config.resolve().await?;
             list_single(&server).await
         }
         ServerConfig::Default => {
@@ -633,6 +636,7 @@ const COMPLETION_TIME: Duration = Duration::from_secs(2);
 enum Completion {
     Commands,
     Shells,
+    Servers,
     Sessions,
     Flags {
         attach: bool,
@@ -652,7 +656,7 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
         return Completion::Nothing;
     }
     match parsed.pending {
-        Some(ValueOption::Server) => return Completion::Nothing,
+        Some(ValueOption::Server) => return Completion::Servers,
         Some(ValueOption::Window) => {
             return Completion::Windows {
                 session: parsed.target.clone(),
@@ -700,6 +704,7 @@ async fn complete(mut args: impl Iterator<Item = String>) {
             .map(str::to_owned)
             .collect(),
         Completion::Shells => Shell::NAMES.into_iter().map(str::to_owned).collect(),
+        Completion::Servers => server_candidates().await,
         Completion::Flags { attach } => flags(attach),
         context => {
             let server_config =
@@ -744,6 +749,35 @@ fn flags(attach: bool) -> Vec<String> {
         flags.extend(["-w", "--window", "-b", "--block"].map(str::to_owned));
     }
     flags
+}
+
+async fn server_candidates() -> Vec<String> {
+    let config = config::load_config().unwrap_or_default();
+    let local = timeout(COMPLETION_TIME, ServerAddress::local_if_running())
+        .await
+        .ok()
+        .flatten();
+    server_candidates_from(&config, local.as_ref())
+}
+
+fn server_candidates_from(config: &config::Config, local: Option<&ServerAddress>) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(config.servers.len() + 1);
+    let has_local_name = config
+        .servers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("local"));
+    let has_local_addr = local.is_some_and(|local_addr| {
+        config
+            .servers
+            .values()
+            .filter_map(|raw| raw.parse::<ServerAddress>().ok())
+            .any(|addr| &addr == local_addr)
+    });
+    if local.is_some() && !has_local_name && !has_local_addr {
+        candidates.push("local".to_owned());
+    }
+    candidates.extend(config.servers.keys().cloned());
+    candidates
 }
 
 async fn session_candidates(server: &ServerAddress) -> Vec<String> {
@@ -1072,7 +1106,40 @@ mod tests {
         );
         assert_eq!(
             completion_context("", &args(&["--server"])),
-            Completion::Nothing
+            Completion::Servers
+        );
+        assert_eq!(completion_context("", &args(&["-S"])), Completion::Servers);
+        assert_eq!(
+            completion_context("", &args(&["ls", "-S"])),
+            Completion::Servers
+        );
+    }
+
+    #[test]
+    fn suggests_saved_server_names_and_running_local_for_server_completion() {
+        let mut config = config::Config::default();
+        config
+            .servers
+            .insert("mac".to_owned(), "https://mac.tail.ts.net".to_owned());
+        config
+            .servers
+            .insert("office".to_owned(), "https://office.example".to_owned());
+
+        assert_eq!(server_candidates_from(&config, None), vec!["mac", "office"]);
+
+        let local: ServerAddress = "http://127.0.0.1:7297".parse().unwrap();
+        assert_eq!(
+            server_candidates_from(&config, Some(&local)),
+            vec!["local", "mac", "office"]
+        );
+
+        // Deduplicate local when a saved server already points to it.
+        config
+            .servers
+            .insert("this-box".to_owned(), "http://127.0.0.1:7297".to_owned());
+        assert_eq!(
+            server_candidates_from(&config, Some(&local)),
+            vec!["mac", "office", "this-box"]
         );
     }
 

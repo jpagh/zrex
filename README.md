@@ -54,7 +54,18 @@ zrex -S https://server.example kill work
 
 ### Server Address
 
-The server address is read from `--server` (`-S`), then `REX_SERVER`. Without either, `zrex` uses a local Rex server's Unix socket when one is running, and otherwise defaults to `http://127.0.0.1:7297`. An address may be an HTTP(S) URL or a Unix socket address such as `unix:///Users/you/Library/Application%20Support/rex/server.sock`. An address without a port uses the scheme's default port: 80 for HTTP, 443 for HTTPS.
+The server is read from `--server` (`-S`), then `REX_SERVER`. It may be a saved server name from `~/.config/zrex/config.toml` (or `$XDG_CONFIG_HOME/zrex/config.toml`), `local` for the local Rex server, an HTTP(S) URL, or a Unix socket address such as `unix:///Users/you/Library/Application%20Support/rex/server.sock`. Without either, `zrex` uses a local Rex server's Unix socket when one is running, and otherwise defaults to `http://127.0.0.1:7297`. An address without a port uses the scheme's default port: 80 for HTTP, 443 for HTTPS.
+
+```sh
+# Use a saved server alias from config.toml with any command
+zrex -S office ls
+zrex -S office a work
+zrex -S office pick
+zrex -S office kill work
+
+# Target only the local server (even when saved servers or REX_SERVER are configured)
+zrex -S local ls
+```
 
 To reach a Rex server on another machine over Tailscale, use the HTTPS address that `rex server status` reports (for example `https://my-mac.tail1234.ts.net`). The Tailscale node serves HTTPS on port 443, so a bare IP with no port falls back to HTTP on port 80 and is refused.
 
@@ -74,7 +85,7 @@ office = "https://office.example.com"
 lab = "https://lab.example.com"
 ```
 
-Each choice shows its server name. `zrex pick` searches the saved servers alongside a running local server (or `REX_SERVER`, if set); if no local server is running, it is silently skipped. Servers are queried in parallel with a short timeout, so an unreachable server doesn't prevent you from picking from another one. Use `zrex -S ADDRESS pick` to search just one server without reading the config file.
+Each choice shows its server name. `zrex pick` searches the saved servers alongside a running local server (or `REX_SERVER`, if set); if no local server is running, it is silently skipped. Servers are queried in parallel with a short timeout, so an unreachable server doesn't prevent you from picking from another one. Use `zrex -S SERVER pick` (with a saved server name, `local`, or a URL) to search just one server.
 
 `zrex ls` (without `--server` or `REX_SERVER`) likewise lists sessions from any running local server and saved servers in `config.toml`, silently skipping the local server when none is running.
 
@@ -88,7 +99,7 @@ Each choice shows its server name. `zrex pick` searches the saved servers alongs
 
 ### Shell Completion
 
-`zrex completion` prints a script that completes session labels, window numbers and labels, and block numbers and labels from the live server.
+`zrex completion` prints a script that completes saved server names for `--server` (`-S`), plus session labels, window numbers and labels, and block numbers and labels from the live server.
 
 ```sh
 # zsh (after compinit, in ~/.zshrc)

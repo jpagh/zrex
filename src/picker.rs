@@ -9,8 +9,8 @@ use tokio::time::{Instant, timeout_at};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app;
-use crate::config::{self, DISCOVERY_TIME, Server};
-use crate::rex::{ServerAddress, ServerConfig, control::Control};
+use crate::config::{self, DISCOVERY_TIME, Server, ServerConfig};
+use crate::rex::{ServerAddress, control::Control};
 use crate::session::{self, PendingCall};
 use crate::{clean_one_line, clean_truncated};
 
@@ -119,7 +119,7 @@ struct ServerDiscovery {
 
 pub async fn run(server_config: &ServerConfig) -> Result<()> {
     app::ensure_terminal()?;
-    let (servers, discover_local) = load_servers(server_config)?;
+    let (servers, discover_local) = load_servers(server_config).await?;
     let deadline = Instant::now() + DISCOVERY_TIME;
     let outcome = discover_all(
         servers,
@@ -265,30 +265,49 @@ where
     }
 }
 
-fn load_servers(server_config: &ServerConfig) -> Result<(Vec<Server>, bool)> {
-    if let ServerConfig::Explicit(address) = server_config {
+async fn load_servers(server_config: &ServerConfig) -> Result<(Vec<Server>, bool)> {
+    if let ServerConfig::Explicit(target) = server_config {
+        return Ok((vec![config::resolve_server(target).await?.server], false));
+    }
+
+    let config = config::load_config()?;
+    load_servers_with(server_config, &config, ServerAddress::local_or_loopback).await
+}
+
+async fn load_servers_with<F, Fut>(
+    server_config: &ServerConfig,
+    config: &config::Config,
+    local: F,
+) -> Result<(Vec<Server>, bool)>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ServerAddress>,
+{
+    if let ServerConfig::Explicit(target) = server_config {
         return Ok((
-            vec![Server {
-                name: address.clone(),
-                address: address.parse()?,
-            }],
+            vec![
+                config::resolve_server_with(config, target, local)
+                    .await?
+                    .server,
+            ],
             false,
         ));
     }
 
-    let mut servers = config::load_saved_servers("pick")?.servers;
+    let mut servers = config::parse_saved_servers(config, "pick").servers;
     match server_config {
         ServerConfig::Explicit(_) => unreachable!(),
-        ServerConfig::Env(address) => {
-            match address.parse() {
-                Ok(address) if !servers.iter().any(|server| server.address == address) => {
-                    servers.insert(
-                        0,
-                        Server {
-                            name: "REX_SERVER".to_owned(),
-                            address,
-                        },
-                    );
+        ServerConfig::Env(target) => {
+            match config::resolve_server_with(config, target, local).await {
+                Ok(mut resolved)
+                    if !servers
+                        .iter()
+                        .any(|saved| saved.address == resolved.server.address) =>
+                {
+                    if !resolved.named {
+                        resolved.server.name = "REX_SERVER".to_owned();
+                    }
+                    servers.insert(0, resolved.server);
                 }
                 Ok(_) => {}
                 Err(error) => eprintln!("zrex pick: {}", clean_one_line(&format!("{error:#}"))),
@@ -1356,5 +1375,82 @@ mod tests {
         assert!(outcome.sessions.is_empty());
         assert!(outcome.choices.is_empty());
         assert!(outcome.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_servers_resolves_explicit_and_env_aliases_and_deduplicates() {
+        let mut config = config::Config::default();
+        config
+            .servers
+            .insert("mac".to_owned(), "https://mac.tail.ts.net".to_owned());
+        config
+            .servers
+            .insert("office".to_owned(), "https://office.example".to_owned());
+        let fake_local = || async { "http://127.0.0.1:7297".parse::<ServerAddress>().unwrap() };
+
+        // Explicit saved alias selects only that server and keeps its alias name.
+        let (servers, discover_local) = load_servers_with(
+            &ServerConfig::Explicit("mac".to_owned()),
+            &config,
+            fake_local,
+        )
+        .await
+        .unwrap();
+        assert!(!discover_local);
+        assert_eq!(
+            servers,
+            vec![Server {
+                name: "mac".to_owned(),
+                address: "https://mac.tail.ts.net".parse().unwrap(),
+            }]
+        );
+
+        // Explicit `local` resolves to the local server without scanning other saved servers.
+        let (servers, discover_local) = load_servers_with(
+            &ServerConfig::Explicit("local".to_owned()),
+            &config,
+            fake_local,
+        )
+        .await
+        .unwrap();
+        assert!(!discover_local);
+        assert_eq!(
+            servers,
+            vec![Server {
+                name: "local".to_owned(),
+                address: "http://127.0.0.1:7297".parse().unwrap(),
+            }]
+        );
+
+        // REX_SERVER set to a saved alias deduplicates against saved servers.
+        let (servers, discover_local) =
+            load_servers_with(&ServerConfig::Env("mac".to_owned()), &config, fake_local)
+                .await
+                .unwrap();
+        assert!(!discover_local);
+        assert_eq!(
+            servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mac", "office"]
+        );
+
+        // REX_SERVER set to a direct URL prepends [REX_SERVER].
+        let (servers, discover_local) = load_servers_with(
+            &ServerConfig::Env("https://extra.example".to_owned()),
+            &config,
+            fake_local,
+        )
+        .await
+        .unwrap();
+        assert!(!discover_local);
+        assert_eq!(
+            servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["REX_SERVER", "mac", "office"]
+        );
     }
 }

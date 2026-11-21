@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::clean_one_line;
@@ -19,6 +19,7 @@ pub struct Config {
     pub servers: BTreeMap<String, String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct Server {
     pub name: String,
     pub address: ServerAddress,
@@ -29,24 +30,64 @@ pub struct SavedServers {
     pub configured: usize,
 }
 
-pub fn load_saved_servers(command: &str) -> Result<SavedServers> {
-    let config = config_path()
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResolvedServer {
+    pub server: Server,
+    pub named: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerConfig {
+    Explicit(String),
+    Env(String),
+    Default,
+}
+
+impl ServerConfig {
+    pub fn from_sources(flag: Option<String>, env: Option<String>) -> Self {
+        if let Some(address) = flag {
+            Self::Explicit(address)
+        } else if let Some(address) = env.filter(|address| !address.is_empty()) {
+            Self::Env(address)
+        } else {
+            Self::Default
+        }
+    }
+
+    pub async fn resolve(&self) -> Result<ServerAddress> {
+        match self {
+            Self::Explicit(target) | Self::Env(target) => {
+                Ok(resolve_server(target).await?.server.address)
+            }
+            Self::Default => Ok(ServerAddress::local_or_loopback().await),
+        }
+    }
+}
+
+pub fn load_config() -> Result<Config> {
+    Ok(config_path()
         .as_deref()
         .map(read_config)
         .transpose()?
-        .unwrap_or_default();
-    Ok(parse_saved_servers(config, command))
+        .unwrap_or_default())
 }
 
-fn parse_saved_servers(config: Config, command: &str) -> SavedServers {
+pub fn load_saved_servers(command: &str) -> Result<SavedServers> {
+    Ok(parse_saved_servers(&load_config()?, command))
+}
+
+pub fn parse_saved_servers(config: &Config, command: &str) -> SavedServers {
     let configured = config.servers.len();
     let mut servers = Vec::with_capacity(configured);
-    for (name, address) in config.servers {
+    for (name, address) in &config.servers {
         match address.parse() {
-            Ok(address) => servers.push(Server { name, address }),
+            Ok(address) => servers.push(Server {
+                name: name.clone(),
+                address,
+            }),
             Err(error) => eprintln!(
                 "zrex {command}: {}: {}",
-                clean_one_line(&name),
+                clean_one_line(name),
                 clean_one_line(&format!("{error:#}"))
             ),
         }
@@ -55,6 +96,98 @@ fn parse_saved_servers(config: Config, command: &str) -> SavedServers {
         servers,
         configured,
     }
+}
+
+/// Resolves a `--server` / `REX_SERVER` value as a saved server name from
+/// `config.toml`, `local`, or a direct server address. Explicit URLs containing
+/// `://` are parsed without reading `config.toml`.
+pub async fn resolve_server(target: &str) -> Result<ResolvedServer> {
+    if target.is_empty() || target.contains("://") {
+        return Ok(ResolvedServer {
+            server: Server {
+                name: target.to_owned(),
+                address: target.parse()?,
+            },
+            named: false,
+        });
+    }
+    let config = load_config()?;
+    resolve_server_in(&config, target).await
+}
+
+pub async fn resolve_server_in(config: &Config, target: &str) -> Result<ResolvedServer> {
+    resolve_server_with(config, target, ServerAddress::local_or_loopback).await
+}
+
+pub(crate) async fn resolve_server_with<F, Fut>(
+    config: &Config,
+    target: &str,
+    local: F,
+) -> Result<ResolvedServer>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ServerAddress>,
+{
+    if !target.is_empty() && !target.contains("://") {
+        if let Some(server) = lookup_saved_server(config, target)? {
+            return Ok(ResolvedServer {
+                server,
+                named: true,
+            });
+        }
+        if target.eq_ignore_ascii_case("local") {
+            return Ok(ResolvedServer {
+                server: Server {
+                    name: "local".to_owned(),
+                    address: local().await,
+                },
+                named: true,
+            });
+        }
+    }
+    Ok(ResolvedServer {
+        server: Server {
+            name: target.to_owned(),
+            address: target.parse()?,
+        },
+        named: false,
+    })
+}
+
+fn lookup_saved_server(config: &Config, name: &str) -> Result<Option<Server>> {
+    if let Some((key, raw)) = config.servers.get_key_value(name) {
+        return Ok(Some(parse_named_server(key, raw)?));
+    }
+    let matches: Vec<_> = config
+        .servers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .collect();
+    match matches.as_slice() {
+        [(key, raw)] => Ok(Some(parse_named_server(key, raw)?)),
+        [] => Ok(None),
+        many => {
+            let names = many
+                .iter()
+                .map(|(key, _)| clean_one_line(key))
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "ambiguous server name {}; matches: {names}",
+                clean_one_line(name)
+            );
+        }
+    }
+}
+
+fn parse_named_server(key: &str, raw: &str) -> Result<Server> {
+    let address = raw
+        .parse()
+        .with_context(|| format!("invalid address for saved server {}", clean_one_line(key)))?;
+    Ok(Server {
+        name: key.to_owned(),
+        address,
+    })
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -93,5 +226,137 @@ mod tests {
         assert_eq!(config.servers.len(), 2);
         assert_eq!(config.servers["office"], "https://office.example");
         assert_eq!(config.servers["lab"], "http://127.0.0.1:7297");
+    }
+
+    fn sample_config(entries: &[(&str, &str)]) -> Config {
+        Config {
+            servers: entries
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolves_saved_server_aliases_local_and_direct_addresses() {
+        let config = sample_config(&[
+            ("mac", "https://my-mac.tail.ts.net"),
+            ("Office", "http://10.0.0.5:7297"),
+            ("broken", "ftp://bad.example"),
+        ]);
+        let fake_local = || async { ServerAddress::Unix(PathBuf::from("/tmp/local.sock")) };
+
+        // Exact alias match.
+        assert_eq!(
+            resolve_server_with(&config, "mac", fake_local)
+                .await
+                .unwrap(),
+            ResolvedServer {
+                server: Server {
+                    name: "mac".to_owned(),
+                    address: "https://my-mac.tail.ts.net".parse().unwrap(),
+                },
+                named: true,
+            }
+        );
+
+        // Case-insensitive alias match keeps canonical config name.
+        assert_eq!(
+            resolve_server_with(&config, "office", fake_local)
+                .await
+                .unwrap(),
+            ResolvedServer {
+                server: Server {
+                    name: "Office".to_owned(),
+                    address: "http://10.0.0.5:7297".parse().unwrap(),
+                },
+                named: true,
+            }
+        );
+
+        // Built-in `local` alias when not configured in config.toml.
+        assert_eq!(
+            resolve_server_with(&config, "local", fake_local)
+                .await
+                .unwrap(),
+            ResolvedServer {
+                server: Server {
+                    name: "local".to_owned(),
+                    address: ServerAddress::Unix(PathBuf::from("/tmp/local.sock")),
+                },
+                named: true,
+            }
+        );
+
+        // Explicit `local` entry in config.toml overrides the built-in local alias.
+        let custom_local = sample_config(&[("local", "http://127.0.0.1:9999")]);
+        assert_eq!(
+            resolve_server_with(&custom_local, "local", fake_local)
+                .await
+                .unwrap(),
+            ResolvedServer {
+                server: Server {
+                    name: "local".to_owned(),
+                    address: "http://127.0.0.1:9999".parse().unwrap(),
+                },
+                named: true,
+            }
+        );
+
+        // Explicit URL with scheme parses directly without matching aliases.
+        assert_eq!(
+            resolve_server_with(&config, "https://direct.example", fake_local)
+                .await
+                .unwrap(),
+            ResolvedServer {
+                server: Server {
+                    name: "https://direct.example".to_owned(),
+                    address: "https://direct.example".parse().unwrap(),
+                },
+                named: false,
+            }
+        );
+
+        // Bare host:port not in config falls back to ServerAddress parsing.
+        assert_eq!(
+            resolve_server_with(&config, "127.0.0.1:7297", fake_local)
+                .await
+                .unwrap(),
+            ResolvedServer {
+                server: Server {
+                    name: "127.0.0.1:7297".to_owned(),
+                    address: "http://127.0.0.1:7297".parse().unwrap(),
+                },
+                named: false,
+            }
+        );
+
+        // Invalid address on the requested saved server surfaces a clear error.
+        let err = resolve_server_with(&config, "broken", fake_local)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("saved server broken"));
+
+        // Empty target errors cleanly.
+        assert!(resolve_server_with(&config, "", fake_local).await.is_err());
+
+        // Ambiguous case-insensitive match fails instead of silently picking one.
+        let ambiguous = sample_config(&[
+            ("mac", "https://mac1.example"),
+            ("Mac", "https://mac2.example"),
+        ]);
+        let err = resolve_server_with(&ambiguous, "MAC", fake_local)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("ambiguous server name"));
+        // Exact match still wins over case-insensitive collision.
+        assert_eq!(
+            resolve_server_with(&ambiguous, "mac", fake_local)
+                .await
+                .unwrap()
+                .server
+                .address,
+            "https://mac1.example".parse().unwrap()
+        );
     }
 }
