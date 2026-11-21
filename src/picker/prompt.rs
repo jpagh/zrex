@@ -14,9 +14,10 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    ManageTarget, ProgramState, SessionChoice, StyleRole, StyledSpan, Target, prefix_to_columns,
-    styled_scope_row, styled_server_row,
+    ManageTarget, ProgramState, SessionChoice, StyleRole, StyledSpan, Target, styled_scope_row,
+    styled_server_row,
 };
+use crate::text::truncate_with_ellipsis;
 
 const MIN_INPUT_WIDTH: usize = 12;
 
@@ -166,6 +167,8 @@ impl TextInput {
     }
 }
 
+const SCOPE_COLUMN_WIDTH: usize = 9;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScopeKind {
     Session,
@@ -174,29 +177,38 @@ enum ScopeKind {
 }
 
 impl ScopeKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Session => "session",
-            Self::Window => "window",
-            Self::Block => "block",
+    fn of(target: &ManageTarget) -> Self {
+        match target {
+            ManageTarget::Session { .. } => Self::Session,
+            ManageTarget::Window { .. } => Self::Window,
+            ManageTarget::Block { .. } => Self::Block,
         }
     }
 
-    fn tag(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
-            Self::Session => "Session  ",
-            Self::Window => "Window   ",
-            Self::Block => "Block    ",
+            Self::Session => "Session",
+            Self::Window => "Window",
+            Self::Block => "Block",
         }
+    }
+
+    fn padded_label(self) -> String {
+        format!("{:<width$}", self.label(), width = SCOPE_COLUMN_WIDTH)
     }
 }
 
 struct ManageChoice {
-    kind: ScopeKind,
     target: ManageTarget,
     display: String,
     detail: String,
     initial_label: String,
+}
+
+impl ManageChoice {
+    fn kind(&self) -> ScopeKind {
+        ScopeKind::of(&self.target)
+    }
 }
 
 enum Mode {
@@ -273,15 +285,10 @@ impl PickerState {
         sessions: Vec<SessionChoice>,
         feedback: Feedback,
     ) {
-        let prev_key = self.matches.get(self.attach_selected).map(|&(index, _)| {
-            let target = &self.targets[index];
-            (
-                target.server_index,
-                target.session_id.clone(),
-                target.window_id.clone(),
-                target.block_id.clone(),
-            )
-        });
+        let prev_key = self
+            .matches
+            .get(self.attach_selected)
+            .map(|&(index, _)| self.targets[index].key());
         let prev_selected = self.attach_selected;
 
         self.targets = targets;
@@ -289,21 +296,18 @@ impl PickerState {
         self.labels = self.targets.iter().map(Target::search_text).collect();
         self.recompute_matches();
 
-        if let Some((server_index, session_id, window_id, block_id)) = prev_key {
-            if let Some(pos) = self.matches.iter().position(|&(index, _)| {
-                let target = &self.targets[index];
-                target.server_index == server_index
-                    && target.session_id == session_id
-                    && target.window_id == window_id
-                    && target.block_id == block_id
-            }) {
+        if let Some(prev_key) = prev_key {
+            if let Some(pos) = self
+                .matches
+                .iter()
+                .position(|&(index, _)| prev_key.matches_target(&self.targets[index]))
+            {
                 self.attach_selected = pos;
-            } else if let Some(pos) = self.matches.iter().position(|&(index, _)| {
-                let target = &self.targets[index];
-                target.server_index == server_index
-                    && target.session_id == session_id
-                    && target.window_id == window_id
-            }) {
+            } else if let Some(pos) = self
+                .matches
+                .iter()
+                .position(|&(index, _)| prev_key.matches_window(&self.targets[index]))
+            {
                 self.attach_selected = pos;
             } else if !self.matches.is_empty() {
                 self.attach_selected = prev_selected.min(self.matches.len() - 1);
@@ -372,7 +376,6 @@ impl PickerState {
                 .sessions
                 .iter()
                 .map(|session| ManageChoice {
-                    kind: ScopeKind::Session,
                     target: ManageTarget::Session {
                         server_index: session.server_index,
                         session_id: session.session_id.clone(),
@@ -437,7 +440,6 @@ impl PickerState {
 
         let mut choices = vec![
             ManageChoice {
-                kind: ScopeKind::Session,
                 target: ManageTarget::Session {
                     server_index: target.server_index,
                     session_id: target.session_id.clone(),
@@ -447,7 +449,6 @@ impl PickerState {
                 initial_label: session.label.clone(),
             },
             ManageChoice {
-                kind: ScopeKind::Window,
                 target: ManageTarget::Window {
                     server_index: target.server_index,
                     session_id: target.session_id.clone(),
@@ -458,7 +459,6 @@ impl PickerState {
                 initial_label: target.window_label.clone().unwrap_or_default(),
             },
             ManageChoice {
-                kind: ScopeKind::Block,
                 target: ManageTarget::Block {
                     server_index: target.server_index,
                     session_id: target.session_id.clone(),
@@ -478,7 +478,6 @@ impl PickerState {
             }
             if !self.targets.iter().any(|t| t.session_index == idx) {
                 choices.push(ManageChoice {
-                    kind: ScopeKind::Session,
                     target: ManageTarget::Session {
                         server_index: other.server_index,
                         session_id: other.session_id.clone(),
@@ -496,9 +495,11 @@ impl PickerState {
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<Outcome> {
         self.feedback = None;
+        // In raw Unix mode crossterm decodes ASCII 0x1c (Ctrl-\) as Ctrl-4,
+        // while Kitty / modifyOtherKeys sends Ctrl-\ directly.
         if matches!(
             (code, modifiers),
-            (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            (KeyCode::Char('c' | '\\' | '4'), KeyModifiers::CONTROL)
         ) {
             return Some(Outcome::Cancel);
         }
@@ -550,12 +551,11 @@ impl PickerState {
                     None
                 }
                 (KeyCode::Up | KeyCode::BackTab, _) if !self.matches.is_empty() => {
-                    self.attach_selected =
-                        (self.attach_selected + self.matches.len() - 1) % self.matches.len();
+                    step_selection(&mut self.attach_selected, self.matches.len(), false);
                     None
                 }
                 (KeyCode::Down | KeyCode::Tab, _) if !self.matches.is_empty() => {
-                    self.attach_selected = (self.attach_selected + 1) % self.matches.len();
+                    step_selection(&mut self.attach_selected, self.matches.len(), true);
                     None
                 }
                 _ => {
@@ -593,11 +593,11 @@ impl PickerState {
                     None
                 }
                 (KeyCode::Up | KeyCode::BackTab, _) if self.servers.len() > 1 => {
-                    *server_index = (*server_index + self.servers.len() - 1) % self.servers.len();
+                    step_selection(server_index, self.servers.len(), false);
                     None
                 }
                 (KeyCode::Down | KeyCode::Tab, _) if self.servers.len() > 1 => {
-                    *server_index = (*server_index + 1) % self.servers.len();
+                    step_selection(server_index, self.servers.len(), true);
                     None
                 }
                 _ => {
@@ -628,12 +628,11 @@ impl PickerState {
                     None
                 }
                 (KeyCode::Up | KeyCode::BackTab, _) if self.sessions.len() > 1 => {
-                    *session_index =
-                        (*session_index + self.sessions.len() - 1) % self.sessions.len();
+                    step_selection(session_index, self.sessions.len(), false);
                     None
                 }
                 (KeyCode::Down | KeyCode::Tab, _) if self.sessions.len() > 1 => {
-                    *session_index = (*session_index + 1) % self.sessions.len();
+                    step_selection(session_index, self.sessions.len(), true);
                     None
                 }
                 _ => {
@@ -662,14 +661,14 @@ impl PickerState {
                     Some(Outcome::Selected(Selection::Rename { target, label }))
                 }
                 (KeyCode::Up | KeyCode::BackTab, _) if choices.len() > 1 => {
-                    *selected = (*selected + choices.len() - 1) % choices.len();
+                    step_selection(selected, choices.len(), false);
                     if !*dirty {
                         *input = TextInput::from_text(&choices[*selected].initial_label);
                     }
                     None
                 }
                 (KeyCode::Down | KeyCode::Tab, _) if choices.len() > 1 => {
-                    *selected = (*selected + 1) % choices.len();
+                    step_selection(selected, choices.len(), true);
                     if !*dirty {
                         *input = TextInput::from_text(&choices[*selected].initial_label);
                     }
@@ -708,14 +707,14 @@ impl PickerState {
                 (KeyCode::Char('s' | 'S'), mods)
                     if mods.difference(KeyModifiers::SHIFT).is_empty() =>
                 {
-                    let next = if choices[*selected].kind == ScopeKind::Session {
+                    let next = if choices[*selected].kind() == ScopeKind::Session {
                         choices[*selected + 1..]
                             .iter()
-                            .position(|c| c.kind == ScopeKind::Session)
+                            .position(|c| c.kind() == ScopeKind::Session)
                             .map(|offset| *selected + 1 + offset)
-                            .or_else(|| choices.iter().position(|c| c.kind == ScopeKind::Session))
+                            .or_else(|| choices.iter().position(|c| c.kind() == ScopeKind::Session))
                     } else {
-                        choices.iter().position(|c| c.kind == ScopeKind::Session)
+                        choices.iter().position(|c| c.kind() == ScopeKind::Session)
                     };
                     if let Some(pos) = next {
                         *selected = pos;
@@ -725,7 +724,7 @@ impl PickerState {
                 (KeyCode::Char('w' | 'W'), mods)
                     if mods.difference(KeyModifiers::SHIFT).is_empty() =>
                 {
-                    if let Some(pos) = choices.iter().position(|c| c.kind == ScopeKind::Window) {
+                    if let Some(pos) = choices.iter().position(|c| c.kind() == ScopeKind::Window) {
                         *selected = pos;
                     }
                     None
@@ -733,17 +732,17 @@ impl PickerState {
                 (KeyCode::Char('b' | 'B'), mods)
                     if mods.difference(KeyModifiers::SHIFT).is_empty() =>
                 {
-                    if let Some(pos) = choices.iter().position(|c| c.kind == ScopeKind::Block) {
+                    if let Some(pos) = choices.iter().position(|c| c.kind() == ScopeKind::Block) {
                         *selected = pos;
                     }
                     None
                 }
                 (KeyCode::Up | KeyCode::BackTab, _) if choices.len() > 1 => {
-                    *selected = (*selected + choices.len() - 1) % choices.len();
+                    step_selection(selected, choices.len(), false);
                     None
                 }
                 (KeyCode::Down | KeyCode::Tab, _) if choices.len() > 1 => {
-                    *selected = (*selected + 1) % choices.len();
+                    step_selection(selected, choices.len(), true);
                     None
                 }
                 _ => None,
@@ -837,92 +836,50 @@ impl PickerState {
                 first,
                 input,
             } => {
-                *first = scroll_first(*first, *server_index, list_rows);
-                if rows > 1 && width > 2 {
-                    if self.servers.len() > 1 {
-                        for (line, server) in
-                            self.servers.iter().skip(*first).take(list_rows).enumerate()
-                        {
-                            let active = *first + line == *server_index;
-                            queue!(out, MoveTo(0, (line + 1) as u16))?;
-                            let spans = styled_server_row(server, width - 2);
-                            render_row(out, &spans, &[], active, use_color)?;
-                        }
-                    } else {
-                        queue!(out, MoveTo(0, 1))?;
-                        render_hint(
-                            out,
-                            "Type a session name, or press Enter for a default name",
-                            width - 2,
-                        )?;
-                    }
-                }
-                let server = &self.servers[*server_index];
-                let prompt = if self.servers.len() > 1 {
-                    let full = format!("New session name on [{server}] (Tab: server, Esc: back)> ");
-                    let medium = format!("New session on [{server}] (Tab)> ");
-                    let short = format!("New session on [{server}]> ");
-                    choose_prompt(width, &[&full, &medium, &short, "New session> "]).to_owned()
-                } else {
-                    let full =
-                        format!("New session name on [{server}] (Enter: default, Esc: back)> ");
-                    let medium = format!("New session name on [{server}]> ");
-                    choose_prompt(
-                        width,
-                        &[&full, &medium, "New session name> ", "New session> "],
-                    )
-                    .to_owned()
-                };
-                let (displayed, offset) = input.visible(width.saturating_sub(prompt.width()));
-                (prompt, displayed, offset, Color::DarkCyan)
+                let server_label = format!("[{}]", self.servers[*server_index]);
+                render_create_mode(
+                    out,
+                    &self.servers,
+                    *server_index,
+                    first,
+                    input,
+                    CreatePromptCopy {
+                        noun: "session",
+                        prep: "on",
+                        container_noun: "server",
+                        container_display: &server_label,
+                    },
+                    rows,
+                    width,
+                    list_rows,
+                    use_color,
+                    |server, cols| styled_server_row(server, cols),
+                )?
             }
             Mode::NewWindow {
                 session_index,
                 first,
                 input,
             } => {
-                *first = scroll_first(*first, *session_index, list_rows);
-                if rows > 1 && width > 2 {
-                    if self.sessions.len() > 1 {
-                        for (line, session) in self
-                            .sessions
-                            .iter()
-                            .skip(*first)
-                            .take(list_rows)
-                            .enumerate()
-                        {
-                            let active = *first + line == *session_index;
-                            queue!(out, MoveTo(0, (line + 1) as u16))?;
-                            let spans = session.styled_row(width - 2);
-                            render_row(out, &spans, &[], active, use_color)?;
-                        }
-                    } else {
-                        queue!(out, MoveTo(0, 1))?;
-                        render_hint(
-                            out,
-                            "Type a window name, or press Enter for a default name",
-                            width - 2,
-                        )?;
-                    }
-                }
-                let session = self.sessions[*session_index].display_name();
-                let prompt = if self.sessions.len() > 1 {
-                    let full = format!("New window name in {session} (Tab: session, Esc: back)> ");
-                    let medium = format!("New window in {session} (Tab)> ");
-                    let short = format!("New window in {session}> ");
-                    choose_prompt(width, &[&full, &medium, &short, "New window> "]).to_owned()
-                } else {
-                    let full =
-                        format!("New window name in {session} (Enter: default, Esc: back)> ");
-                    let medium = format!("New window name in {session}> ");
-                    choose_prompt(
-                        width,
-                        &[&full, &medium, "New window name> ", "New window> "],
-                    )
-                    .to_owned()
-                };
-                let (displayed, offset) = input.visible(width.saturating_sub(prompt.width()));
-                (prompt, displayed, offset, Color::DarkCyan)
+                let session_label = self.sessions[*session_index].display_name();
+                render_create_mode(
+                    out,
+                    &self.sessions,
+                    *session_index,
+                    first,
+                    input,
+                    CreatePromptCopy {
+                        noun: "window",
+                        prep: "in",
+                        container_noun: "session",
+                        container_display: &session_label,
+                    },
+                    rows,
+                    width,
+                    list_rows,
+                    use_color,
+                    |session, cols| session.styled_row(cols),
+                )?
             }
             Mode::Rename {
                 choices,
@@ -933,19 +890,15 @@ impl PickerState {
             } => {
                 *first = scroll_first(*first, *selected, list_rows);
                 if rows > 1 && width > 2 {
-                    let mut rendered = 0;
-                    for (line, choice) in choices.iter().skip(*first).take(list_rows).enumerate() {
-                        let active = *first + line == *selected;
-                        queue!(out, MoveTo(0, (line + 1) as u16))?;
-                        let spans = styled_scope_row(
-                            choice.kind.tag(),
-                            &choice.display,
-                            &choice.detail,
-                            width - 2,
-                        );
-                        render_row(out, &spans, &[], active, use_color)?;
-                        rendered += 1;
-                    }
+                    let rendered = render_manage_choices(
+                        out,
+                        choices,
+                        *first,
+                        *selected,
+                        list_rows,
+                        width - 2,
+                        use_color,
+                    )?;
                     if rendered < list_rows {
                         queue!(out, MoveTo(0, (rendered + 1) as u16))?;
                         render_hint(
@@ -955,7 +908,7 @@ impl PickerState {
                         )?;
                     }
                 }
-                let kind = choices[*selected].kind.name();
+                let kind = choices[*selected].target.kind_name();
                 let prompt = if choices.len() > 1 {
                     let full = format!("Rename {kind} (Tab: target, Ctrl-U: reset, Esc: back)> ");
                     let medium = format!("Rename {kind} (Tab: target, Esc: back)> ");
@@ -978,19 +931,17 @@ impl PickerState {
             } => {
                 *first = scroll_first(*first, *selected, list_rows);
                 if rows > 1 && width > 2 {
-                    for (line, choice) in choices.iter().skip(*first).take(list_rows).enumerate() {
-                        let active = *first + line == *selected;
-                        queue!(out, MoveTo(0, (line + 1) as u16))?;
-                        let spans = styled_scope_row(
-                            choice.kind.tag(),
-                            &choice.display,
-                            &choice.detail,
-                            width - 2,
-                        );
-                        render_row(out, &spans, &[], active, use_color)?;
-                    }
+                    let _ = render_manage_choices(
+                        out,
+                        choices,
+                        *first,
+                        *selected,
+                        list_rows,
+                        width - 2,
+                        use_color,
+                    )?;
                 }
-                let kind = choices[*selected].kind.name();
+                let kind = choices[*selected].target.kind_name();
                 let prompt = if choices.len() > 1 {
                     let full =
                         format!("Kill {kind}? (Enter/y: kill, Tab/s/w/b: target, Esc: back) ");
@@ -1017,6 +968,99 @@ impl PickerState {
         render_prompt(out, &prompt, &displayed, prompt_color, use_color)?;
         queue!(out, MoveTo((prompt.width() + offset) as u16, 0))?;
         out.flush()
+    }
+}
+
+struct CreatePromptCopy<'a> {
+    noun: &'a str,
+    prep: &'a str,
+    container_noun: &'a str,
+    container_display: &'a str,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_create_mode<T>(
+    out: &mut impl Write,
+    items: &[T],
+    selected: usize,
+    first: &mut usize,
+    input: &TextInput,
+    copy: CreatePromptCopy<'_>,
+    rows: u16,
+    width: usize,
+    list_rows: usize,
+    use_color: bool,
+    style_item: impl Fn(&T, usize) -> Vec<StyledSpan>,
+) -> io::Result<(String, String, usize, Color)> {
+    *first = scroll_first(*first, selected, list_rows);
+    if rows > 1 && width > 2 {
+        if items.len() > 1 {
+            for (line, item) in items.iter().skip(*first).take(list_rows).enumerate() {
+                let active = *first + line == selected;
+                queue!(out, MoveTo(0, (line + 1) as u16))?;
+                let spans = style_item(item, width - 2);
+                render_row(out, &spans, &[], active, use_color)?;
+            }
+        } else {
+            queue!(out, MoveTo(0, 1))?;
+            render_hint(
+                out,
+                &format!(
+                    "Type a {} name, or press Enter for a default name",
+                    copy.noun
+                ),
+                width - 2,
+            )?;
+        }
+    }
+    let noun = copy.noun;
+    let prep = copy.prep;
+    let container = copy.container_display;
+    let fallback = format!("New {noun}> ");
+    let prompt = if items.len() > 1 {
+        let full = format!(
+            "New {noun} name {prep} {container} (Tab: {}, Esc: back)> ",
+            copy.container_noun
+        );
+        let medium = format!("New {noun} {prep} {container} (Tab)> ");
+        let short = format!("New {noun} {prep} {container}> ");
+        choose_prompt(width, &[&full, &medium, &short, &fallback]).to_owned()
+    } else {
+        let full = format!("New {noun} name {prep} {container} (Enter: default, Esc: back)> ");
+        let medium = format!("New {noun} name {prep} {container}> ");
+        let short = format!("New {noun} name> ");
+        choose_prompt(width, &[&full, &medium, &short, &fallback]).to_owned()
+    };
+    let (displayed, offset) = input.visible(width.saturating_sub(prompt.width()));
+    Ok((prompt, displayed, offset, Color::DarkCyan))
+}
+
+fn render_manage_choices(
+    out: &mut impl Write,
+    choices: &[ManageChoice],
+    first: usize,
+    selected: usize,
+    list_rows: usize,
+    max_width: usize,
+    use_color: bool,
+) -> io::Result<usize> {
+    let mut rendered = 0;
+    for (line, choice) in choices.iter().skip(first).take(list_rows).enumerate() {
+        let active = first + line == selected;
+        queue!(out, MoveTo(0, (line + 1) as u16))?;
+        let tag = choice.kind().padded_label();
+        let spans = styled_scope_row(&tag, &choice.display, &choice.detail, max_width);
+        render_row(out, &spans, &[], active, use_color)?;
+        rendered += 1;
+    }
+    Ok(rendered)
+}
+
+fn step_selection(selected: &mut usize, len: usize, forward: bool) {
+    if forward {
+        *selected = (*selected + 1) % len;
+    } else {
+        *selected = (*selected + len - 1) % len;
     }
 }
 
@@ -1137,15 +1181,7 @@ fn render_banner(
     max_width: usize,
     use_color: bool,
 ) -> io::Result<()> {
-    let visible = if banner.text.width() <= max_width {
-        banner.text.clone()
-    } else {
-        let ellipsis_width = '…'.width().unwrap_or(1);
-        format!(
-            "{}…",
-            prefix_to_columns(&banner.text, max_width.saturating_sub(ellipsis_width))
-        )
-    };
+    let visible = truncate_with_ellipsis(&banner.text, max_width);
     queue!(out, Print("  "))?;
     if banner.is_error {
         if use_color {
@@ -1161,15 +1197,7 @@ fn render_banner(
 }
 
 fn render_hint(out: &mut impl Write, text: &str, max_width: usize) -> io::Result<()> {
-    let visible = if text.width() <= max_width {
-        text.to_owned()
-    } else {
-        let ellipsis_width = '…'.width().unwrap_or(1);
-        format!(
-            "{}…",
-            prefix_to_columns(text, max_width.saturating_sub(ellipsis_width))
-        )
-    };
+    let visible = truncate_with_ellipsis(text, max_width);
     queue!(
         out,
         Print("  "),
@@ -1532,6 +1560,32 @@ mod tests {
             state.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
             Some(Outcome::Cancel)
         );
+    }
+
+    #[test]
+    fn ctrl_backslash_cancels_from_every_picker_mode() {
+        let (targets, sessions, servers) = split_fixture();
+        // Both Kitty/modifyOtherKeys (Ctrl-\) and legacy 0x1c (crossterm Ctrl-4) must cancel.
+        for detach_key in [KeyCode::Char('\\'), KeyCode::Char('4')] {
+            for enter_mode in [
+                None,
+                Some(KeyCode::Char('n')),
+                Some(KeyCode::Char('t')),
+                Some(KeyCode::Char('r')),
+                Some(KeyCode::Char('k')),
+            ] {
+                let mut state =
+                    PickerState::new(targets.clone(), sessions.clone(), servers.clone());
+                if let Some(key) = enter_mode {
+                    assert_eq!(state.handle_key(key, KeyModifiers::CONTROL), None);
+                }
+                assert_eq!(
+                    state.handle_key(detach_key, KeyModifiers::CONTROL),
+                    Some(Outcome::Cancel),
+                    "expected {detach_key:?} to cancel in mode {enter_mode:?}"
+                );
+            }
+        }
     }
 
     #[test]

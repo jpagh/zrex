@@ -1,8 +1,10 @@
 mod app;
 mod config;
+mod discovery;
 mod picker;
 mod rex;
 mod session;
+mod text;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -14,8 +16,10 @@ use serde_json::Value;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::config::{DISCOVERY_TIME, Server, ServerConfig};
-use crate::rex::ServerAddress;
+use crate::discovery::{LocalDiscovery, fan_out, probe_local};
 use crate::rex::control::Control;
+use crate::rex::{BlockRef, ServerAddress};
+use crate::text::{clean_one_line, clean_truncated};
 
 const USAGE: &str = "\
 zrex: use a session on a Rex server from a terminal
@@ -43,20 +47,21 @@ with that label, with one shell in it. --block, or -b, picks a block inside the
 window by its number from one, its label, or its ID. Without --window the client
 shows the window the session already has, and never changes it, leaving what
 Rex.app shows alone. ls lists every session, its windows, and any splits (1.1,
-1.2, ...) with a star on the active window and block, and the terminal title a
-window's focused block reports beside the window's label. Without --server or
-REX_SERVER, ls lists any running local server and saved servers from
-~/.config/zrex/config.toml (or $XDG_CONFIG_HOME/zrex/config.toml), skipping an
-absent local server when saved servers are configured and returning an error
-when neither is available. completion prints a shell completion script that completes server names,
-session labels, window numbers and labels, and block numbers and labels. Running
-zrex with no command (or zrex pick) fuzzy-searches existing sessions, windows,
-and splits on the default (when running) and saved servers
-(~/.config/zrex/config.toml, or $XDG_CONFIG_HOME/zrex/config.toml). With
---server it searches only that server. When run without a terminal, bare zrex
-prints this help. Enter attaches, Ctrl-N creates a new session, Ctrl-T creates a
-new window in a session, Ctrl-R renames a session, window, or block, Ctrl-K
-kills a session, window, or block, and Esc cancels.
+1.2, ...) with a star on the active window and block, and the terminal title
+(or foreground process) a window's focused block reports beside the window's
+label. Without --server or REX_SERVER, ls lists any running local server and
+saved servers from ~/.config/zrex/config.toml (or $XDG_CONFIG_HOME/zrex/config.toml),
+skipping an absent local server when saved servers are configured and returning
+an error when neither is available. completion prints a shell completion script
+that completes server names, session labels, window numbers and labels, and
+block numbers and labels. Running zrex with no command (or zrex pick)
+fuzzy-searches existing sessions, windows, and splits on the default (when
+running) and saved servers (~/.config/zrex/config.toml, or
+$XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that server.
+When run without a terminal, bare zrex prints this help. Enter attaches, Ctrl-N
+creates a new session, Ctrl-T creates a new window in a session, Ctrl-R renames
+a session, window, or block, Ctrl-K kills a session, window, or block, and Esc,
+Ctrl-C, or Ctrl-backslash cancels.
 
 While attached:
   Ctrl-backslash          detach, and leave the session running
@@ -248,7 +253,9 @@ fn parse_args(
                     Some(other) => match Shell::parse(other) {
                         Some(shell) => Command::Completion(shell),
                         None => {
-                            anyhow::bail!("no completion script for {other}; use zsh, bash, or fish")
+                            anyhow::bail!(
+                                "no completion script for {other}; use zsh, bash, or fish"
+                            )
                         }
                     },
                     None => anyhow::bail!("completion needs zsh, bash, or fish"),
@@ -301,8 +308,8 @@ async fn main() -> Result<()> {
             target,
             window,
             block,
-        } => app::attach(&server_config.resolve().await?, target, window, block).await,
-        Command::Kill { target } => kill(&server_config.resolve().await?, &target).await,
+        } => app::attach(&server_config, target, window, block).await,
+        Command::Kill { target } => kill(&server_config, &target).await,
         Command::Completion(shell) => {
             print!("{}", shell.script());
             Ok(())
@@ -320,17 +327,11 @@ struct MultiListReport {
     reachable: usize,
 }
 
-enum LocalProbe {
-    #[cfg_attr(not(test), allow(dead_code))]
-    Address(ServerAddress),
-    Connected(ServerAddress, Control),
-}
-
 async fn list(server_config: &ServerConfig) -> Result<()> {
     match server_config {
         ServerConfig::Explicit(_) | ServerConfig::Env(_) => {
-            let server = server_config.resolve().await?;
-            list_single(&server).await
+            let (_addr, ctrl, _events) = server_config.connect().await?;
+            list_single_with_control(ctrl).await
         }
         ServerConfig::Default => {
             let saved = config::load_saved_servers("ls")?;
@@ -346,11 +347,6 @@ async fn list(server_config: &ServerConfig) -> Result<()> {
             list_multi(saved.servers).await
         }
     }
-}
-
-async fn list_single(server: &ServerAddress) -> Result<()> {
-    let (ctrl, _events) = Control::connect(server, None).await?;
-    list_single_with_control(ctrl).await
 }
 
 async fn list_single_with_control(mut ctrl: Control) -> Result<()> {
@@ -370,11 +366,7 @@ async fn list_multi(servers: Vec<Server>) -> Result<()> {
     let excluded: Vec<ServerAddress> = servers.iter().map(|s| s.address.clone()).collect();
     let report = collect_multi_list(
         servers,
-        async move {
-            Control::connect_local_if_running(&excluded)
-                .await
-                .map(|(address, ctrl, _events)| LocalProbe::Connected(address, ctrl))
-        },
+        async move { probe_local(LocalDiscovery::Optional, &excluded).await },
         deadline,
     )
     .await;
@@ -402,60 +394,26 @@ async fn list_multi(servers: Vec<Server>) -> Result<()> {
 
 async fn collect_multi_list(
     servers: Vec<Server>,
-    local_probe: impl Future<Output = Option<LocalProbe>>,
+    local_probe: impl Future<Output = Result<Option<(ServerAddress, Control)>>>,
     deadline: Instant,
 ) -> MultiListReport {
-    let local_future = async {
-        let Some(probe) = timeout_at(deadline, local_probe)
-            .await
-            .context("local server detection timed out")?
-        else {
-            return Ok(None);
-        };
-        let (address, connected) = match probe {
-            LocalProbe::Address(address) => (address, None),
-            LocalProbe::Connected(address, ctrl) => (address, Some(ctrl)),
-        };
-        if servers.iter().any(|server| server.address == address) {
-            return Ok(None);
-        }
-        let server = Server {
-            name: "local".to_owned(),
-            address,
-        };
-        let result = match connected {
-            Some(mut ctrl) => list_with_control(&mut ctrl, deadline).await,
-            None => list_server_until(&server, deadline).await,
-        };
-        Ok::<_, anyhow::Error>(Some((server, result)))
-    };
+    let outcome = fan_out(
+        servers,
+        LocalDiscovery::Optional,
+        local_probe,
+        deadline,
+        "listing timed out",
+        |_server, mut ctrl, deadline| async move { list_with_control(&mut ctrl, deadline).await },
+    )
+    .await;
 
-    let (local_outcome, listed) = tokio::join!(
-        local_future,
-        join_all(
-            servers
-                .iter()
-                .map(|server| list_server_until(server, deadline))
-        )
-    );
-
-    let mut all_servers = Vec::with_capacity(servers.len() + 1);
-    let mut all_results = Vec::with_capacity(servers.len() + 1);
     let mut errors = Vec::new();
-    match local_outcome {
-        Ok(Some((server, result))) => {
-            all_servers.push(server);
-            all_results.push(result);
-        }
-        Ok(None) => {}
-        Err(error) => errors.push(clean_one_line(&format!("{error:#}"))),
+    if let Some(error) = outcome.local_error {
+        errors.push(error);
     }
-    all_servers.extend(servers);
-    all_results.extend(listed);
-
     let mut groups = Vec::new();
     let mut reachable = 0;
-    for (server, result) in all_servers.into_iter().zip(all_results) {
+    for (server, result) in outcome.entries {
         match result {
             Ok(lines) => {
                 reachable += 1;
@@ -476,13 +434,6 @@ async fn collect_multi_list(
         errors,
         reachable,
     }
-}
-
-async fn list_server_until(server: &Server, deadline: Instant) -> Result<Vec<String>> {
-    let (mut ctrl, _events) = timeout_at(deadline, Control::connect(&server.address, None))
-        .await
-        .context("listing timed out")??;
-    list_with_control(&mut ctrl, deadline).await
 }
 
 async fn list_with_control(ctrl: &mut Control, deadline: Instant) -> Result<Vec<String>> {
@@ -518,7 +469,7 @@ async fn format_sessions(
             .into_iter()
             .map(|(entry, id, reply)| async move {
                 let view = match reply {
-                    Some(reply) => optional_call(reply, deadline).await,
+                    Some(reply) => session::optional_reply(reply, deadline).await,
                     None => None,
                 };
                 (entry, id, view)
@@ -563,8 +514,9 @@ fn start_window_titles(
         let Some(block_id) = window.focused_block_id else {
             continue;
         };
-        if let Ok(title_reply) = session::start_terminal_title(ctrl, session_id, &block_id) {
-            let process_reply = session::start_terminal_process(ctrl, session_id, &block_id).ok();
+        let block = BlockRef::new(session_id, &block_id);
+        if let Ok(title_reply) = session::start_terminal_title(ctrl, block) {
+            let process_reply = session::start_terminal_process(ctrl, block).ok();
             pending.push((window.id, title_reply, process_reply));
         }
     }
@@ -578,16 +530,17 @@ async fn finish_window_titles(
     let resolved = join_all(pending.into_iter().map(
         |(window_id, title_reply, process_reply)| async move {
             let (title_reply, process_reply) =
-                tokio::join!(optional_call(Ok(title_reply), deadline), async {
+                tokio::join!(session::optional_reply(Ok(title_reply), deadline), async {
                     match process_reply {
-                        Some(reply) => optional_call(Ok(reply), deadline).await,
+                        Some(reply) => session::optional_reply(Ok(reply), deadline).await,
                         None => None,
                     }
                 });
-            let title = title_reply
-                .as_ref()
-                .and_then(|reply| session::live_terminal_title(reply, process_reply.as_ref()))
-                .map(str::to_owned);
+            let title = session::resolved_terminal_title(
+                title_reply.as_ref(),
+                process_reply.as_ref(),
+                None,
+            );
             (window_id, title)
         },
     ))
@@ -596,17 +549,6 @@ async fn finish_window_titles(
         .into_iter()
         .filter_map(|(window_id, title)| Some((window_id, title?)))
         .collect()
-}
-
-async fn optional_call(
-    call: Result<session::PendingCall>,
-    deadline: Option<Instant>,
-) -> Option<Value> {
-    let rx = call.ok()?;
-    match deadline {
-        Some(deadline) => timeout_at(deadline, rx).await.ok()?.ok()?.ok(),
-        None => rx.await.ok()?.ok(),
-    }
 }
 
 fn format_session(
@@ -657,42 +599,13 @@ fn format_session(
     lines
 }
 
-async fn kill(server: &ServerAddress, target: &str) -> Result<()> {
-    let (mut ctrl, _events) = Control::connect(server, None).await?;
+async fn kill(server_config: &ServerConfig, target: &str) -> Result<()> {
+    let (_addr, mut ctrl, _events) = server_config.connect().await?;
     let id = session::pick(&mut ctrl, Some(target)).await?;
+    session::attach(&mut ctrl, &id).await?;
     session::destroy(&mut ctrl, &id).await?;
     println!("destroyed {id}");
     Ok(())
-}
-
-/// Server- and program-provided text must not send terminal escapes or span
-/// multiple lines.
-pub(crate) fn clean_one_line(text: &str) -> String {
-    text.chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>()
-        .trim()
-        .to_owned()
-}
-
-pub(crate) fn clean_truncated(text: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let cleaned = clean_one_line(text);
-    let mut chars = cleaned.chars();
-    let mut short: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        short.pop();
-        short.push('…');
-    }
-    short
 }
 
 fn clean_title(title: &str) -> String {
@@ -785,8 +698,8 @@ async fn complete(mut args: impl Iterator<Item = String>) {
                         (ctrl, events)
                     }
                     other => {
-                        let server = other.resolve().await.ok()?;
-                        Control::connect(&server, None).await.ok()?
+                        let (_addr, ctrl, events) = other.connect().await.ok()?;
+                        (ctrl, events)
                     }
                 };
                 Some(match context {
@@ -993,10 +906,7 @@ mod tests {
         assert!(parse_args(args(&["--window", "1"]), None).is_err());
         assert!(parse_args(args(&["--block", "2"]), None).is_err());
 
-        assert_eq!(
-            parse_args(args(&["-h"]), None).unwrap().1,
-            Command::Help
-        );
+        assert_eq!(parse_args(args(&["-h"]), None).unwrap().1, Command::Help);
         assert_eq!(
             parse_args(args(&["--help"]), None).unwrap().1,
             Command::Help
@@ -1295,54 +1205,59 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            #[allow(
-                clippy::result_large_err,
-                reason = "tungstenite fixes the callback error type"
-            )]
-            let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
-                if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
-                    res.headers_mut()
-                        .insert("Sec-WebSocket-Protocol", proto.clone());
-                }
-                Ok(res)
-            })
-            .await
-            .unwrap();
+            while let Ok((stream, _)) = listener.accept().await {
+                let sessions = sessions.clone();
+                tokio::spawn(async move {
+                    #[allow(
+                        clippy::result_large_err,
+                        reason = "tungstenite fixes the callback error type"
+                    )]
+                    let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                        if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                            res.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", proto.clone());
+                        }
+                        Ok(res)
+                    })
+                    .await
+                    .unwrap();
 
-            let _ = ws.next().await;
-            ws.send(Message::text(
-                json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
-                    .to_string(),
-            ))
-            .await
-            .unwrap();
+                    let _ = ws.next().await;
+                    ws.send(Message::text(
+                        json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
 
-            while let Some(Ok(Message::Text(text))) = ws.next().await {
-                let req: Value = serde_json::from_str(&text).unwrap();
-                let id = req["id"].as_str().unwrap();
-                let payload = match req["method"].as_str().unwrap() {
-                    "session.attach_all" => json!({"sessions": sessions}),
-                    "session.view" => json!({
-                        "active_window_id": "window:1",
-                        "windows": [{
-                            "window_id": "window:1",
-                            "label": "dev",
-                            "focused_block_id": "block:1",
-                            "layers": [{"blocks": [{"block_id": "block:1", "label": "shell"}]}]
-                        }]
-                    }),
-                    "com.superlogical.terminal.title" => json!({"title": "vim"}),
-                    "com.superlogical.terminal.process" => {
-                        json!({"foreground": null, "child": null})
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let req: Value = serde_json::from_str(&text).unwrap();
+                        let id = req["id"].as_str().unwrap();
+                        let payload = match req["method"].as_str().unwrap() {
+                            "session.attach_all" => json!({"sessions": sessions}),
+                            "session.view" => json!({
+                                "active_window_id": "window:1",
+                                "windows": [{
+                                    "window_id": "window:1",
+                                    "label": "dev",
+                                    "focused_block_id": "block:1",
+                                    "layers": [{"blocks": [{"block_id": "block:1", "label": "shell"}]}]
+                                }]
+                            }),
+                            "com.superlogical.terminal.title" => json!({"title": "vim"}),
+                            "com.superlogical.terminal.process" => {
+                                json!({"foreground": null, "child": null})
+                            }
+                            other => panic!("unexpected method {other}"),
+                        };
+                        ws.send(Message::text(
+                            json!({"type": "response", "id": id, "seq": 0, "payload": payload})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
                     }
-                    other => panic!("unexpected method {other}"),
-                };
-                ws.send(Message::text(
-                    json!({"type": "response", "id": id, "seq": 0, "payload": payload}).to_string(),
-                ))
-                .await
-                .unwrap();
+                });
             }
         });
         format!("http://{addr}").parse().unwrap()
@@ -1375,7 +1290,7 @@ mod tests {
                     address: office_addr,
                 },
             ],
-            async { None },
+            async { Ok(None) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1404,7 +1319,10 @@ mod tests {
                 name: "office".to_owned(),
                 address: office_addr,
             }],
-            async { Some(LocalProbe::Address(local_addr)) },
+            async move {
+                let (ctrl, _events) = Control::connect(&local_addr, None).await?;
+                Ok(Some((local_addr, ctrl)))
+            },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1424,7 +1342,10 @@ mod tests {
                 name: "saved-local".to_owned(),
                 address: shared_addr,
             }],
-            async { Some(LocalProbe::Address(shared_copy)) },
+            async move {
+                let (ctrl, _events) = Control::connect(&shared_copy, None).await?;
+                Ok(Some((shared_copy, ctrl)))
+            },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1433,6 +1354,28 @@ mod tests {
         assert!(deduped.errors.is_empty());
         assert_eq!(deduped.groups.len(), 1);
         assert_eq!(deduped.groups[0].0, "saved-local");
+    }
+
+    #[tokio::test]
+    async fn ls_window_titles_fall_back_to_foreground_process_when_title_missing_or_stale() {
+        let (title_tx, title_rx) = tokio::sync::oneshot::channel();
+        let (proc_tx, proc_rx) = tokio::sync::oneshot::channel();
+        title_tx
+            .send(Ok(json!({
+                "title": "old-app",
+                "owner": {"pid": 999, "name": "node"}
+            })))
+            .unwrap();
+        proc_tx
+            .send(Ok(json!({
+                "last_exit": null,
+                "foreground": {"pid": 200, "argv0": "-zsh", "name": "zsh"}
+            })))
+            .unwrap();
+        let titles =
+            finish_window_titles(vec![("window:1".to_owned(), title_rx, Some(proc_rx))], None)
+                .await;
+        assert_eq!(titles.get("window:1").map(String::as_str), Some("zsh"));
     }
 
     #[test]

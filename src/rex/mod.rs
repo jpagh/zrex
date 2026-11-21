@@ -37,6 +37,21 @@ pub const LOCAL_PROBE_TIME: Duration = Duration::from_secs(1);
 const OPEN_TRIES: u32 = 3;
 const DEFAULT_LOOPBACK_ADDR: &str = "127.0.0.1:7297";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockRef<'a> {
+    pub session_id: &'a str,
+    pub block_id: &'a str,
+}
+
+impl<'a> BlockRef<'a> {
+    pub fn new(session_id: &'a str, block_id: &'a str) -> Self {
+        Self {
+            session_id,
+            block_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerAddress {
     Network(String),
@@ -508,7 +523,10 @@ mod tests {
             "http://[::1",
             "http:///path",
         ] {
-            assert!(bad.parse::<ServerAddress>().is_err(), "expected {bad:?} to fail");
+            assert!(
+                bad.parse::<ServerAddress>().is_err(),
+                "expected {bad:?} to fail"
+            );
         }
     }
 
@@ -566,7 +584,8 @@ mod tests {
 
     #[tokio::test]
     async fn connect_local_if_running_handles_unix_tcp_stale_excluded_and_absent() {
-        let unix_path = env::temp_dir().join(format!("zrex-ctrl-local-{}.sock", std::process::id()));
+        let unix_path =
+            env::temp_dir().join(format!("zrex-ctrl-local-{}.sock", std::process::id()));
         let stale_path =
             env::temp_dir().join(format!("zrex-ctrl-stale-{}.sock", std::process::id()));
         let non_rex_path =
@@ -602,11 +621,7 @@ mod tests {
         });
 
         // 1. Skips stale and non-Rex sockets and connects cleanly to the live Unix Rex server.
-        let candidates = vec![
-            stale_path.clone(),
-            non_rex_path.clone(),
-            unix_path.clone(),
-        ];
+        let candidates = vec![stale_path.clone(), non_rex_path.clone(), unix_path.clone()];
         let (addr, mut ctrl, _events) =
             control::Control::connect_local_in(candidates.clone(), &tcp_addr, &[])
                 .await

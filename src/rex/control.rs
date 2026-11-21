@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,11 +15,26 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::proto::{self, Incoming};
 use super::{
-    CONNECT_TIME, DEFAULT_LOOPBACK_ADDR, LOCAL_PROBE_TIME, ServerAddress, Socket, format_timeout,
-    frame_with_timeout, local_socket_candidates,
+    BlockRef, CONNECT_TIME, DEFAULT_LOOPBACK_ADDR, LOCAL_PROBE_TIME, ServerAddress, Socket,
+    format_timeout, frame_with_timeout, local_socket_candidates,
 };
 
 pub const SUBPROTOCOL: &str = "rex.control.v1";
+
+/// Upper bound on control RPCs so a connected-but-wedged server never hangs
+/// attach or CLI commands indefinitely.
+pub const CALL_TIME: Duration = CONNECT_TIME;
+
+#[derive(Debug)]
+pub struct CallTimeout(pub String);
+
+impl fmt::Display for CallTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CallTimeout {}
 
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value>>>>>;
 
@@ -84,16 +100,13 @@ impl Control {
                 // server twice.
                 return None;
             }
-            if let Ok((ctrl, events)) =
-                Self::connect_once(&address, None, LOCAL_PROBE_TIME).await
-            {
+            if let Ok((ctrl, events)) = Self::connect_once(&address, None, LOCAL_PROBE_TIME).await {
                 return Some((address, ctrl, events));
             }
         }
         let loopback = ServerAddress::Network(format!("ws://{loopback}"));
         if !exclude.contains(&loopback)
-            && let Ok((ctrl, events)) =
-                Self::connect_once(&loopback, None, LOCAL_PROBE_TIME).await
+            && let Ok((ctrl, events)) = Self::connect_once(&loopback, None, LOCAL_PROBE_TIME).await
         {
             return Some((loopback, ctrl, events));
         }
@@ -108,7 +121,12 @@ impl Control {
         let hello = serde_json::to_string(&proto::hello(reconnect_token))?;
         tokio::time::timeout(timeout, socket.send(Message::text(hello)))
             .await
-            .map_err(|_| anyhow!("the server took no hello within {}", format_timeout(timeout)))??;
+            .map_err(|_| {
+                anyhow!(
+                    "the server took no hello within {}",
+                    format_timeout(timeout)
+                )
+            })??;
 
         let Some(message) = frame_with_timeout(&mut socket, "a welcome", timeout).await? else {
             bail!("the server closed the connection before the welcome");
@@ -218,9 +236,28 @@ impl Control {
     }
 
     pub async fn call(&mut self, method: &str, payload: Value) -> Result<Value> {
-        let rx = self.start_call(method, payload)?;
-        rx.await
-            .map_err(|_| anyhow!("the control connection ended during {method}"))?
+        self.call_with_timeout(method, payload, CALL_TIME).await
+    }
+
+    pub async fn call_with_timeout(
+        &mut self,
+        method: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (id, rx) = self.start_call_with_id(method, payload)?;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(received) => {
+                received.map_err(|_| anyhow!("the control connection ended during {method}"))?
+            }
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&id);
+                Err(anyhow::Error::new(CallTimeout(format!(
+                    "the server did not answer {method} within {}",
+                    format_timeout(timeout)
+                ))))
+            }
+        }
     }
 
     pub fn start_call(
@@ -228,6 +265,15 @@ impl Control {
         method: &str,
         payload: Value,
     ) -> Result<oneshot::Receiver<Result<Value>>> {
+        let (_, rx) = self.start_call_with_id(method, payload)?;
+        Ok(rx)
+    }
+
+    fn start_call_with_id(
+        &mut self,
+        method: &str,
+        payload: Value,
+    ) -> Result<(String, oneshot::Receiver<Result<Value>>)> {
         let id = self.next_request_id()?;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id.clone(), tx);
@@ -235,7 +281,7 @@ impl Control {
             self.pending.lock().unwrap().remove(&id);
             return Err(error);
         }
-        Ok(rx)
+        Ok((id, rx))
     }
 
     /// Fire-and-forget send for server-ordered methods such as `block.event`.
@@ -266,26 +312,25 @@ impl Control {
     /// this reply before sending the next write to preserve input ordering.
     pub fn start_write(
         &mut self,
-        session_id: &str,
-        block_id: &str,
+        block: BlockRef<'_>,
         data: &str,
     ) -> Result<oneshot::Receiver<Result<Value>>> {
         self.start_call(
             "com.superlogical.terminal.write",
             serde_json::json!({
-                "session_id": session_id,
-                "block_id": block_id,
+                "session_id": block.session_id,
+                "block_id": block.block_id,
                 "args": { "data": data },
             }),
         )
     }
 
-    pub fn post_event(&mut self, session_id: &str, block_id: &str, event: Value) -> Result<()> {
+    pub fn post_event(&mut self, block: BlockRef<'_>, event: Value) -> Result<()> {
         self.post(
             "block.event",
             serde_json::json!({
-                "session_id": session_id,
-                "block_id": block_id,
+                "session_id": block.session_id,
+                "block_id": block.block_id,
                 "event": event,
             }),
         )
@@ -468,5 +513,47 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn call_with_timeout_fails_with_call_timeout_when_server_stays_silent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                    res.headers_mut()
+                        .insert("Sec-WebSocket-Protocol", proto.clone());
+                }
+                Ok(res)
+            })
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+            ws.send(Message::text(
+                json!({"type": "welcome", "api_revision": proto::API_REVISION}).to_string(),
+            ))
+            .await
+            .unwrap();
+            // Read request and intentionally never reply.
+            let _ = ws.next().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let server: ServerAddress = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, _events) = Control::connect(&server, None).await.unwrap();
+        let err = ctrl
+            .call_with_timeout("server.version", Value::Null, Duration::from_millis(40))
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<CallTimeout>().is_some());
+        assert!(ctrl.pending.lock().unwrap().is_empty());
     }
 }

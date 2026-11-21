@@ -1,10 +1,29 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
+use tokio::time::{Instant, timeout_at};
 
+use crate::rex::BlockRef;
 use crate::rex::control::Control;
+use crate::text::{clean_one_line, clean_truncated, percent_decode, shorten_home};
 
 pub type PendingCall = oneshot::Receiver<Result<Value>>;
+
+pub async fn optional_reply(call: Result<PendingCall>, deadline: Option<Instant>) -> Option<Value> {
+    let rx = call.ok()?;
+    match deadline {
+        Some(deadline) => timeout_at(deadline, rx).await.ok()?.ok()?.ok(),
+        None => rx.await.ok()?.ok(),
+    }
+}
+
+/// Attaches the control connection to `session_id`. Mutating session, window,
+/// or block RPCs require prior `attach` (or `session.bootstrap`).
+pub async fn attach(ctrl: &mut Control, session_id: &str) -> Result<()> {
+    ctrl.call("session.attach", json!({"session_id": session_id}))
+        .await?;
+    Ok(())
+}
 
 pub async fn list(ctrl: &mut Control) -> Result<Vec<Value>> {
     let reply = ctrl.call("session.list", Value::Null).await?;
@@ -37,25 +56,17 @@ pub fn start_view(ctrl: &mut Control, session_id: &str) -> Result<PendingCall> {
     ctrl.start_call("session.view", json!({"session_id": session_id}))
 }
 
-pub fn start_terminal_title(
-    ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
-) -> Result<PendingCall> {
+pub fn start_terminal_title(ctrl: &mut Control, block: BlockRef<'_>) -> Result<PendingCall> {
     ctrl.start_call(
         "com.superlogical.terminal.title",
-        json!({"session_id": session_id, "block_id": block_id}),
+        json!({"session_id": block.session_id, "block_id": block.block_id}),
     )
 }
 
-pub fn start_terminal_process(
-    ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
-) -> Result<PendingCall> {
+pub fn start_terminal_process(ctrl: &mut Control, block: BlockRef<'_>) -> Result<PendingCall> {
     ctrl.start_call(
         "com.superlogical.terminal.process",
-        json!({"session_id": session_id, "block_id": block_id}),
+        json!({"session_id": block.session_id, "block_id": block.block_id}),
     )
 }
 
@@ -132,7 +143,7 @@ fn label_for_process(process: &Value) -> Option<String> {
         let Some(raw) = process.get(key).and_then(Value::as_str) else {
             continue;
         };
-        let cleaned = crate::clean_one_line(raw);
+        let cleaned = clean_one_line(raw);
         let candidate = if strip_login_dash {
             cleaned.strip_prefix('-').unwrap_or(&cleaned)
         } else {
@@ -144,7 +155,7 @@ fn label_for_process(process: &Value) -> Option<String> {
         } else {
             base
         };
-        let short = crate::clean_truncated(base, 24);
+        let short = clean_truncated(base, 24);
         if !short.is_empty() {
             return Some(short);
         }
@@ -157,20 +168,87 @@ fn basename(value: &str) -> &str {
     trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
 }
 
+/// Derives a pane's display title from its live terminal title, falling back
+/// to the foreground process name (and OSC 7 working directory when a VT
+/// snapshot is available).
+pub fn resolved_terminal_title(
+    title_reply: Option<&Value>,
+    process_reply: Option<&Value>,
+    screen: Option<&[u8]>,
+) -> Option<String> {
+    title_reply
+        .and_then(|reply| live_terminal_title(reply, process_reply))
+        .map(clean_one_line)
+        .filter(|title| !title.is_empty())
+        .or_else(|| process_pwd_title(process_reply, screen))
+}
+
+pub fn process_pwd_title(process_reply: Option<&Value>, screen: Option<&[u8]>) -> Option<String> {
+    let process = process_reply.and_then(process_name);
+    let pwd = screen.and_then(extract_osc_pwd);
+    match (process, pwd) {
+        (Some(proc_name), Some(dir)) => Some(format!("{proc_name} {dir}")),
+        (Some(proc_name), None) => Some(proc_name),
+        (None, Some(dir)) => Some(dir),
+        (None, None) => None,
+    }
+}
+
+fn extract_osc_pwd(bytes: &[u8]) -> Option<String> {
+    let start = bytes.windows(4).rposition(|w| w == b"\x1b]7;")?;
+    let rest = &bytes[start + 4..];
+    let end = rest
+        .iter()
+        .position(|&b| b == 0x07)
+        .into_iter()
+        .chain(rest.windows(2).position(|w| w == b"\x1b\\"))
+        .min()?;
+    let raw = std::str::from_utf8(&rest[..end]).ok()?;
+    let path = if let Some(after_scheme) = raw.strip_prefix("file://") {
+        let slash = after_scheme.find('/')?;
+        &after_scheme[slash..]
+    } else if raw.starts_with('/') {
+        raw
+    } else {
+        return None;
+    };
+    let decoded = clean_one_line(&percent_decode(path));
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(shorten_home(&decoded))
+}
+
+pub fn fallback_title_for(bootstrap: &Value, view: &Value, block_id: &str) -> Option<String> {
+    let window_label = windows(view)
+        .into_iter()
+        .find(|window| window.blocks.iter().any(|block| block.id == block_id))
+        .map(|window| clean_one_line(&window.label))
+        .filter(|label| !label.is_empty() && !is_default_window_label(label));
+    if window_label.is_some() {
+        return window_label;
+    }
+    bootstrap
+        .get("selected_session")
+        .map(label_of)
+        .map(clean_one_line)
+        .filter(|label| !label.is_empty())
+}
+
 pub fn is_default_window_label(label: &str) -> bool {
     label
         .strip_prefix("Window ")
         .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+/// Destroys a session. Requires prior `session::attach` (or `session.bootstrap`).
 pub async fn destroy(ctrl: &mut Control, session_id: &str) -> Result<()> {
-    ctrl.call("session.attach", json!({"session_id": session_id}))
-        .await?;
     ctrl.call("session.destroy", json!({"session_id": session_id}))
         .await?;
     Ok(())
 }
 
+/// Renames a session. Requires prior `session::attach` (or `session.bootstrap`).
 pub async fn set_label(ctrl: &mut Control, session_id: &str, label: &str) -> Result<()> {
     ctrl.call(
         "session.set_label",
@@ -180,6 +258,7 @@ pub async fn set_label(ctrl: &mut Control, session_id: &str, label: &str) -> Res
     Ok(())
 }
 
+/// Renames a window. Requires prior `session::attach` (or `session.bootstrap`).
 pub async fn set_window_label(
     ctrl: &mut Control,
     session_id: &str,
@@ -194,20 +273,17 @@ pub async fn set_window_label(
     Ok(())
 }
 
-pub async fn set_block_label(
-    ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
-    label: &str,
-) -> Result<()> {
+/// Renames a block. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn set_block_label(ctrl: &mut Control, block: BlockRef<'_>, label: &str) -> Result<()> {
     ctrl.call(
         "session.set_block_label",
-        json!({"session_id": session_id, "block_id": block_id, "label": label}),
+        json!({"session_id": block.session_id, "block_id": block.block_id, "label": label}),
     )
     .await?;
     Ok(())
 }
 
+/// Closes a window. Requires prior `session::attach` (or `session.bootstrap`).
 pub async fn close_window(ctrl: &mut Control, session_id: &str, window_id: &str) -> Result<()> {
     ctrl.call(
         "session.close_window",
@@ -217,10 +293,11 @@ pub async fn close_window(ctrl: &mut Control, session_id: &str, window_id: &str)
     Ok(())
 }
 
-pub async fn close_block(ctrl: &mut Control, session_id: &str, block_id: &str) -> Result<()> {
+/// Closes a block. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn close_block(ctrl: &mut Control, block: BlockRef<'_>) -> Result<()> {
     ctrl.call(
         "block.close",
-        json!({"session_id": session_id, "block_id": block_id}),
+        json!({"session_id": block.session_id, "block_id": block.block_id}),
     )
     .await?;
     Ok(())
@@ -920,13 +997,13 @@ mod tests {
         set_window_label(&mut ctrl, "session:1111-aaaa", "window:1", "renamed-window")
             .await
             .unwrap();
-        set_block_label(&mut ctrl, "session:1111-aaaa", "block:1", "")
+        set_block_label(&mut ctrl, BlockRef::new("session:1111-aaaa", "block:1"), "")
             .await
             .unwrap();
         close_window(&mut ctrl, "session:1111-aaaa", "window:1")
             .await
             .unwrap();
-        close_block(&mut ctrl, "session:1111-aaaa", "block:1")
+        close_block(&mut ctrl, BlockRef::new("session:1111-aaaa", "block:1"))
             .await
             .unwrap();
     }
@@ -1041,6 +1118,63 @@ mod tests {
         assert_eq!(
             process_name(&json!({"foreground": null, "child": null})),
             None
+        );
+    }
+
+    #[test]
+    fn fallback_title_prefers_custom_window_label_and_falls_back_to_session_label() {
+        let view = json!({
+            "windows": [
+                {
+                    "window_id": "window:1",
+                    "label": "Antigravity ~/Projects/zrex",
+                    "layers": [{"blocks": [{"block_id": "block:1"}]}]
+                },
+                {
+                    "window_id": "window:2",
+                    "label": "Window 1234abcd",
+                    "layers": [{"blocks": [{"block_id": "block:2"}]}]
+                }
+            ]
+        });
+        let bootstrap = json!({
+            "selected_session": {
+                "label": "work",
+                "view": view
+            }
+        });
+        assert_eq!(
+            fallback_title_for(&bootstrap, &view, "block:1").as_deref(),
+            Some("Antigravity ~/Projects/zrex")
+        );
+        assert_eq!(
+            fallback_title_for(&bootstrap, &view, "block:2").as_deref(),
+            Some("work")
+        );
+    }
+
+    #[test]
+    fn resolved_terminal_title_prefers_live_title_then_process_and_osc7_pwd() {
+        let process = json!({"foreground": {"pid": 200, "argv0": "-zsh", "name": "zsh"}});
+        let screen = b"hello\x1b]7;file://MacBook.local/tmp/my%20dir\x07world";
+        let live = json!({"title": "vim", "owner": {"pid": 200, "name": "zsh"}});
+        let stale = json!({"title": "old", "owner": {"pid": 999, "name": "node"}});
+
+        assert_eq!(
+            resolved_terminal_title(Some(&live), Some(&process), Some(screen)).as_deref(),
+            Some("vim")
+        );
+        assert_eq!(
+            resolved_terminal_title(Some(&stale), Some(&process), Some(screen)).as_deref(),
+            Some("zsh /tmp/my dir")
+        );
+        assert_eq!(
+            resolved_terminal_title(Some(&stale), Some(&process), None).as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(
+            process_pwd_title(Some(&process), Some(b"no osc7")).as_deref(),
+            Some("zsh")
         );
     }
 }

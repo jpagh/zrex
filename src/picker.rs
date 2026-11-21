@@ -10,9 +10,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app;
 use crate::config::{self, DISCOVERY_TIME, Server, ServerConfig};
-use crate::rex::{ServerAddress, control::Control, proto::ApiError};
-use crate::session::{self, PendingCall};
-use crate::{clean_one_line, clean_truncated};
+use crate::discovery::{LocalDiscovery, fan_out, probe_local};
+use crate::rex::{BlockRef, ServerAddress, control::Control, proto::ApiError};
+use crate::session;
+use crate::text::{clean_one_line, clean_truncated, truncate_to_columns};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProgramStatus {
@@ -101,6 +102,72 @@ impl ManageTarget {
             Self::Block { .. } => "block",
         }
     }
+
+    fn kill_progress_message(&self) -> String {
+        match self {
+            Self::Session { .. } => "Destroying session…".to_owned(),
+            Self::Window { .. } | Self::Block { .. } => format!("Closing {}…", self.kind_name()),
+        }
+    }
+
+    fn kill_done_message(&self) -> String {
+        match self {
+            Self::Session { .. } => "Destroyed session".to_owned(),
+            Self::Window { .. } | Self::Block { .. } => format!("Closed {}", self.kind_name()),
+        }
+    }
+
+    async fn rename(&self, ctrl: &mut Control, label: &str) -> Result<()> {
+        match self {
+            Self::Session { session_id, .. } => session::set_label(ctrl, session_id, label).await,
+            Self::Window {
+                session_id,
+                window_id,
+                ..
+            } => session::set_window_label(ctrl, session_id, window_id, label).await,
+            Self::Block {
+                session_id,
+                block_id,
+                ..
+            } => session::set_block_label(ctrl, BlockRef::new(session_id, block_id), label).await,
+        }
+    }
+
+    async fn kill(&self, ctrl: &mut Control) -> Result<()> {
+        match self {
+            Self::Session { session_id, .. } => session::destroy(ctrl, session_id).await,
+            Self::Window {
+                session_id,
+                window_id,
+                ..
+            } => session::close_window(ctrl, session_id, window_id).await,
+            Self::Block {
+                session_id,
+                block_id,
+                ..
+            } => session::close_block(ctrl, BlockRef::new(session_id, block_id)).await,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TargetKey {
+    server_index: usize,
+    session_id: String,
+    window_id: String,
+    block_id: String,
+}
+
+impl TargetKey {
+    pub(super) fn matches_target(&self, target: &Target) -> bool {
+        self.matches_window(target) && target.block_id == self.block_id
+    }
+
+    pub(super) fn matches_window(&self, target: &Target) -> bool {
+        target.server_index == self.server_index
+            && target.session_id == self.session_id
+            && target.window_id == self.window_id
+    }
 }
 
 #[derive(Clone)]
@@ -173,13 +240,6 @@ struct DiscoveryOutcome {
     attempted_any: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LocalDiscovery {
-    None,
-    Optional,
-    Required,
-}
-
 struct LoadedServers {
     servers: Vec<Server>,
     local_discovery: LocalDiscovery,
@@ -192,9 +252,21 @@ struct ServerDiscovery {
     missing_views: usize,
 }
 
+fn missing_views_warning(server_name: &str, missing_views: usize) -> Option<String> {
+    (missing_views > 0)
+        .then(|| format!("{server_name}: could not list windows for {missing_views} session(s)"))
+}
+
 impl DiscoveryOutcome {
     fn has_no_sources(&self, has_configured_sources: bool) -> bool {
         !has_configured_sources && !self.attempted_any
+    }
+
+    fn unreachable_error(&self) -> String {
+        match self.warnings.as_slice() {
+            [single] => single.clone(),
+            _ => "no reachable servers".to_owned(),
+        }
     }
 
     fn replace_server(
@@ -203,12 +275,7 @@ impl DiscoveryOutcome {
         discovery: ServerDiscovery,
     ) -> Option<String> {
         let server_name = clean_one_line(&self.servers[server_index].name);
-        let warning = (discovery.missing_views > 0).then(|| {
-            format!(
-                "{server_name}: could not list windows for {} session(s)",
-                discovery.missing_views
-            )
-        });
+        let warning = missing_views_warning(&server_name, discovery.missing_views);
 
         let old_sessions = std::mem::take(&mut self.sessions);
         let old_choices = std::mem::take(&mut self.choices);
@@ -299,12 +366,6 @@ fn discovery_warning_feedback(warnings: &[String]) -> Option<prompt::Feedback> {
     })
 }
 
-enum LocalTarget {
-    #[cfg_attr(not(test), allow(dead_code))]
-    Address(ServerAddress),
-    Connected(ServerAddress, Control),
-}
-
 pub async fn run(server_config: &ServerConfig) -> Result<()> {
     app::ensure_terminal()?;
     let loaded = load_servers(server_config).await?;
@@ -318,30 +379,25 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
     let mut outcome = discover_all(
         loaded.servers,
         local_discovery,
-        async move {
-            match local_discovery {
-                LocalDiscovery::None => None,
-                LocalDiscovery::Optional => Control::connect_local_if_running(&excluded)
-                    .await
-                    .map(|(address, ctrl, _events)| LocalTarget::Connected(address, ctrl)),
-                LocalDiscovery::Required => Control::connect_local_if_running(&[])
-                    .await
-                    .map(|(address, ctrl, _events)| LocalTarget::Connected(address, ctrl)),
-            }
-        },
+        async move { probe_local(local_discovery, &excluded).await },
         deadline,
     )
     .await;
-    let initial_feedback = discovery_warning_feedback(&outcome.warnings);
-    for warning in outcome.warnings.drain(..) {
-        eprintln!("zrex pick: {warning}");
-    }
     if outcome.servers.is_empty() {
         if outcome.has_no_sources(loaded.has_configured_sources) {
             println!("{NO_SERVERS_INTRO}");
             return Ok(());
         }
-        bail!("no reachable servers");
+        if outcome.warnings.len() > 1 {
+            for warning in &outcome.warnings {
+                eprintln!("zrex pick: {warning}");
+            }
+        }
+        bail!("{}", outcome.unreachable_error());
+    }
+    let initial_feedback = discovery_warning_feedback(&outcome.warnings);
+    for warning in outcome.warnings.drain(..) {
+        eprintln!("zrex pick: {warning}");
     }
 
     let server_names: Vec<String> = outcome
@@ -393,67 +449,52 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
                 .await;
             }
             Some(prompt::Selection::Rename { target, label }) => {
-                let kind = target.kind_name();
-                screen.render_busy(&mut state, &format!("Renaming {kind}…"))?;
-                let server_index = target.server_index();
-                let applied = apply_manage(
-                    &outcome.servers[server_index],
+                run_manage_op(
+                    &mut screen,
+                    &mut state,
+                    &mut outcome,
                     ManageOp::Rename {
                         target: &target,
                         label: &label,
                     },
-                    Instant::now() + DISCOVERY_TIME,
-                    DISCOVERY_TIME,
                 )
-                .await;
-                let ok_msg = if label.is_empty() {
-                    format!("Reset {kind} name to default")
-                } else {
-                    format!("Renamed {kind} to {}", clean_one_line(&label))
-                };
-                let feedback = finish_manage(
-                    &mut outcome,
-                    server_index,
-                    applied,
-                    ok_msg,
-                    &format!("Rename {kind} failed"),
-                );
-                state.refresh(outcome.choices.clone(), outcome.sessions.clone(), feedback);
-                screen.drain_input()?;
+                .await?;
             }
             Some(prompt::Selection::Kill { target }) => {
-                let kind = target.kind_name();
-                let verb = if matches!(target, ManageTarget::Session { .. }) {
-                    "Destroying"
-                } else {
-                    "Closing"
-                };
-                screen.render_busy(&mut state, &format!("{verb} {kind}…"))?;
-                let server_index = target.server_index();
-                let applied = apply_manage(
-                    &outcome.servers[server_index],
-                    ManageOp::Kill { target: &target },
-                    Instant::now() + DISCOVERY_TIME,
-                    DISCOVERY_TIME,
-                )
-                .await;
-                let ok_msg = if matches!(target, ManageTarget::Session { .. }) {
-                    "Destroyed session".to_owned()
-                } else {
-                    format!("Closed {kind}")
-                };
-                let feedback = finish_manage(
+                run_manage_op(
+                    &mut screen,
+                    &mut state,
                     &mut outcome,
-                    server_index,
-                    applied,
-                    ok_msg,
-                    &format!("Kill {kind} failed"),
-                );
-                state.refresh(outcome.choices.clone(), outcome.sessions.clone(), feedback);
-                screen.drain_input()?;
+                    ManageOp::Kill { target: &target },
+                )
+                .await?;
             }
         }
     }
+}
+
+async fn run_manage_op(
+    screen: &mut prompt::Screen,
+    state: &mut prompt::PickerState,
+    outcome: &mut DiscoveryOutcome,
+    op: ManageOp<'_>,
+) -> Result<()> {
+    let busy = op.busy_message();
+    let ok_msg = op.ok_message();
+    let err_prefix = op.err_prefix();
+    let server_index = op.target().server_index();
+    screen.render_busy(state, &busy)?;
+    let applied = apply_manage(
+        &outcome.servers[server_index],
+        op,
+        Instant::now() + DISCOVERY_TIME,
+        DISCOVERY_TIME,
+    )
+    .await;
+    let feedback = finish_manage(outcome, server_index, applied, ok_msg, &err_prefix);
+    state.refresh(outcome.choices.clone(), outcome.sessions.clone(), feedback);
+    screen.drain_input()?;
+    Ok(())
 }
 
 enum ManageOp<'a> {
@@ -464,6 +505,42 @@ enum ManageOp<'a> {
     Kill {
         target: &'a ManageTarget,
     },
+}
+
+impl<'a> ManageOp<'a> {
+    fn target(&self) -> &'a ManageTarget {
+        match self {
+            Self::Rename { target, .. } | Self::Kill { target } => target,
+        }
+    }
+
+    fn busy_message(&self) -> String {
+        match self {
+            Self::Rename { target, .. } => format!("Renaming {}…", target.kind_name()),
+            Self::Kill { target } => target.kill_progress_message(),
+        }
+    }
+
+    fn ok_message(&self) -> String {
+        match self {
+            Self::Rename { target, label } => {
+                let kind = target.kind_name();
+                if label.is_empty() {
+                    format!("Reset {kind} name to default")
+                } else {
+                    format!("Renamed {kind} to {}", clean_one_line(label))
+                }
+            }
+            Self::Kill { target } => target.kill_done_message(),
+        }
+    }
+
+    fn err_prefix(&self) -> String {
+        match self {
+            Self::Rename { target, .. } => format!("Rename {} failed", target.kind_name()),
+            Self::Kill { target } => format!("Kill {} failed", target.kind_name()),
+        }
+    }
 }
 
 struct ManageOutcome {
@@ -494,49 +571,10 @@ async fn apply_manage(
     };
 
     let result = timeout_at(op_deadline, async {
+        session::attach(&mut ctrl, op.target().session_id()).await?;
         match op {
-            ManageOp::Rename { target, label } => {
-                ctrl.call("session.attach", json!({"session_id": target.session_id()}))
-                    .await?;
-                match target {
-                    ManageTarget::Session { session_id, .. } => {
-                        session::set_label(&mut ctrl, session_id, label).await
-                    }
-                    ManageTarget::Window {
-                        session_id,
-                        window_id,
-                        ..
-                    } => session::set_window_label(&mut ctrl, session_id, window_id, label).await,
-                    ManageTarget::Block {
-                        session_id,
-                        block_id,
-                        ..
-                    } => session::set_block_label(&mut ctrl, session_id, block_id, label).await,
-                }
-            }
-            ManageOp::Kill { target } => match target {
-                ManageTarget::Session { session_id, .. } => {
-                    session::destroy(&mut ctrl, session_id).await
-                }
-                ManageTarget::Window {
-                    session_id,
-                    window_id,
-                    ..
-                } => {
-                    ctrl.call("session.attach", json!({"session_id": session_id}))
-                        .await?;
-                    session::close_window(&mut ctrl, session_id, window_id).await
-                }
-                ManageTarget::Block {
-                    session_id,
-                    block_id,
-                    ..
-                } => {
-                    ctrl.call("session.attach", json!({"session_id": session_id}))
-                        .await?;
-                    session::close_block(&mut ctrl, session_id, block_id).await
-                }
-            },
+            ManageOp::Rename { target, label } => target.rename(&mut ctrl, label).await,
+            ManageOp::Kill { target } => target.kill(&mut ctrl).await,
         }
     })
     .await
@@ -614,81 +652,35 @@ async fn discover_all<F>(
     deadline: Instant,
 ) -> DiscoveryOutcome
 where
-    F: Future<Output = Option<LocalTarget>>,
+    F: Future<Output = Result<Option<(ServerAddress, Control)>>>,
 {
-    // Resolve and query the default local server in parallel with saved servers
-    // so a hung local socket never delays remote discovery.
-    let local_future = async {
-        if local_discovery == LocalDiscovery::None {
-            return Ok(None);
-        }
-        let target = match timeout_at(deadline, local_probe).await {
-            Ok(Some(target)) => target,
-            Ok(None) => match local_discovery {
-                LocalDiscovery::Optional => return Ok(None),
-                LocalDiscovery::Required => bail!("local: server is not running"),
-                LocalDiscovery::None => unreachable!(),
-            },
-            Err(_) => bail!("local server detection timed out"),
-        };
-        let (address, connected) = match target {
-            LocalTarget::Address(address) => (address, None),
-            LocalTarget::Connected(address, ctrl) => (address, Some(ctrl)),
-        };
-        if servers.iter().any(|server| server.address == address) {
-            return Ok(None);
-        }
-        let server = Server {
-            name: "local".to_owned(),
-            address,
-        };
-        let result = match connected {
-            Some(mut ctrl) => discover_with_control(&mut ctrl, &server, deadline).await,
-            None => discover_until(&server, deadline).await,
-        };
-        Ok::<_, anyhow::Error>(Some((server, result)))
-    };
+    let fan = fan_out(
+        servers,
+        local_discovery,
+        local_probe,
+        deadline,
+        "discovery timed out",
+        |server, mut ctrl, deadline| async move {
+            discover_with_control(&mut ctrl, &server, deadline).await
+        },
+    )
+    .await;
 
-    let (local_outcome, discovered) = tokio::join!(
-        local_future,
-        join_all(
-            servers
-                .iter()
-                .map(|server| discover_until(server, deadline))
-        )
-    );
-
-    let mut all_servers = Vec::with_capacity(servers.len() + 1);
-    let mut all_results = Vec::with_capacity(servers.len() + 1);
     let mut warnings = Vec::new();
-    let mut local_failed = false;
-    match local_outcome {
-        Ok(Some((server, result))) => {
-            all_servers.push(server);
-            all_results.push(result);
-        }
-        Ok(None) => {}
-        Err(error) => {
-            local_failed = true;
-            warnings.push(clean_one_line(&format!("{error:#}")));
-        }
+    if let Some(error) = fan.local_error {
+        warnings.push(error);
     }
-    all_servers.extend(servers);
-    all_results.extend(discovered);
-    let attempted_any = !all_servers.is_empty() || local_failed;
 
     let mut reachable_servers = Vec::new();
     let mut sessions = Vec::new();
     let mut choices = Vec::new();
-    for (server, result) in all_servers.into_iter().zip(all_results) {
+    for (server, result) in fan.entries {
         match result {
             Ok(discovery) => {
                 let server_name = clean_one_line(&server.name);
-                if discovery.missing_views > 0 {
-                    warnings.push(format!(
-                        "{server_name}: could not list windows for {} session(s)",
-                        discovery.missing_views
-                    ));
+                if let Some(warning) = missing_views_warning(&server_name, discovery.missing_views)
+                {
+                    warnings.push(warning);
                 }
                 let server_index = reachable_servers.len();
                 let session_offset = sessions.len();
@@ -720,12 +712,14 @@ where
         sessions,
         choices,
         warnings,
-        attempted_any,
+        attempted_any: fan.attempted_any,
     }
 }
 
 async fn load_servers(server_config: &ServerConfig) -> Result<LoadedServers> {
-    if let ServerConfig::Explicit(target) = server_config {
+    if let ServerConfig::Explicit(target) = server_config
+        && (target.is_empty() || target.contains("://"))
+    {
         return Ok(LoadedServers {
             servers: vec![config::resolve_server(target).await?.server],
             local_discovery: LocalDiscovery::None,
@@ -747,6 +741,13 @@ where
     Fut: Future<Output = ServerAddress>,
 {
     if let ServerConfig::Explicit(target) = server_config {
+        if config::is_builtin_local(config, target) {
+            return Ok(LoadedServers {
+                servers: Vec::new(),
+                local_discovery: LocalDiscovery::Required,
+                has_configured_sources: true,
+            });
+        }
         return Ok(LoadedServers {
             servers: vec![
                 config::resolve_server_with(config, target, local)
@@ -763,12 +764,7 @@ where
     match server_config {
         ServerConfig::Explicit(_) => unreachable!(),
         ServerConfig::Env(target) => {
-            let local_discovery = if target.eq_ignore_ascii_case("local")
-                && !config
-                    .servers
-                    .keys()
-                    .any(|name| name.eq_ignore_ascii_case("local"))
-            {
+            let local_discovery = if config::is_builtin_local(config, target) {
                 LocalDiscovery::Required
             } else {
                 match config::resolve_server_with(config, target, local).await {
@@ -801,13 +797,6 @@ where
     }
 }
 
-async fn discover_until(server: &Server, deadline: Instant) -> Result<ServerDiscovery> {
-    let (mut ctrl, _events) = timeout_at(deadline, Control::connect(&server.address, None))
-        .await
-        .context("discovery timed out")??;
-    discover_with_control(&mut ctrl, server, deadline).await
-}
-
 async fn discover_with_control(
     ctrl: &mut Control,
     server: &Server,
@@ -832,7 +821,7 @@ async fn discover_with_control(
         let reply = session::start_view(ctrl, &id);
         let server_name = server.name.clone();
         views.push(async move {
-            let view = optional_reply(deadline, reply).await?;
+            let view = session::optional_reply(reply, Some(deadline)).await?;
             Some((
                 session_index,
                 targets(&server_name, session_index, &session_label, &id, &view),
@@ -862,10 +851,6 @@ async fn discover_with_control(
     })
 }
 
-async fn optional_reply(deadline: Instant, call: Result<PendingCall>) -> Option<Value> {
-    timeout_at(deadline, call.ok()?).await.ok()?.ok()?.ok()
-}
-
 fn describe_targets(
     ctrl: &mut Control,
     deadline: Instant,
@@ -876,13 +861,13 @@ fn describe_targets(
     for target in &targets {
         // Deduplicate metadata queries per block ID.
         requests.entry(target.block_id.clone()).or_insert_with(|| {
-            let title = session::start_terminal_title(ctrl, &target.session_id, &target.block_id);
+            let block = BlockRef::new(&target.session_id, &target.block_id);
+            let title = session::start_terminal_title(ctrl, block);
             let status = ctrl.start_call(
                 "com.superlogical.terminal.program_status",
-                json!({"session_id": target.session_id, "block_id": target.block_id}),
+                json!({"session_id": block.session_id, "block_id": block.block_id}),
             );
-            let process =
-                session::start_terminal_process(ctrl, &target.session_id, &target.block_id);
+            let process = session::start_terminal_process(ctrl, block);
             (title, status, process)
         });
     }
@@ -890,10 +875,12 @@ fn describe_targets(
         let details: HashMap<_, _> = join_all(requests.into_iter().map(
             |(id, (title, status, process))| async move {
                 let (title, status, process) = tokio::join!(
-                    optional_reply(deadline, title),
-                    optional_reply(deadline, status),
-                    optional_reply(deadline, process)
+                    session::optional_reply(title, Some(deadline)),
+                    session::optional_reply(status, Some(deadline)),
+                    session::optional_reply(process, Some(deadline))
                 );
+                // TargetLabel already renders the foreground process in the
+                // primary label column, so only show an explicit live title.
                 let title = title
                     .as_ref()
                     .and_then(|reply| session::live_terminal_title(reply, process.as_ref()))
@@ -1033,6 +1020,60 @@ fn is_default_block_label(label: &str) -> bool {
         .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+struct TargetSpec<'a> {
+    session_index: usize,
+    session_id: &'a str,
+    window_id: &'a str,
+    window_number: usize,
+    window_label: Option<String>,
+    window_block_count: usize,
+    block_id: &'a str,
+    block_number: usize,
+    block_label: Option<String>,
+    block_raw_label: String,
+    prefix: String,
+    fallback: String,
+}
+
+impl Target {
+    fn from_spec(spec: TargetSpec<'_>) -> Self {
+        let label_parts = TargetLabel {
+            prefix: spec.prefix,
+            window: spec.window_label.clone(),
+            block: spec.block_label.clone(),
+            fallback: spec.fallback,
+        };
+        let label = label_parts.format(None);
+        Self {
+            server_index: 0,
+            session_index: spec.session_index,
+            window_id: spec.window_id.to_owned(),
+            window_number: spec.window_number,
+            window_label: spec.window_label,
+            window_block_count: spec.window_block_count,
+            block_id: spec.block_id.to_owned(),
+            block_number: spec.block_number,
+            block_label: spec.block_label,
+            block_raw_label: spec.block_raw_label,
+            process: None,
+            label,
+            label_parts,
+            title: String::new(),
+            status: None,
+            session_id: spec.session_id.to_owned(),
+        }
+    }
+
+    pub(super) fn key(&self) -> TargetKey {
+        TargetKey {
+            server_index: self.server_index,
+            session_id: self.session_id.clone(),
+            window_id: self.window_id.clone(),
+            block_id: self.block_id.clone(),
+        }
+    }
+}
+
 fn targets(
     server: &str,
     session_index: usize,
@@ -1049,33 +1090,20 @@ fn targets(
         if window.blocks.len() > 1 {
             let block_count = window.blocks.len();
             for (split_index, block) in window.blocks.iter().enumerate() {
-                let fallback = label_or_id(&block.label, &block.id);
-                let block_label = custom_block_label(&block.label);
-                let label_parts = TargetLabel {
-                    prefix: format!("{session} / {number}.{}", split_index + 1),
-                    window: window_label.clone(),
-                    block: block_label.clone(),
-                    fallback,
-                };
-                let label = label_parts.format(None);
-                targets.push(Target {
-                    server_index: 0,
+                targets.push(Target::from_spec(TargetSpec {
                     session_index,
-                    window_id: window.id.clone(),
+                    session_id,
+                    window_id: &window.id,
                     window_number: number,
                     window_label: window_label.clone(),
                     window_block_count: block_count,
-                    block_id: block.id.clone(),
+                    block_id: &block.id,
                     block_number: split_index + 1,
-                    block_label,
+                    block_label: custom_block_label(&block.label),
                     block_raw_label: clean_one_line(&block.label),
-                    process: None,
-                    label,
-                    label_parts,
-                    title: String::new(),
-                    status: None,
-                    session_id: session_id.to_owned(),
-                });
+                    prefix: format!("{session} / {number}.{}", split_index + 1),
+                    fallback: label_or_id(&block.label, &block.id),
+                }));
             }
         } else if let Some(block_id) = window.active_or_first_block_id() {
             let block_label_str = window
@@ -1090,32 +1118,20 @@ fn targets(
             } else {
                 block_raw_label.clone()
             };
-            let block_label = custom_block_label(block_label_str);
-            let label_parts = TargetLabel {
-                prefix: format!("{session} / {number}"),
-                window: window_label.clone(),
-                block: block_label.clone(),
-                fallback,
-            };
-            let label = label_parts.format(None);
-            targets.push(Target {
-                server_index: 0,
+            targets.push(Target::from_spec(TargetSpec {
                 session_index,
-                window_id: window.id.clone(),
+                session_id,
+                window_id: &window.id,
                 window_number: number,
                 window_label,
                 window_block_count: 1,
-                block_id: block_id.to_owned(),
+                block_id,
                 block_number: 1,
-                block_label,
+                block_label: custom_block_label(block_label_str),
                 block_raw_label,
-                process: None,
-                label,
-                label_parts,
-                title: String::new(),
-                status: None,
-                session_id: session_id.to_owned(),
-            });
+                prefix: format!("{session} / {number}"),
+                fallback,
+            }));
         }
     }
     targets
@@ -1238,15 +1254,7 @@ impl Target {
                     search_offset: Some(part.sep_offset),
                 });
             }
-            let (visible, truncated) = if part.width <= part.limit {
-                (part.text.to_owned(), false)
-            } else {
-                let ellipsis_width = '…'.width().unwrap_or(1);
-                (
-                    prefix_to_columns(part.text, part.limit.saturating_sub(ellipsis_width)),
-                    true,
-                )
-            };
+            let (visible, truncated) = truncate_to_columns(part.text, part.limit);
             if part.role == StyleRole::Label {
                 push_label_spans(&mut spans, &visible, part.text_offset, truncated);
             } else {
@@ -1354,7 +1362,7 @@ pub(super) fn styled_scope_row(
     let mut spans = Vec::new();
     let tag_width = tag.width();
     if tag_width >= columns {
-        let visible = prefix_to_columns(tag, columns.saturating_sub(ellipsis_width));
+        let (visible, truncated) = truncate_to_columns(tag, columns);
         if !visible.is_empty() {
             spans.push(StyledSpan {
                 role: StyleRole::Title,
@@ -1362,7 +1370,7 @@ pub(super) fn styled_scope_row(
                 search_offset: None,
             });
         }
-        if columns >= ellipsis_width {
+        if truncated {
             spans.push(StyledSpan {
                 role: StyleRole::Title,
                 text: "…".to_owned(),
@@ -1379,32 +1387,17 @@ pub(super) fn styled_scope_row(
     });
     let remaining = columns - tag_width;
 
-    if detail.is_empty() {
-        let (visible, truncated) = if target.width() <= remaining {
-            (target.to_owned(), false)
-        } else {
-            (
-                prefix_to_columns(target, remaining.saturating_sub(ellipsis_width)),
-                true,
-            )
-        };
-        push_label_spans(&mut spans, &visible, 0, truncated);
-        return spans;
-    }
-
     let target_width = target.width();
-    let detail_width = detail.width();
-    if target_width + 1 + detail_width <= remaining {
+    if !detail.is_empty() && target_width + 1 + detail.width() <= remaining {
         push_label_spans(&mut spans, target, 0, false);
         spans.push(StyledSpan {
             role: StyleRole::Title,
             text: format!(" {detail}"),
             search_offset: None,
         });
-    } else if target_width + 1 + ellipsis_width < remaining {
+    } else if !detail.is_empty() && target_width + 1 + ellipsis_width < remaining {
         push_label_spans(&mut spans, target, 0, false);
-        let detail_budget = remaining - target_width - 1;
-        let visible = prefix_to_columns(detail, detail_budget.saturating_sub(ellipsis_width));
+        let (visible, _) = truncate_to_columns(detail, remaining - target_width - 1);
         if !visible.is_empty() {
             spans.push(StyledSpan {
                 role: StyleRole::Title,
@@ -1413,14 +1406,7 @@ pub(super) fn styled_scope_row(
             });
         }
     } else {
-        let (visible, truncated) = if target_width <= remaining {
-            (target.to_owned(), false)
-        } else {
-            (
-                prefix_to_columns(target, remaining.saturating_sub(ellipsis_width)),
-                true,
-            )
-        };
+        let (visible, truncated) = truncate_to_columns(target, remaining);
         push_label_spans(&mut spans, &visible, 0, truncated);
     }
     spans
@@ -1431,31 +1417,9 @@ fn styled_label(text: &str, columns: usize) -> Vec<StyledSpan> {
         return Vec::new();
     }
     let mut spans = Vec::new();
-    let (visible, truncated) = if text.width() <= columns {
-        (text.to_owned(), false)
-    } else {
-        let ellipsis_width = '…'.width().unwrap_or(1);
-        (
-            prefix_to_columns(text, columns.saturating_sub(ellipsis_width)),
-            true,
-        )
-    };
+    let (visible, truncated) = truncate_to_columns(text, columns);
     push_label_spans(&mut spans, &visible, 0, truncated);
     spans
-}
-
-pub(super) fn prefix_to_columns(text: &str, max_columns: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let ch_width = ch.width().unwrap_or(0);
-        if used + ch_width > max_columns {
-            break;
-        }
-        out.push(ch);
-        used += ch_width;
-    }
-    out
 }
 
 fn label_or_id(label: &str, id: &str) -> String {
@@ -1847,7 +1811,7 @@ mod tests {
         let outcome = discover_all(
             servers,
             LocalDiscovery::Optional,
-            async { None },
+            async { Ok(None) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1921,7 +1885,7 @@ mod tests {
         let outcome = discover_all(
             servers,
             LocalDiscovery::Optional,
-            async { None },
+            async { Ok(None) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1962,7 +1926,7 @@ mod tests {
             }]
         );
 
-        // Explicit `local` resolves to the local server without scanning other saved servers.
+        // Explicit `local` without a saved `local` entry requires probing the local server directly.
         let loaded = load_servers_with(
             &ServerConfig::Explicit("local".to_owned()),
             &config,
@@ -1970,13 +1934,42 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
+        assert_eq!(loaded.local_discovery, LocalDiscovery::Required);
         assert!(loaded.has_configured_sources);
+        assert!(loaded.servers.is_empty());
+
+        // When no local server is running, `-S local` names the local server instead of "no reachable servers".
+        let local_missing = discover_all(
+            loaded.servers,
+            loaded.local_discovery,
+            async { Ok(None) },
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
+        assert!(local_missing.servers.is_empty());
+        assert_eq!(
+            local_missing.unreachable_error(),
+            "local: server is not running"
+        );
+
+        // An explicit saved `local` entry overrides the built-in local probe for `-S local`.
+        let mut custom_local_cfg = config::Config::default();
+        custom_local_cfg
+            .servers
+            .insert("local".to_owned(), "http://127.0.0.1:9999".to_owned());
+        let loaded = load_servers_with(
+            &ServerConfig::Explicit("local".to_owned()),
+            &custom_local_cfg,
+            fake_local,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
         assert_eq!(
             loaded.servers,
             vec![Server {
                 name: "local".to_owned(),
-                address: "http://127.0.0.1:7297".parse().unwrap(),
+                address: "http://127.0.0.1:9999".parse().unwrap(),
             }]
         );
 
@@ -2020,9 +2013,10 @@ mod tests {
             #[allow(unreachable_code)]
             "http://127.0.0.1:7297".parse::<ServerAddress>().unwrap()
         };
-        let loaded = load_servers_with(&ServerConfig::Env("LOCAL".to_owned()), &config, panic_local)
-            .await
-            .unwrap();
+        let loaded =
+            load_servers_with(&ServerConfig::Env("LOCAL".to_owned()), &config, panic_local)
+                .await
+                .unwrap();
         assert_eq!(loaded.local_discovery, LocalDiscovery::Required);
         assert!(loaded.has_configured_sources);
         assert_eq!(
@@ -2080,7 +2074,7 @@ mod tests {
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { None },
+            async { Ok(None) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2101,7 +2095,7 @@ mod tests {
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { None },
+            async { Ok(None) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2121,22 +2115,17 @@ mod tests {
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { None },
+            async { Ok(None) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
         assert!(!outcome.has_no_sources(loaded.has_configured_sources));
 
-        // 4. Running local server detected, but fails to connect -> source existed.
-        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_addr: ServerAddress = format!("http://{}", dead_listener.local_addr().unwrap())
-            .parse()
-            .unwrap();
-        drop(dead_listener);
+        // 4. Local probe fails with a connection error -> source existed.
         let outcome = discover_all(
             Vec::new(),
             LocalDiscovery::Optional,
-            async move { Some(LocalTarget::Address(dead_addr)) },
+            async { Err(anyhow!("local: connection refused")) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2148,7 +2137,7 @@ mod tests {
         let outcome = discover_all(
             Vec::new(),
             LocalDiscovery::Optional,
-            std::future::pending::<Option<LocalTarget>>(),
+            std::future::pending::<Result<Option<(ServerAddress, Control)>>>(),
             Instant::now() + Duration::from_millis(10),
         )
         .await;
@@ -2160,19 +2149,16 @@ mod tests {
         let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_url = format!("http://{}", dead_listener.local_addr().unwrap());
         drop(dead_listener);
-        let loaded = load_servers_with(
-            &ServerConfig::Explicit(dead_url),
-            &empty_config,
-            fake_local,
-        )
-        .await
-        .unwrap();
+        let loaded =
+            load_servers_with(&ServerConfig::Explicit(dead_url), &empty_config, fake_local)
+                .await
+                .unwrap();
         assert!(loaded.has_configured_sources);
         assert_eq!(loaded.local_discovery, LocalDiscovery::None);
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { None },
+            async { Ok(None) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2193,12 +2179,13 @@ mod tests {
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { None },
+            async { Ok(None) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
         assert!(outcome.servers.is_empty());
         assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(outcome.unreachable_error(), "local: server is not running");
         assert!(!outcome.has_no_sources(loaded.has_configured_sources));
     }
 
@@ -2373,7 +2360,8 @@ mod tests {
             name: "other".to_owned(),
             address: "http://127.0.0.1:1".parse().unwrap(),
         };
-        let initial = discover_until(&server, Instant::now() + DISCOVERY_TIME)
+        let (mut ctrl, _events) = Control::connect(&server.address, None).await.unwrap();
+        let initial = discover_with_control(&mut ctrl, &server, Instant::now() + DISCOVERY_TIME)
             .await
             .unwrap();
         let mut outcome = DiscoveryOutcome {
@@ -2690,7 +2678,7 @@ mod tests {
                 address: saved_url.parse().unwrap(),
             }],
             LocalDiscovery::Required,
-            std::future::pending::<Option<LocalTarget>>(),
+            std::future::pending::<Result<Option<(ServerAddress, Control)>>>(),
             Instant::now() + Duration::from_millis(50),
         )
         .await;
@@ -2706,7 +2694,10 @@ mod tests {
                 address: saved_url.parse().unwrap(),
             }],
             LocalDiscovery::Required,
-            async move { Some(LocalTarget::Address(saved_addr)) },
+            async move {
+                let (ctrl, _events) = Control::connect(&saved_addr, None).await?;
+                Ok(Some((saved_addr, ctrl)))
+            },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2717,8 +2708,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_manage_refreshes_on_404_status_and_skips_500() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         use futures_util::SinkExt;
         use tokio::net::TcpListener;

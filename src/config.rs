@@ -8,8 +8,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::clean_one_line;
 use crate::rex::ServerAddress;
+use crate::rex::control::{Control, Events};
+use crate::text::clean_one_line;
 
 pub const DISCOVERY_TIME: Duration = Duration::from_secs(3);
 
@@ -19,7 +20,7 @@ pub struct Config {
     pub servers: BTreeMap<String, String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Server {
     pub name: String,
     pub address: ServerAddress,
@@ -54,14 +55,39 @@ impl ServerConfig {
         }
     }
 
-    pub async fn resolve(&self) -> Result<ServerAddress> {
+    pub async fn connect(&self) -> Result<(ServerAddress, Control, Events)> {
         match self {
             Self::Explicit(target) | Self::Env(target) => {
-                Ok(resolve_server(target).await?.server.address)
+                if !target.is_empty() && !target.contains("://") {
+                    let config = load_config()?;
+                    if is_builtin_local(&config, target) {
+                        return Control::connect_local_if_running(&[])
+                            .await
+                            .ok_or_else(|| anyhow::anyhow!("local: server is not running"));
+                    }
+                    let server = resolve_server_in(&config, target).await?.server.address;
+                    let (ctrl, events) = Control::connect(&server, None).await?;
+                    return Ok((server, ctrl, events));
+                }
+                let server = resolve_server(target).await?.server.address;
+                let (ctrl, events) = Control::connect(&server, None).await?;
+                Ok((server, ctrl, events))
             }
-            Self::Default => Ok(ServerAddress::local_or_loopback().await),
+            Self::Default => {
+                let server = ServerAddress::local_or_loopback().await;
+                let (ctrl, events) = Control::connect(&server, None).await?;
+                Ok((server, ctrl, events))
+            }
         }
     }
+}
+
+pub fn is_builtin_local(config: &Config, target: &str) -> bool {
+    target.eq_ignore_ascii_case("local")
+        && !config
+            .servers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("local"))
 }
 
 pub fn load_config() -> Result<Config> {

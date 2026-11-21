@@ -9,7 +9,7 @@ A lightweight command-line client for a [Rex](https://www.superlogical.com/rex/d
 - **Session management**: List, create, attach to, and destroy sessions by label, full ID, or 4+ character ID suffix.
 - **Attach picker**: Fuzzy-search existing sessions, windows, and splits across saved Rex servers, create new sessions (`Ctrl-N`) and windows (`Ctrl-T`), and rename (`Ctrl-R`) or kill (`Ctrl-K`) sessions, windows, or blocks on the fly.
 - **Window and split selection**: List windows and split panes (`1.1`, `1.2`, ...), attach to any window or split with `--window` (`-w`) and `--block` (`-b`), or create new windows on demand without changing the active window shown in Rex.app.
-- **Direct terminal pass-through**: Runs in your terminal's normal screen buffer so native scrollback, native mouse text selection, clickable URLs, Kitty graphics, and OSC escape sequences work directly without an intermediate renderer.
+- **Direct terminal pass-through**: Runs in your terminal's normal screen buffer so native scrollback, native mouse text selection, clickable URLs, Kitty graphics, and OSC escape sequences work directly without an intermediate renderer (OSC 0/2 window titles are prefixed with `zrex:` while attached and restored on detach).
 - **Full state rehydration**: Restores scrollback history, cursor state, colors, and terminal modes from the server on attach, and resets terminal modes cleanly on detach.
 - **Automatic reconnection**: Reconnects when the network drops and resumes the terminal stream from the last received byte.
 
@@ -95,7 +95,7 @@ Each choice shows its server name. `zrex` (or `zrex pick`) searches the saved se
 - **`--window` (`-w`)**: Selects a window by its 1-based number from `zrex ls`, its `window.block` index (such as `1.2`), its label, or `-` for a new window with a default Rex label. Passing a label that no window has creates a new window with that label and one shell block.
 - **`--block` (`-b`)**: Selects a block within the target (or active) window by its 1-based number, label, full ID, or 4+ character ID suffix.
 
-`ls` prints each window's label and, beside it, the terminal title its focused block reports — the same title Rex.app shows on the tab.
+`ls` prints each window's label and, beside it, the live terminal title its focused block reports (falling back to the foreground process name when no live title is set).
 
 ### Shell Completion
 
