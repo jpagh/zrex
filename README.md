@@ -7,7 +7,7 @@ A lightweight command-line client for a [Rex](https://www.superlogical.com/rex/d
 ## Features
 
 - **Session management**: List, create, attach to, and destroy sessions by label, full ID, or 4+ character ID suffix.
-- **Attach picker**: Fuzzy-search existing sessions, windows, and splits across saved Rex servers.
+- **Attach picker**: Fuzzy-search existing sessions, windows, and splits across saved Rex servers, or create new sessions (`Ctrl-N`) and windows (`Ctrl-T`) on the fly.
 - **Window and split selection**: List windows and split panes (`1.1`, `1.2`, ...), attach to any window or split with `--window` (`-w`) and `--block` (`-b`), or create new windows on demand without changing the active window shown in Rex.app.
 - **Direct terminal pass-through**: Runs in your terminal's normal screen buffer so native scrollback, native mouse text selection, clickable URLs, Kitty graphics, and OSC escape sequences work directly without an intermediate renderer.
 - **Full state rehydration**: Restores scrollback history, cursor state, colors, and terminal modes from the server on attach, and resets terminal modes cleanly on detach.
@@ -60,7 +60,7 @@ To reach a Rex server on another machine over Tailscale, use the HTTPS address t
 
 ### Attach Picker
 
-Run `zrex pick`, type to filter, and use the arrow keys (or `Tab`/`Shift-Tab`) and Enter to attach in the same terminal. `Ctrl-U` clears the entire search query, and `Esc` or `Ctrl-C` cancels. `Ctrl-\` detaches straight back to your shell. The picker never creates a session or window.
+Run `zrex pick`, type to filter, and use the arrow keys (or `Tab`/`Shift-Tab`) and Enter to attach in the same terminal. Press `Ctrl-N` to create a new session (optionally choosing a server and name, or pressing Enter for the default) or `Ctrl-T` to create a new window in a session (defaulting to the highlighted target's session). `Ctrl-U` clears the current input, `Esc` backs out of a creation prompt or cancels the picker, and `Ctrl-C` cancels immediately. `Ctrl-\` detaches straight back to your shell.
 
 Use `Alt/Option-←` and `Alt/Option-→` to move by word. `Ctrl-←`/`Ctrl-→` and `Alt-B`/`Alt-F` also work, depending on what your terminal sends. `Home`/`End` or `Ctrl-A`/`Ctrl-E` go to the start or end of the query.
 

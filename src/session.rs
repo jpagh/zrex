@@ -685,12 +685,27 @@ mod tests {
                     "session.list" => json!({
                         "sessions": [{"session_id": "session:1111-aaaa", "label": "work"}]
                     }),
-                    "session.create" => json!({"session_id": "session:2222-bbbb"}),
+                    "session.create" => {
+                        if let Some(label) = req["payload"].get("label").and_then(Value::as_str) {
+                            json!({"session_id": format!("session:2222-{label}")})
+                        } else {
+                            json!({"session_id": "session:2222-default"})
+                        }
+                    }
                     "session.view" => json!({
                         "active_window_id": "window:1",
                         "windows": [{"window_id": "window:1", "label": "editor", "focused_block_id": "block:1"}]
                     }),
-                    "session.new_window" => json!({"window_id": "window:2"}),
+                    "session.new_window" => {
+                        assert_eq!(req["payload"]["focus"], json!(false));
+                        if let Some(label) =
+                            req["payload"].get("window_label").and_then(Value::as_str)
+                        {
+                            json!({"window_id": format!("window:{label}")})
+                        } else {
+                            json!({"window_id": "window:default"})
+                        }
+                    }
                     other => panic!("unexpected method {other}"),
                 };
                 ws.send(Message::text(
@@ -717,7 +732,15 @@ mod tests {
         );
         assert_eq!(
             find_or_create(&mut ctrl, "fresh").await.unwrap(),
-            "session:2222-bbbb"
+            "session:2222-fresh"
+        );
+        assert_eq!(
+            create(&mut ctrl, None).await.unwrap(),
+            "session:2222-default"
+        );
+        assert_eq!(
+            create(&mut ctrl, Some("named")).await.unwrap(),
+            "session:2222-named"
         );
 
         assert_eq!(
@@ -752,13 +775,13 @@ mod tests {
             ensure_window(&mut ctrl, "session:1111-aaaa", "logs", None)
                 .await
                 .unwrap(),
-            ("window:2".to_owned(), None)
+            ("window:logs".to_owned(), None)
         );
         assert_eq!(
             ensure_window(&mut ctrl, "session:1111-aaaa", "-", None)
                 .await
                 .unwrap(),
-            ("window:2".to_owned(), None)
+            ("window:default".to_owned(), None)
         );
     }
 

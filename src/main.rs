@@ -49,7 +49,8 @@ completion script that completes session labels, window numbers and labels, and
 block numbers and labels from the live server. pick fuzzy-searches existing
 sessions, windows, and splits on the default (when running) and saved servers
 (~/.config/zrex/config.toml, or $XDG_CONFIG_HOME/zrex/config.toml). With --server
-it searches only that address. Enter attaches, and Esc cancels.
+it searches only that address. Enter attaches, Ctrl-N creates a new session,
+Ctrl-T creates a new window in a session, and Esc cancels.
 
 While attached:
   Ctrl-backslash          detach, and leave the session running

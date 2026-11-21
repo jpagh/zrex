@@ -37,7 +37,31 @@ pub(super) struct StyledSpan {
     pub(super) search_offset: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SessionChoice {
+    pub(super) server_index: usize,
+    pub(super) server_name: String,
+    pub(super) session_id: String,
+    pub(super) label: String,
+}
+
+impl SessionChoice {
+    pub(super) fn display_name(&self) -> String {
+        format!("[{}] {}", self.server_name, self.label)
+    }
+
+    pub(super) fn styled_row(&self, columns: usize) -> Vec<StyledSpan> {
+        styled_label(&self.display_name(), columns)
+    }
+}
+
+pub(super) fn styled_server_row(server_name: &str, columns: usize) -> Vec<StyledSpan> {
+    styled_label(&format!("[{server_name}]"), columns)
+}
+
 pub(super) struct Target {
+    pub(super) server_index: usize,
+    pub(super) session_index: usize,
     label: String,
     label_parts: TargetLabel,
     title: String,
@@ -82,8 +106,15 @@ impl TargetLabel {
 
 struct DiscoveryOutcome {
     servers: Vec<Server>,
-    choices: Vec<(usize, Target)>,
+    sessions: Vec<SessionChoice>,
+    choices: Vec<Target>,
     warnings: Vec<String>,
+}
+
+struct ServerDiscovery {
+    sessions: Vec<(String, String)>,
+    targets: Vec<Target>,
+    missing_views: usize,
 }
 
 pub async fn run(server_config: &ServerConfig) -> Result<()> {
@@ -99,15 +130,37 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
     for warning in outcome.warnings {
         eprintln!("zrex pick: {warning}");
     }
-    if outcome.choices.is_empty() {
-        bail!("no attachable sessions found");
+    if outcome.servers.is_empty() {
+        bail!("no reachable servers");
     }
 
-    let targets: Vec<_> = outcome.choices.iter().map(|(_, target)| target).collect();
-    if let Some(index) = prompt::select(&targets)? {
-        let (server_index, target) = &outcome.choices[index];
-        let server = &outcome.servers[*server_index];
-        app::attach_existing(&server.address, &target.session_id, &target.block_id).await?;
+    let server_names: Vec<String> = outcome
+        .servers
+        .iter()
+        .map(|server| clean_one_line(&server.name))
+        .collect();
+    match prompt::select(&outcome.choices, &outcome.sessions, &server_names)? {
+        Some(prompt::Selection::Attach(index)) => {
+            let target = &outcome.choices[index];
+            let server = &outcome.servers[target.server_index];
+            app::attach_existing(&server.address, &target.session_id, &target.block_id).await?;
+        }
+        Some(prompt::Selection::NewSession {
+            server_index,
+            label,
+        }) => {
+            let server = &outcome.servers[server_index];
+            app::attach_new_session(&server.address, label.as_deref()).await?;
+        }
+        Some(prompt::Selection::NewWindow {
+            session_index,
+            label,
+        }) => {
+            let session = &outcome.sessions[session_index];
+            let server = &outcome.servers[session.server_index];
+            app::attach_new_window(&server.address, &session.session_id, label.as_deref()).await?;
+        }
+        None => {}
     }
     Ok(())
 }
@@ -166,17 +219,35 @@ where
     all_servers.extend(servers);
     all_results.extend(discovered);
 
+    let mut reachable_servers = Vec::new();
+    let mut sessions = Vec::new();
     let mut choices = Vec::new();
-    for (server_index, (server, result)) in all_servers.iter().zip(all_results).enumerate() {
+    for (server, result) in all_servers.into_iter().zip(all_results) {
         match result {
-            Ok((targets, missing_views)) => {
-                if missing_views > 0 {
+            Ok(discovery) => {
+                let server_name = clean_one_line(&server.name);
+                if discovery.missing_views > 0 {
                     warnings.push(format!(
-                        "{}: could not list windows for {missing_views} session(s)",
-                        clean_one_line(&server.name)
+                        "{server_name}: could not list windows for {} session(s)",
+                        discovery.missing_views
                     ));
                 }
-                choices.extend(targets.into_iter().map(|target| (server_index, target)));
+                let server_index = reachable_servers.len();
+                let session_offset = sessions.len();
+                for (session_id, label) in discovery.sessions {
+                    sessions.push(SessionChoice {
+                        server_index,
+                        server_name: server_name.clone(),
+                        session_id,
+                        label,
+                    });
+                }
+                for mut target in discovery.targets {
+                    target.server_index = server_index;
+                    target.session_index += session_offset;
+                    choices.push(target);
+                }
+                reachable_servers.push(server);
             }
             Err(error) => warnings.push(format!(
                 "{}: {}",
@@ -187,7 +258,8 @@ where
     }
 
     DiscoveryOutcome {
-        servers: all_servers,
+        servers: reachable_servers,
+        sessions,
         choices,
         warnings,
     }
@@ -227,7 +299,7 @@ fn load_servers(server_config: &ServerConfig) -> Result<(Vec<Server>, bool)> {
     }
 }
 
-async fn discover_until(server: &Server, deadline: Instant) -> Result<(Vec<Target>, usize)> {
+async fn discover_until(server: &Server, deadline: Instant) -> Result<ServerDiscovery> {
     let (mut ctrl, entries) = timeout_at(deadline, async {
         let (mut ctrl, _events) = Control::connect(&server.address, None).await?;
         let entries = session::list_all(&mut ctrl).await?;
@@ -238,21 +310,26 @@ async fn discover_until(server: &Server, deadline: Instant) -> Result<(Vec<Targe
 
     // Send all view requests before waiting, so one slow session does not
     // prevent other sessions on the same server from appearing.
-    let mut views: FuturesUnordered<_> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            let id = session::id_of(entry);
-            if id.is_empty() {
-                return None;
-            }
-            let reply = session::start_view(&mut ctrl, &id);
-            Some(async move {
-                let view = optional_reply(deadline, reply).await?;
-                Some((index, targets(&server.name, entry, &id, &view)))
-            })
-        })
-        .collect();
+    let mut sessions = Vec::new();
+    let mut views = FuturesUnordered::new();
+    for entry in &entries {
+        let id = session::id_of(entry);
+        if id.is_empty() {
+            continue;
+        }
+        let session_index = sessions.len();
+        let session_label = label_or_id(session::label_of(entry), &id);
+        sessions.push((id.clone(), session_label.clone()));
+        let reply = session::start_view(&mut ctrl, &id);
+        let server_name = server.name.clone();
+        views.push(async move {
+            let view = optional_reply(deadline, reply).await?;
+            Some((
+                session_index,
+                targets(&server_name, session_index, &session_label, &id, &view),
+            ))
+        });
+    }
     let mut missing_views = 0;
     let mut pending = Vec::new();
     while let Some(view) = views.next().await {
@@ -266,13 +343,14 @@ async fn discover_until(server: &Server, deadline: Instant) -> Result<(Vec<Targe
     }
     let mut groups = join_all(pending).await;
     groups.sort_unstable_by_key(|(index, _)| *index);
-    Ok((
-        groups
+    Ok(ServerDiscovery {
+        sessions,
+        targets: groups
             .into_iter()
             .flat_map(|(_, targets)| targets)
             .collect(),
         missing_views,
-    ))
+    })
 }
 
 async fn optional_reply(deadline: Instant, call: Result<PendingCall>) -> Option<Value> {
@@ -487,16 +565,20 @@ fn custom_block_label(label: &str) -> Option<String> {
     }
 }
 
-fn targets(server: &str, entry: &Value, session_id: &str, view: &Value) -> Vec<Target> {
-    let session = format!(
-        "[{}] {}",
-        clean_one_line(server),
-        label_or_id(session::label_of(entry), session_id)
-    );
+fn targets(
+    server: &str,
+    session_index: usize,
+    session_label: &str,
+    session_id: &str,
+    view: &Value,
+) -> Vec<Target> {
+    let session = format!("[{}] {}", clean_one_line(server), session_label);
     let mut targets = Vec::new();
     let mut add = |label_parts: TargetLabel, block_id: &str| {
         let label = label_parts.format(None);
         targets.push(Target {
+            server_index: 0,
+            session_index,
             label,
             label_parts,
             title: String::new(),
@@ -771,7 +853,25 @@ fn push_label_spans(
     }
 }
 
-fn prefix_to_columns(text: &str, max_columns: usize) -> String {
+fn styled_label(text: &str, columns: usize) -> Vec<StyledSpan> {
+    if columns == 0 || text.is_empty() {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let (visible, truncated) = if text.width() <= columns {
+        (text.to_owned(), false)
+    } else {
+        let ellipsis_width = '…'.width().unwrap_or(1);
+        (
+            prefix_to_columns(text, columns.saturating_sub(ellipsis_width)),
+            true,
+        )
+    };
+    push_label_spans(&mut spans, &visible, 0, truncated);
+    spans
+}
+
+pub(super) fn prefix_to_columns(text: &str, max_columns: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for ch in text.chars() {
@@ -795,6 +895,31 @@ fn label_or_id(label: &str, id: &str) -> String {
 }
 
 #[cfg(test)]
+pub(super) fn test_target(
+    server_index: usize,
+    session_index: usize,
+    label: &str,
+    session_id: &str,
+    block_id: &str,
+) -> Target {
+    Target {
+        server_index,
+        session_index,
+        label: label.to_owned(),
+        label_parts: TargetLabel {
+            prefix: label.to_owned(),
+            window: None,
+            block: None,
+            fallback: String::new(),
+        },
+        title: String::new(),
+        status: None,
+        session_id: session_id.to_owned(),
+        block_id: block_id.to_owned(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -809,6 +934,8 @@ mod tests {
             })
         };
         Target {
+            server_index: 0,
+            session_index: 0,
             label: label.to_owned(),
             label_parts: TargetLabel {
                 prefix: label.to_owned(),
@@ -995,7 +1122,6 @@ mod tests {
 
     #[test]
     fn targets_hide_default_window_and_shell_labels_and_show_process() {
-        let entry = json!({"session_id": "session:1", "label": "zrex"});
         let view = json!({
             "active_window_id": "window:1",
             "windows": [
@@ -1033,7 +1159,7 @@ mod tests {
                 }
             ]
         });
-        let list = targets("local", &entry, "session:1", &view);
+        let list = targets("local", 0, "zrex", "session:1", &view);
         assert_eq!(
             list.iter()
                 .map(|t| (t.label.as_str(), t.block_id.as_str()))
@@ -1152,9 +1278,83 @@ mod tests {
         )
         .await;
 
+        assert_eq!(outcome.servers.len(), 1);
+        assert_eq!(outcome.servers[0].name, "office");
+        assert_eq!(outcome.sessions.len(), 1);
+        assert_eq!(outcome.sessions[0].display_name(), "[office] work");
         assert_eq!(outcome.choices.len(), 1);
-        assert_eq!(outcome.choices[0].1.label, "[office] work / 1 dev");
+        assert_eq!(outcome.choices[0].server_index, 0);
+        assert_eq!(outcome.choices[0].session_index, 0);
+        assert_eq!(outcome.choices[0].label, "[office] work / 1 dev");
         assert_eq!(outcome.warnings.len(), 1);
         assert!(outcome.warnings[0].starts_with("dead: "));
+    }
+
+    #[tokio::test]
+    async fn discover_all_keeps_reachable_empty_server_for_new_session_creation() {
+        use futures_util::SinkExt;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                    res.headers_mut()
+                        .insert("Sec-WebSocket-Protocol", proto.clone());
+                }
+                Ok(res)
+            })
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+            ws.send(Message::text(
+                json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_str().unwrap();
+                let payload = match req["method"].as_str().unwrap() {
+                    "session.attach_all" => json!({"sessions": []}),
+                    other => panic!("unexpected method {other}"),
+                };
+                ws.send(Message::text(
+                    json!({"type": "response", "id": id, "seq": 0, "payload": payload}).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+
+        let servers = vec![Server {
+            name: "fresh".to_owned(),
+            address: format!("http://{live_addr}").parse().unwrap(),
+        }];
+
+        let outcome = discover_all(
+            servers,
+            Some(async { None }),
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
+
+        assert_eq!(outcome.servers.len(), 1);
+        assert_eq!(outcome.servers[0].name, "fresh");
+        assert!(outcome.sessions.is_empty());
+        assert!(outcome.choices.is_empty());
+        assert!(outcome.warnings.is_empty());
     }
 }

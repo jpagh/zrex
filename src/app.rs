@@ -160,6 +160,40 @@ pub async fn attach_existing(
     .await
 }
 
+pub async fn attach_new_session(server: &ServerAddress, label: Option<&str>) -> Result<()> {
+    ensure_terminal()?;
+    let (mut ctrl, events) = Control::connect(server, None).await?;
+    let session_id = session::create(&mut ctrl, label).await?;
+    attach_block(
+        server,
+        ctrl,
+        events,
+        &session_id,
+        BlockSelection::Selectors(None, None),
+    )
+    .await
+}
+
+pub async fn attach_new_window(
+    server: &ServerAddress,
+    session_id: &str,
+    label: Option<&str>,
+) -> Result<()> {
+    ensure_terminal()?;
+    let (mut ctrl, events) = Control::connect(server, None).await?;
+    ctrl.call("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let window_id = session::new_window(&mut ctrl, session_id, label).await?;
+    attach_block(
+        server,
+        ctrl,
+        events,
+        session_id,
+        BlockSelection::Selectors(Some(&window_id), None),
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum BlockSelection<'a> {
     Selectors(Option<&'a str>, Option<&'a str>),
