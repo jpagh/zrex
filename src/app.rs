@@ -26,6 +26,7 @@ const PROBE_TIME: Duration = Duration::from_secs(5);
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(5);
 const THEME_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+const TITLE_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 /// An unterminated local reply grows no larger than this before zrex stops
 /// holding it and forwards the bytes as input. The longest reply a terminal
 /// sends is a 256-color palette entry at 29 bytes.
@@ -57,6 +58,7 @@ const RESET_MODES: &[u8] = concat!(
     "\x1b[r",
     "\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\",
     "\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07",
+    "\x1b[23;0t",
     "\x1b[?25h",
     "\x1b[0m\r\n",
 )
@@ -424,6 +426,7 @@ struct Attached<'a> {
     client_id: String,
     size: (u16, u16),
     theme: Theme,
+    fallback_title: Option<String>,
     data: Data,
     filter: Filter,
     pending: Vec<u8>,
@@ -475,6 +478,7 @@ impl<'a> Attached<'a> {
                     (None, None) => anyhow!("the session's active window shows no block"),
                 })?,
         };
+        let fallback_title = fallback_title_for(&bootstrap, &view, &block_id);
 
         finish_call(start_take(ctrl, session_id, &block_id)?).await?;
         let ticket_rx = start_ticket(ctrl, session_id, &block_id)?;
@@ -497,6 +501,7 @@ impl<'a> Attached<'a> {
             client_id,
             size: (cols, rows),
             theme,
+            fallback_title,
             data,
             filter,
             pending: Vec::new(),
@@ -529,9 +534,29 @@ impl<'a> Attached<'a> {
     }
 
     async fn prime(&mut self, ctrl: &mut Control) -> Result<()> {
+        let title_rx = session::start_terminal_title(ctrl, &self.session_id, &self.block_id).ok();
+        let process_rx =
+            session::start_terminal_process(ctrl, &self.session_id, &self.block_id).ok();
         let screen = format_vt(ctrl, &self.session_id, &self.block_id).await?;
+        let deadline = tokio::time::Instant::now() + TITLE_QUERY_TIMEOUT;
+        let (title_reply, process_reply) = tokio::join!(
+            optional_reply(title_rx, deadline),
+            optional_reply(process_rx, deadline),
+        );
+        let title = title_reply
+            .as_ref()
+            .and_then(|reply| session::live_terminal_title(reply, process_reply.as_ref()))
+            .map(crate::clean_one_line)
+            .filter(|t| !t.is_empty())
+            .or_else(|| process_pwd_title(process_reply.as_ref(), &screen))
+            .or_else(|| self.fallback_title.clone());
         self.out.extend_from_slice(b"\x1b[2J\x1b[H");
         self.out.extend_from_slice(&screen);
+        self.out.extend_from_slice(&stream::format_osc_title(
+            b'0',
+            title.as_deref().unwrap_or(""),
+            b"\x07",
+        ));
         self.primed = true;
         Ok(())
     }
@@ -812,6 +837,7 @@ impl<'a> Attached<'a> {
         if let Some(client_id) = bootstrap.get("client_id").and_then(Value::as_str) {
             self.client_id = client_id.to_owned();
         }
+        self.fallback_title = fallback_title_for(&bootstrap, view, &self.block_id);
         if let Ok(size) = crossterm::terminal::size() {
             self.size = size;
         }
@@ -1553,6 +1579,112 @@ async fn ticket(ctrl: &mut Control, session_id: &str, block_id: &str) -> Result<
     parse_ticket(&finish_call(start_ticket(ctrl, session_id, block_id)?).await?)
 }
 
+async fn optional_reply(
+    rx: Option<session::PendingCall>,
+    deadline: tokio::time::Instant,
+) -> Option<Value> {
+    tokio::time::timeout_at(deadline, rx?)
+        .await
+        .ok()?
+        .ok()?
+        .ok()
+}
+
+fn process_pwd_title(process_reply: Option<&Value>, screen: &[u8]) -> Option<String> {
+    let process = process_reply.and_then(session::process_name);
+    let pwd = extract_osc_pwd(screen);
+    match (process, pwd) {
+        (Some(proc_name), Some(dir)) => Some(format!("{proc_name} {dir}")),
+        (Some(proc_name), None) => Some(proc_name),
+        (None, Some(dir)) => Some(dir),
+        (None, None) => None,
+    }
+}
+
+fn extract_osc_pwd(bytes: &[u8]) -> Option<String> {
+    let start = bytes.windows(4).rposition(|w| w == b"\x1b]7;")?;
+    let rest = &bytes[start + 4..];
+    let end = rest
+        .iter()
+        .position(|&b| b == 0x07)
+        .into_iter()
+        .chain(rest.windows(2).position(|w| w == b"\x1b\\"))
+        .min()?;
+    let raw = std::str::from_utf8(&rest[..end]).ok()?;
+    let path = if let Some(after_scheme) = raw.strip_prefix("file://") {
+        let slash = after_scheme.find('/')?;
+        &after_scheme[slash..]
+    } else if raw.starts_with('/') {
+        raw
+    } else {
+        return None;
+    };
+    let decoded = crate::clean_one_line(&percent_decode(path));
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(shorten_home(&decoded))
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn shorten_home(path: &str) -> String {
+    let home = std::env::var_os("HOME");
+    shorten_home_with(path, home.as_deref().and_then(std::ffi::OsStr::to_str))
+}
+
+fn shorten_home_with(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home
+        .map(|h| h.trim_end_matches('/'))
+        .filter(|h| !h.is_empty())
+    else {
+        return path.to_owned();
+    };
+    if path == home {
+        "~".to_owned()
+    } else if let Some(rest) = path.strip_prefix(home)
+        && rest.starts_with('/')
+    {
+        format!("~{rest}")
+    } else {
+        path.to_owned()
+    }
+}
+
+fn fallback_title_for(bootstrap: &Value, view: &Value, block_id: &str) -> Option<String> {
+    let window_label = session::windows(view)
+        .into_iter()
+        .find(|window| window.blocks.iter().any(|block| block.id == block_id))
+        .map(|window| crate::clean_one_line(&window.label))
+        .filter(|label| !label.is_empty() && !session::is_default_window_label(label));
+    if window_label.is_some() {
+        return window_label;
+    }
+    bootstrap
+        .get("selected_session")
+        .map(session::label_of)
+        .map(crate::clean_one_line)
+        .filter(|label| !label.is_empty())
+}
+
 fn closed_block(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<StreamClosed>()
@@ -1569,8 +1701,9 @@ impl Screen {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
         // Clear any leftover OSC 4/10/11/12 overrides before probing the host
-        // terminal's theme.
+        // terminal's theme, and save the host title so RESET_MODES can restore it.
         stdout.write_all(RESET_COLORS)?;
+        stdout.write_all(b"\x1b[22;0t")?;
         stdout.flush()?;
         Ok(Self {
             stdout,
@@ -2082,6 +2215,9 @@ mod tests {
                     "com.superlogical.terminal.blob_read" => {
                         json!({"data": "screen ", "eof": true})
                     }
+                    "com.superlogical.terminal.title" => {
+                        json!({"title": "vim"})
+                    }
                     _ => json!({}),
                 };
                 ctrl_ws
@@ -2132,12 +2268,15 @@ mod tests {
         attached.feed(&stream_bytes, &mut ctrl).await.unwrap();
         assert!(attached.primed);
 
-        let live = b"live!\x1b_rex1;42;{\"type\":\"resize\",\"cols\":50,\"rows\":12}\x1b\\";
+        let live = b"live!\x1b]2;running\x07\x1b_rex1;42;{\"type\":\"resize\",\"cols\":50,\"rows\":12}\x1b\\";
         attached.feed(live, &mut ctrl).await.unwrap();
 
         let mut out = Vec::new();
         attached.flush(&mut out).unwrap();
-        assert_eq!(out, b"\x1b[2J\x1b[Hprimed-screen live!");
+        assert_eq!(
+            out,
+            b"\x1b[2J\x1b[Hprimed-screen \x1b]0;zrex: vim\x07live!\x1b]2;zrex: running\x07"
+        );
 
         let other = attached
             .event(
@@ -2720,5 +2859,70 @@ mod tests {
         assert!(matches!(ending, Some(Ending::Block)));
 
         server.await.unwrap();
+    }
+
+    #[test]
+    fn fallback_title_prefers_custom_window_label_and_falls_back_to_session_label() {
+        let view = json!({
+            "windows": [
+                {
+                    "window_id": "window:1",
+                    "label": "Antigravity ~/Projects/zrex",
+                    "layers": [{"blocks": [{"block_id": "block:1"}]}]
+                },
+                {
+                    "window_id": "window:2",
+                    "label": "Window 1234abcd",
+                    "layers": [{"blocks": [{"block_id": "block:2"}]}]
+                }
+            ]
+        });
+        let bootstrap = json!({
+            "selected_session": {
+                "label": "work",
+                "view": view
+            }
+        });
+        assert_eq!(
+            super::fallback_title_for(&bootstrap, &view, "block:1").as_deref(),
+            Some("Antigravity ~/Projects/zrex")
+        );
+        assert_eq!(
+            super::fallback_title_for(&bootstrap, &view, "block:2").as_deref(),
+            Some("work")
+        );
+    }
+
+    #[test]
+    fn process_pwd_title_combines_process_and_osc7_pwd() {
+        let process = json!({"foreground": {"argv0": "-zsh", "name": "zsh"}});
+        let screen = b"hello\x1b]7;file://MacBook.local/tmp/my%20dir\x07world";
+        assert_eq!(
+            super::process_pwd_title(Some(&process), screen).as_deref(),
+            Some("zsh /tmp/my dir")
+        );
+        assert_eq!(
+            super::process_pwd_title(Some(&process), b"no osc7").as_deref(),
+            Some("zsh")
+        );
+    }
+
+    #[test]
+    fn shorten_home_handles_root_and_boundary_prefixes() {
+        assert_eq!(
+            super::shorten_home_with("/Users/jack", Some("/Users/jack")),
+            "~"
+        );
+        assert_eq!(
+            super::shorten_home_with("/Users/jack/Projects/zrex", Some("/Users/jack/")),
+            "~/Projects/zrex"
+        );
+        assert_eq!(
+            super::shorten_home_with("/Users/jackson/work", Some("/Users/jack")),
+            "/Users/jackson/work"
+        );
+        assert_eq!(super::shorten_home_with("/tmp/foo", Some("/")), "/tmp/foo");
+        assert_eq!(super::shorten_home_with("/", Some("/")), "/");
+        assert_eq!(super::shorten_home_with("/tmp/foo", None), "/tmp/foo");
     }
 }

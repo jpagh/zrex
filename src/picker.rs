@@ -899,7 +899,7 @@ fn describe_targets(
                     .and_then(|reply| session::live_terminal_title(reply, process.as_ref()))
                     .map_or_else(String::new, |title| clean_truncated(title, 64));
                 let status = status.as_ref().and_then(status_summary);
-                let process = process.as_ref().and_then(process_name);
+                let process = process.as_ref().and_then(session::process_name);
                 (id, (title, status, process))
             },
         ))
@@ -1009,61 +1009,13 @@ fn clean_json_field(value: &Value, key: &str, max_chars: usize) -> String {
     )
 }
 
-fn process_name(reply: &Value) -> Option<String> {
-    reply
-        .get("foreground")
-        .and_then(label_for_process)
-        .or_else(|| reply.get("child").and_then(label_for_process))
-}
-
-/// Follows Rex's `com.superlogical.terminal.process` guidance: prefer `script`,
-/// then `argv0`, then `name`, reduced to a short display name.
-fn label_for_process(process: &Value) -> Option<String> {
-    if process.is_null() {
-        return None;
-    }
-    for (key, strip_login_dash) in [("script", false), ("argv0", true), ("name", false)] {
-        let Some(raw) = process.get(key).and_then(Value::as_str) else {
-            continue;
-        };
-        let cleaned = clean_one_line(raw);
-        let candidate = if strip_login_dash {
-            cleaned.strip_prefix('-').unwrap_or(&cleaned)
-        } else {
-            &cleaned
-        };
-        let base = basename(candidate);
-        let base = if strip_login_dash {
-            base.strip_prefix('-').unwrap_or(base)
-        } else {
-            base
-        };
-        let short = clean_truncated(base, 24);
-        if !short.is_empty() {
-            return Some(short);
-        }
-    }
-    None
-}
-
-fn basename(value: &str) -> &str {
-    let trimmed = value.trim_end_matches(['/', '\\']);
-    trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
-}
-
 fn custom_window_label(label: &str) -> Option<String> {
     let clean = clean_one_line(label);
-    if clean.is_empty() || is_default_window_label(&clean) {
+    if clean.is_empty() || session::is_default_window_label(&clean) {
         None
     } else {
         Some(clean)
     }
-}
-
-fn is_default_window_label(label: &str) -> bool {
-    label
-        .strip_prefix("Window ")
-        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn custom_block_label(label: &str) -> Option<String> {
@@ -1739,56 +1691,6 @@ mod tests {
         );
 
         assert_eq!(status_summary(&json!({"records": []})), None);
-    }
-
-    #[test]
-    fn process_name_prefers_script_then_argv0_then_name() {
-        assert_eq!(
-            process_name(&json!({
-                "foreground": {
-                    "script": "/opt/homebrew/bin/agy",
-                    "argv0": "node",
-                    "name": "node"
-                }
-            }))
-            .as_deref(),
-            Some("agy")
-        );
-        assert_eq!(
-            process_name(&json!({
-                "foreground": {
-                    "argv0": "-zsh",
-                    "name": "zsh"
-                }
-            }))
-            .as_deref(),
-            Some("zsh")
-        );
-        assert_eq!(
-            process_name(&json!({
-                "foreground": {
-                    "argv0": "/bin/zsh",
-                    "name": "zsh"
-                }
-            }))
-            .as_deref(),
-            Some("zsh")
-        );
-        assert_eq!(
-            process_name(&json!({
-                "foreground": null,
-                "child": {
-                    "argv0": "",
-                    "name": "fish"
-                }
-            }))
-            .as_deref(),
-            Some("fish")
-        );
-        assert_eq!(
-            process_name(&json!({"foreground": null, "child": null})),
-            None
-        );
     }
 
     #[test]

@@ -115,6 +115,54 @@ fn process_identity(value: &Value) -> Option<(i64, &str)> {
     Some((pid, name))
 }
 
+/// Follows Rex's `com.superlogical.terminal.process` guidance: prefer `script`,
+/// then `argv0`, then `name`, reduced to a short display name.
+pub fn process_name(reply: &Value) -> Option<String> {
+    reply
+        .get("foreground")
+        .and_then(label_for_process)
+        .or_else(|| reply.get("child").and_then(label_for_process))
+}
+
+fn label_for_process(process: &Value) -> Option<String> {
+    if process.is_null() {
+        return None;
+    }
+    for (key, strip_login_dash) in [("script", false), ("argv0", true), ("name", false)] {
+        let Some(raw) = process.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let cleaned = crate::clean_one_line(raw);
+        let candidate = if strip_login_dash {
+            cleaned.strip_prefix('-').unwrap_or(&cleaned)
+        } else {
+            &cleaned
+        };
+        let base = basename(candidate);
+        let base = if strip_login_dash {
+            base.strip_prefix('-').unwrap_or(base)
+        } else {
+            base
+        };
+        let short = crate::clean_truncated(base, 24);
+        if !short.is_empty() {
+            return Some(short);
+        }
+    }
+    None
+}
+
+fn basename(value: &str) -> &str {
+    let trimmed = value.trim_end_matches(['/', '\\']);
+    trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
+}
+
+pub fn is_default_window_label(label: &str) -> bool {
+    label
+        .strip_prefix("Window ")
+        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 pub async fn destroy(ctrl: &mut Control, session_id: &str) -> Result<()> {
     ctrl.call("session.attach", json!({"session_id": session_id}))
         .await?;
@@ -943,6 +991,56 @@ mod tests {
         assert_eq!(
             live_terminal_title(&pi_title, Some(&json!({"last_exit": null}))),
             Some("π - jack")
+        );
+    }
+
+    #[test]
+    fn process_name_prefers_script_then_argv0_then_name() {
+        assert_eq!(
+            process_name(&json!({
+                "foreground": {
+                    "script": "/opt/homebrew/bin/agy",
+                    "argv0": "node",
+                    "name": "node"
+                }
+            }))
+            .as_deref(),
+            Some("agy")
+        );
+        assert_eq!(
+            process_name(&json!({
+                "foreground": {
+                    "argv0": "-zsh",
+                    "name": "zsh"
+                }
+            }))
+            .as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(
+            process_name(&json!({
+                "foreground": {
+                    "argv0": "/bin/zsh",
+                    "name": "zsh"
+                }
+            }))
+            .as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(
+            process_name(&json!({
+                "foreground": null,
+                "child": {
+                    "argv0": "",
+                    "name": "fish"
+                }
+            }))
+            .as_deref(),
+            Some("fish")
+        );
+        assert_eq!(
+            process_name(&json!({"foreground": null, "child": null})),
+            None
         );
     }
 }

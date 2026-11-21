@@ -1235,17 +1235,14 @@ fn render_run(
     use_color: bool,
 ) -> io::Result<()> {
     queue!(out, SetAttribute(Attribute::Reset))?;
-    if active {
-        queue!(out, SetAttribute(Attribute::Reverse))?;
-    }
     if use_color && let Some(color) = foreground_color(role, matched) {
         queue!(out, SetForegroundColor(color))?;
     }
     if matched {
         queue!(
             out,
-            SetAttribute(Attribute::Bold),
-            SetAttribute(Attribute::Underlined)
+            SetAttribute(Attribute::Reverse),
+            SetAttribute(Attribute::Bold)
         )?;
     } else if active {
         if matches!(
@@ -1405,25 +1402,31 @@ mod tests {
         let mut colored = Vec::new();
         render_row(&mut colored, &spans, &[8, 9], false, true).unwrap();
         let colored = String::from_utf8(colored).unwrap();
-        // Server cyan (ANSI 6), matched "wo" yellow+bold+underline (ANSI 3), error red (ANSI 1).
+        // Server cyan (ANSI 6), matched "wo" reverse+bold+yellow (ANSI 3), error red (ANSI 1).
         assert!(colored.contains("\x1b[38;5;6m") || colored.contains("\x1b[36m"));
         assert!(colored.contains("\x1b[38;5;3m") || colored.contains("\x1b[33m"));
         assert!(colored.contains("\x1b[38;5;1m") || colored.contains("\x1b[31m"));
-        assert!(colored.contains("\x1b[4m"));
+        assert!(colored.contains("\x1b[7m"));
         assert!(colored.contains("wo"));
         assert!(colored.contains("rk"));
         assert!(colored.ends_with("\x1b[0m"));
 
+        let mut active_unmatched = Vec::new();
+        render_row(&mut active_unmatched, &spans, &[], true, true).unwrap();
+        let active_unmatched = String::from_utf8(active_unmatched).unwrap();
+        // Active row without matches shows the "> " indicator without a row-wide background.
+        assert!(active_unmatched.contains("> "));
+        assert!(!active_unmatched.contains("\x1b[7m"));
+
         let mut active_plain = Vec::new();
         render_row(&mut active_plain, &spans, &[8, 9], true, false).unwrap();
         let active_plain = String::from_utf8(active_plain).unwrap();
-        // NO_COLOR mode emits no foreground color escapes, but keeps reverse, bold, and underline.
+        // NO_COLOR mode emits no foreground color escapes, but keeps reverse and bold on matches.
         assert!(!active_plain.contains("\x1b[38;"));
         assert!(!active_plain.contains("\x1b[31m"));
         assert!(!active_plain.contains("\x1b[33m"));
         assert!(!active_plain.contains("\x1b[36m"));
         assert!(active_plain.contains("\x1b[7m"));
-        assert!(active_plain.contains("\x1b[4m"));
         assert!(active_plain.contains("> "));
     }
 

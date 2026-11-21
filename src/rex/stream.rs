@@ -40,6 +40,20 @@ enum State {
     Ground,
     SawEsc,
     InApc { data: Vec<u8>, saw_esc: bool },
+    InOsc { data: Vec<u8>, saw_esc: bool },
+}
+
+pub fn format_osc_title(code: u8, title: &str, terminator: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + title.len() + terminator.len());
+    out.extend_from_slice(b"\x1b]");
+    out.push(code);
+    out.extend_from_slice(b";zrex");
+    if !title.is_empty() {
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(title.as_bytes());
+    }
+    out.extend_from_slice(terminator);
+    out
 }
 
 pub struct Filter {
@@ -79,6 +93,13 @@ impl Filter {
                         data: Vec::new(),
                         saw_esc: false,
                     };
+                } else if byte == b']' {
+                    self.state = State::InOsc {
+                        data: Vec::new(),
+                        saw_esc: false,
+                    };
+                } else if byte == 0x1b {
+                    self.out.push(0x1b);
                 } else {
                     self.out.push(0x1b);
                     self.out.push(byte);
@@ -100,6 +121,58 @@ impl Filter {
                     }
                 }
             }
+            State::InOsc { data, saw_esc } => {
+                if *saw_esc {
+                    let body = std::mem::take(data);
+                    if byte == b'\\' {
+                        self.state = State::Ground;
+                        self.osc_title(&body, b"\x1b\\");
+                    } else {
+                        // A non-ST ESC aborts the OSC and starts a new escape
+                        // sequence in VT parsers; re-dispatch from SawEsc so
+                        // subsequent Rex APCs or OSC titles are not swallowed.
+                        self.out.extend_from_slice(b"\x1b]");
+                        self.out.extend_from_slice(&body);
+                        self.state = State::SawEsc;
+                        self.byte(byte);
+                    }
+                } else if data.is_empty() && byte != b'0' && byte != b'2' {
+                    self.out.extend_from_slice(b"\x1b]");
+                    if byte == 0x1b {
+                        self.state = State::SawEsc;
+                    } else {
+                        self.out.push(byte);
+                        self.state = State::Ground;
+                    }
+                } else if data.len() == 1 && byte != b';' {
+                    self.out.extend_from_slice(b"\x1b]");
+                    self.out.extend_from_slice(data);
+                    if byte == 0x1b {
+                        self.state = State::SawEsc;
+                    } else {
+                        self.out.push(byte);
+                        self.state = State::Ground;
+                    }
+                } else if byte == 0x07 {
+                    let body = std::mem::take(data);
+                    self.state = State::Ground;
+                    self.osc_title(&body, b"\x07");
+                } else if byte == 0x18 || byte == 0x1a {
+                    self.out.extend_from_slice(b"\x1b]");
+                    self.out.extend_from_slice(data);
+                    self.out.push(byte);
+                    self.state = State::Ground;
+                } else if byte == 0x1b {
+                    *saw_esc = true;
+                } else {
+                    data.push(byte);
+                    if data.len() >= 4096 {
+                        self.out.extend_from_slice(b"\x1b]");
+                        self.out.extend_from_slice(data);
+                        self.state = State::Ground;
+                    }
+                }
+            }
         }
     }
 
@@ -114,6 +187,13 @@ impl Filter {
         self.out.extend_from_slice(b"\x1b_");
         self.out.extend_from_slice(body);
         self.out.extend_from_slice(b"\x1b\\");
+    }
+
+    fn osc_title(&mut self, body: &[u8], terminator: &[u8]) {
+        let code = body[0];
+        let title = String::from_utf8_lossy(&body[2..]);
+        self.out
+            .extend_from_slice(&format_osc_title(code, &title, terminator));
     }
 }
 
@@ -166,5 +246,53 @@ mod tests {
         let expected = buf.len();
         buf.extend_from_slice(b"live stream");
         assert_eq!(snapshot_len(&buf).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn prefixes_osc_window_titles_and_preserves_other_osc_sequences() {
+        let mut filter = Filter::new(7);
+        let chunks: &[&[u8]] = &[
+            b"a\x1b]0;vim",
+            b" src/main.rs\x07b",
+            b"\x1b]2;\x1b\\c",
+            b"\x1b]52;c;YWJj\x07d",
+            b"\x1b]22;other\x07e",
+        ];
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend_from_slice(&filter.push(chunk));
+        }
+        assert_eq!(
+            out,
+            b"a\x1b]0;zrex: vim src/main.rs\x07b\x1b]2;zrex\x1b\\c\x1b]52;c;YWJj\x07d\x1b]22;other\x07e"
+        );
+    }
+
+    #[test]
+    fn aborts_unterminated_osc_on_escape_and_cancel_without_swallowing_rex_apc() {
+        let mut filter = Filter::new(7);
+        let input = concat!(
+            "\x1b]0;unterminated\x1b_rex1;7;{\"type\":\"resize\"}\x1b\\",
+            "\x1b]0;stale\x1b]2;fresh\x07",
+            "\x1b]0;csi\x1b[31mred",
+            "\x1b]0;escbel\x1b\x07",
+            "\x1b]0;canceled\x18after",
+            "\x1b]\x1b_rex1;7;{\"type\":\"ping\"}\x1b\\",
+            "\x1b]0\x1b]2;after-short\x07",
+        )
+        .as_bytes();
+        assert_eq!(
+            filter.push(input),
+            concat!(
+                "\x1b]0;unterminated",
+                "\x1b]0;stale\x1b]2;zrex: fresh\x07",
+                "\x1b]0;csi\x1b[31mred",
+                "\x1b]0;escbel\x1b\x07",
+                "\x1b]0;canceled\x18after",
+                "\x1b]",
+                "\x1b]0\x1b]2;zrex: after-short\x07",
+            )
+            .as_bytes()
+        );
     }
 }
