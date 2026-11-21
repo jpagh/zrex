@@ -30,6 +30,7 @@ type Socket = WebSocketStream<MaybeTlsStream<Box<dyn Transport>>>;
 pub const CONNECT_TIME: Duration = Duration::from_secs(10);
 
 const OPEN_TRIES: u32 = 3;
+const DEFAULT_LOOPBACK_ADDR: &str = "127.0.0.1:7297";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerConfig {
@@ -92,20 +93,44 @@ impl FromStr for ServerAddress {
 
 impl ServerAddress {
     pub async fn local_or_loopback() -> Self {
-        Self::first_reachable_local(local_socket_candidates()).await
+        Self::first_reachable_local(local_socket_candidates())
+            .await
+            .unwrap_or_else(|| Self::Network(format!("ws://{DEFAULT_LOOPBACK_ADDR}")))
     }
 
-    async fn first_reachable_local(candidates: impl IntoIterator<Item = PathBuf>) -> Self {
+    /// Returns the local Rex server's Unix socket or default loopback TCP
+    /// address only when a local server is actually accepting connections.
+    pub async fn local_if_running() -> Option<Self> {
+        Self::detect_local(local_socket_candidates(), DEFAULT_LOOPBACK_ADDR).await
+    }
+
+    async fn first_reachable_local(candidates: impl IntoIterator<Item = PathBuf>) -> Option<Self> {
         for path in candidates {
             if path.metadata().is_ok_and(|m| m.file_type().is_socket())
                 && with_connect_timeout(UnixStream::connect(&path))
                     .await
                     .is_ok()
             {
-                return Self::Unix(path);
+                return Some(Self::Unix(path));
             }
         }
-        Self::Network("ws://127.0.0.1:7297".to_owned())
+        None
+    }
+
+    async fn detect_local(
+        candidates: impl IntoIterator<Item = PathBuf>,
+        loopback: &str,
+    ) -> Option<Self> {
+        if let Some(unix) = Self::first_reachable_local(candidates).await {
+            return Some(unix);
+        }
+        if with_connect_timeout(TcpStream::connect(loopback))
+            .await
+            .is_ok()
+        {
+            return Some(Self::Network(format!("ws://{loopback}")));
+        }
+        None
     }
 
     async fn open(&self, route: &str, protocol: &'static str) -> Result<Socket> {
@@ -340,8 +365,37 @@ mod tests {
         drop(listener);
         let stale = ServerAddress::first_reachable_local([path.clone()]).await;
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(live, ServerAddress::Unix(path));
-        assert_eq!(stale, "127.0.0.1:7297".parse().unwrap());
+        assert_eq!(live, Some(ServerAddress::Unix(path)));
+        assert_eq!(stale, None);
+    }
+
+    #[tokio::test]
+    async fn detects_running_local_server_and_returns_none_when_absent() {
+        let path = env::temp_dir().join(format!("zrex-detect-{}.sock", std::process::id()));
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap().to_string();
+
+        // Prefers a live Unix socket over loopback TCP.
+        let unix_listener = UnixListener::bind(&path).unwrap();
+        assert_eq!(
+            ServerAddress::detect_local([path.clone()], &tcp_addr).await,
+            Some(ServerAddress::Unix(path.clone()))
+        );
+        drop(unix_listener);
+
+        // Falls back to loopback TCP when the Unix socket is stale/absent.
+        assert_eq!(
+            ServerAddress::detect_local([path.clone()], &tcp_addr).await,
+            Some(ServerAddress::Network(format!("ws://{tcp_addr}")))
+        );
+
+        // Returns None when neither Unix socket nor loopback TCP is accepting connections.
+        drop(tcp_listener);
+        assert_eq!(
+            ServerAddress::detect_local([path.clone()], &tcp_addr).await,
+            None
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[tokio::test]

@@ -1,36 +1,18 @@
 mod prompt;
 
-use std::collections::{BTreeMap, HashMap};
-use std::env;
-use std::fs;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Instant, timeout_at};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app;
+use crate::config::{self, DISCOVERY_TIME, Server};
 use crate::rex::{ServerAddress, ServerConfig, control::Control};
 use crate::session::{self, PendingCall};
 use crate::{clean_one_line, clean_truncated};
-
-const DISCOVERY_TIME: Duration = Duration::from_secs(3);
-
-#[derive(Default, Deserialize)]
-struct Config {
-    #[serde(default)]
-    servers: BTreeMap<String, String>,
-}
-
-struct Server {
-    name: String,
-    address: ServerAddress,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProgramStatus {
@@ -98,20 +80,58 @@ impl TargetLabel {
     }
 }
 
+struct DiscoveryOutcome {
+    servers: Vec<Server>,
+    choices: Vec<(usize, Target)>,
+    warnings: Vec<String>,
+}
+
 pub async fn run(server_config: &ServerConfig) -> Result<()> {
     app::ensure_terminal()?;
     let (servers, discover_local) = load_servers(server_config)?;
     let deadline = Instant::now() + DISCOVERY_TIME;
+    let outcome = discover_all(
+        servers,
+        discover_local.then(ServerAddress::local_if_running),
+        deadline,
+    )
+    .await;
+    for warning in outcome.warnings {
+        eprintln!("zrex pick: {warning}");
+    }
+    if outcome.choices.is_empty() {
+        bail!("no attachable sessions found");
+    }
 
+    let targets: Vec<_> = outcome.choices.iter().map(|(_, target)| target).collect();
+    if let Some(index) = prompt::select(&targets)? {
+        let (server_index, target) = &outcome.choices[index];
+        let server = &outcome.servers[*server_index];
+        app::attach_existing(&server.address, &target.session_id, &target.block_id).await?;
+    }
+    Ok(())
+}
+
+async fn discover_all<F>(
+    servers: Vec<Server>,
+    local_probe: Option<F>,
+    deadline: Instant,
+) -> DiscoveryOutcome
+where
+    F: Future<Output = Option<ServerAddress>>,
+{
     // Resolve and query the default local server in parallel with saved servers
     // so a hung local socket never delays remote discovery.
     let local_future = async {
-        if !discover_local {
+        let Some(probe) = local_probe else {
             return Ok(None);
-        }
-        let address = timeout_at(deadline, ServerAddress::local_or_loopback())
+        };
+        let Some(address) = timeout_at(deadline, probe)
             .await
-            .context("local server detection timed out")?;
+            .context("local server detection timed out")?
+        else {
+            return Ok(None);
+        };
         if servers.iter().any(|server| server.address == address) {
             return Ok(None);
         }
@@ -134,46 +154,43 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
 
     let mut all_servers = Vec::with_capacity(servers.len() + 1);
     let mut all_results = Vec::with_capacity(servers.len() + 1);
+    let mut warnings = Vec::new();
     match local_outcome {
         Ok(Some((server, result))) => {
             all_servers.push(server);
             all_results.push(result);
         }
         Ok(None) => {}
-        Err(error) => eprintln!("zrex pick: {}", clean_one_line(&format!("{error:#}"))),
+        Err(error) => warnings.push(clean_one_line(&format!("{error:#}"))),
     }
     all_servers.extend(servers);
     all_results.extend(discovered);
 
     let mut choices = Vec::new();
-    for (server, result) in all_servers.iter().zip(all_results) {
+    for (server_index, (server, result)) in all_servers.iter().zip(all_results).enumerate() {
         match result {
             Ok((targets, missing_views)) => {
                 if missing_views > 0 {
-                    eprintln!(
-                        "zrex pick: {}: could not list windows for {missing_views} session(s)",
+                    warnings.push(format!(
+                        "{}: could not list windows for {missing_views} session(s)",
                         clean_one_line(&server.name)
-                    );
+                    ));
                 }
-                choices.extend(targets.into_iter().map(|target| (server, target)));
+                choices.extend(targets.into_iter().map(|target| (server_index, target)));
             }
-            Err(error) => eprintln!(
-                "zrex pick: {}: {}",
+            Err(error) => warnings.push(format!(
+                "{}: {}",
                 clean_one_line(&server.name),
                 clean_one_line(&format!("{error:#}"))
-            ),
+            )),
         }
     }
-    if choices.is_empty() {
-        bail!("no attachable sessions found");
-    }
 
-    let targets: Vec<_> = choices.iter().map(|(_, target)| target).collect();
-    if let Some(index) = prompt::select(&targets)? {
-        let (server, target) = &choices[index];
-        app::attach_existing(&server.address, &target.session_id, &target.block_id).await?;
+    DiscoveryOutcome {
+        servers: all_servers,
+        choices,
+        warnings,
     }
-    Ok(())
 }
 
 fn load_servers(server_config: &ServerConfig) -> Result<(Vec<Server>, bool)> {
@@ -187,23 +204,7 @@ fn load_servers(server_config: &ServerConfig) -> Result<(Vec<Server>, bool)> {
         ));
     }
 
-    let config = config_path()
-        .as_deref()
-        .map(read_config)
-        .transpose()?
-        .unwrap_or_default();
-    let mut servers = Vec::<Server>::new();
-    for (name, address) in config.servers {
-        match address.parse() {
-            Ok(address) => servers.push(Server { name, address }),
-            Err(error) => eprintln!(
-                "zrex pick: {}: {}",
-                clean_one_line(&name),
-                clean_one_line(&format!("{error:#}"))
-            ),
-        }
-    }
-
+    let mut servers = config::load_saved_servers("pick")?.servers;
     match server_config {
         ServerConfig::Explicit(_) => unreachable!(),
         ServerConfig::Env(address) => {
@@ -223,22 +224,6 @@ fn load_servers(server_config: &ServerConfig) -> Result<(Vec<Server>, bool)> {
             Ok((servers, false))
         }
         ServerConfig::Default => Ok((servers, true)),
-    }
-}
-
-fn config_path() -> Option<PathBuf> {
-    env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| env::home_dir().map(|home| home.join(".config")))
-        .map(|dir| dir.join("zrex/config.toml"))
-}
-
-fn read_config(path: &Path) -> Result<Config> {
-    match fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).with_context(|| format!("invalid {}", path.display())),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Config::default()),
-        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
     }
 }
 
@@ -1079,21 +1064,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_config_parses_servers_and_handles_missing_file() {
-        let missing = env::temp_dir().join(format!("zrex-missing-{}.toml", std::process::id()));
-        assert!(read_config(&missing).unwrap().servers.is_empty());
+    #[tokio::test]
+    async fn discover_all_skips_absent_local_silently_and_reports_saved_server_errors() {
+        use futures_util::SinkExt;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
-        let path = env::temp_dir().join(format!("zrex-config-{}.toml", std::process::id()));
-        fs::write(
-            &path,
-            "[servers]\noffice = \"https://office.example\"\nlab = \"http://127.0.0.1:7297\"\n",
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                    res.headers_mut()
+                        .insert("Sec-WebSocket-Protocol", proto.clone());
+                }
+                Ok(res)
+            })
+            .await
+            .unwrap();
+
+            let _ = ws.next().await;
+            ws.send(Message::text(
+                json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_str().unwrap();
+                let payload = match req["method"].as_str().unwrap() {
+                    "session.attach_all" => json!({
+                        "sessions": [{"session_id": "session:1", "label": "work"}]
+                    }),
+                    "session.view" => json!({
+                        "active_window_id": "window:1",
+                        "windows": [{
+                            "window_id": "window:1",
+                            "label": "dev",
+                            "focused_block_id": "block:1",
+                            "layers": [{"blocks": [{"block_id": "block:1", "label": "shell"}]}]
+                        }]
+                    }),
+                    "com.superlogical.terminal.title" => json!({"title": ""}),
+                    "com.superlogical.terminal.program_status" => json!({"records": []}),
+                    "com.superlogical.terminal.process" => {
+                        json!({"foreground": null, "child": null})
+                    }
+                    other => panic!("unexpected method {other}"),
+                };
+                ws.send(Message::text(
+                    json!({"type": "response", "id": id, "seq": 0, "payload": payload}).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+
+        // Reserve and immediately release a port so connecting to it fails fast.
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+
+        let servers = vec![
+            Server {
+                name: "dead".to_owned(),
+                address: format!("http://{dead_addr}").parse().unwrap(),
+            },
+            Server {
+                name: "office".to_owned(),
+                address: format!("http://{live_addr}").parse().unwrap(),
+            },
+        ];
+
+        let outcome = discover_all(
+            servers,
+            Some(async { None }),
+            Instant::now() + DISCOVERY_TIME,
         )
-        .unwrap();
-        let config = read_config(&path).unwrap();
-        fs::remove_file(&path).unwrap();
-        assert_eq!(config.servers.len(), 2);
-        assert_eq!(config.servers["office"], "https://office.example");
-        assert_eq!(config.servers["lab"], "http://127.0.0.1:7297");
+        .await;
+
+        assert_eq!(outcome.choices.len(), 1);
+        assert_eq!(outcome.choices[0].1.label, "[office] work / 1 dev");
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].starts_with("dead: "));
     }
 }
