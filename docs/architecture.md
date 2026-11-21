@@ -6,10 +6,10 @@
 
 | File | Role |
 | --- | --- |
-| `src/main.rs` | CLI parsing (`ls`, `pick`, `a`/`attach`, `kill`, `completion`), single- and multi-server session/window/split listing with terminal titles, and shell completion |
-| `src/config.rs` | Saved-server config (`config.toml`) loading and server alias resolution shared across CLI commands, `zrex ls`, and `zrex pick` |
-| `src/picker.rs` | Parallel session discovery and target/status formatting for `zrex pick` |
-| `src/picker/prompt.rs` | Alternate-screen fuzzy prompt UI, key and word navigation, and rendering for `zrex pick` |
+| `src/main.rs` | CLI parsing (defaulting to the picker in a terminal, plus `ls`, `pick`, `a`/`attach`, `kill`, `completion`), single- and multi-server session/window/split listing with terminal titles, and shell completion |
+| `src/config.rs` | Saved-server config (`config.toml`) loading and server alias resolution shared across CLI commands, `zrex ls`, and the picker |
+| `src/picker.rs` | Parallel session discovery and target/status formatting for the picker (`zrex` / `zrex pick`) |
+| `src/picker/prompt.rs` | Alternate-screen fuzzy prompt UI, key and word navigation, and rendering for the picker |
 | `src/app.rs` | Attach lifecycle: bootstrap, block ownership, sizing, VT stream priming, raw I/O pass-through, events, and reconnection |
 | `src/session.rs` | Session lookup/creation and `session.view` queries for windows and split blocks |
 | `src/rex/mod.rs` | Server address parsing, local socket discovery, WebSocket connection setup, and frame helpers |

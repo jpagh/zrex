@@ -158,11 +158,25 @@ impl TargetLabel {
     }
 }
 
+const NO_SERVERS_INTRO: &str = "\
+zrex: no Rex server found.
+
+To get started, start a local Rex server, set REX_SERVER (or pass -S SERVER),
+or add servers under [servers] in ~/.config/zrex/config.toml.
+Run `zrex --help` for usage.";
+
 struct DiscoveryOutcome {
     servers: Vec<Server>,
     sessions: Vec<SessionChoice>,
     choices: Vec<Target>,
     warnings: Vec<String>,
+    attempted_any: bool,
+}
+
+struct LoadedServers {
+    servers: Vec<Server>,
+    discover_local: bool,
+    has_configured_sources: bool,
 }
 
 struct ServerDiscovery {
@@ -172,6 +186,10 @@ struct ServerDiscovery {
 }
 
 impl DiscoveryOutcome {
+    fn has_no_sources(&self, has_configured_sources: bool) -> bool {
+        !has_configured_sources && !self.attempted_any
+    }
+
     fn replace_server(
         &mut self,
         server_index: usize,
@@ -258,11 +276,11 @@ impl DiscoveryOutcome {
 
 pub async fn run(server_config: &ServerConfig) -> Result<()> {
     app::ensure_terminal()?;
-    let (servers, discover_local) = load_servers(server_config).await?;
+    let loaded = load_servers(server_config).await?;
     let deadline = Instant::now() + DISCOVERY_TIME;
     let mut outcome = discover_all(
-        servers,
-        discover_local.then(ServerAddress::local_if_running),
+        loaded.servers,
+        loaded.discover_local.then(ServerAddress::local_if_running),
         deadline,
     )
     .await;
@@ -270,6 +288,10 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
         eprintln!("zrex pick: {warning}");
     }
     if outcome.servers.is_empty() {
+        if outcome.has_no_sources(loaded.has_configured_sources) {
+            println!("{NO_SERVERS_INTRO}");
+            return Ok(());
+        }
         bail!("no reachable servers");
     }
 
@@ -569,16 +591,21 @@ where
     let mut all_servers = Vec::with_capacity(servers.len() + 1);
     let mut all_results = Vec::with_capacity(servers.len() + 1);
     let mut warnings = Vec::new();
+    let mut local_failed = false;
     match local_outcome {
         Ok(Some((server, result))) => {
             all_servers.push(server);
             all_results.push(result);
         }
         Ok(None) => {}
-        Err(error) => warnings.push(clean_one_line(&format!("{error:#}"))),
+        Err(error) => {
+            local_failed = true;
+            warnings.push(clean_one_line(&format!("{error:#}")));
+        }
     }
     all_servers.extend(servers);
     all_results.extend(discovered);
+    let attempted_any = !all_servers.is_empty() || local_failed;
 
     let mut reachable_servers = Vec::new();
     let mut sessions = Vec::new();
@@ -623,12 +650,17 @@ where
         sessions,
         choices,
         warnings,
+        attempted_any,
     }
 }
 
-async fn load_servers(server_config: &ServerConfig) -> Result<(Vec<Server>, bool)> {
+async fn load_servers(server_config: &ServerConfig) -> Result<LoadedServers> {
     if let ServerConfig::Explicit(target) = server_config {
-        return Ok((vec![config::resolve_server(target).await?.server], false));
+        return Ok(LoadedServers {
+            servers: vec![config::resolve_server(target).await?.server],
+            discover_local: false,
+            has_configured_sources: true,
+        });
     }
 
     let config = config::load_config()?;
@@ -639,23 +671,25 @@ async fn load_servers_with<F, Fut>(
     server_config: &ServerConfig,
     config: &config::Config,
     local: F,
-) -> Result<(Vec<Server>, bool)>
+) -> Result<LoadedServers>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = ServerAddress>,
 {
     if let ServerConfig::Explicit(target) = server_config {
-        return Ok((
-            vec![
+        return Ok(LoadedServers {
+            servers: vec![
                 config::resolve_server_with(config, target, local)
                     .await?
                     .server,
             ],
-            false,
-        ));
+            discover_local: false,
+            has_configured_sources: true,
+        });
     }
 
-    let mut servers = config::parse_saved_servers(config, "pick").servers;
+    let saved = config::parse_saved_servers(config, "pick");
+    let mut servers = saved.servers;
     match server_config {
         ServerConfig::Explicit(_) => unreachable!(),
         ServerConfig::Env(target) => {
@@ -673,9 +707,17 @@ where
                 Ok(_) => {}
                 Err(error) => eprintln!("zrex pick: {}", clean_one_line(&format!("{error:#}"))),
             }
-            Ok((servers, false))
+            Ok(LoadedServers {
+                servers,
+                discover_local: false,
+                has_configured_sources: true,
+            })
         }
-        ServerConfig::Default => Ok((servers, true)),
+        ServerConfig::Default => Ok(LoadedServers {
+            servers,
+            discover_local: true,
+            has_configured_sources: saved.configured > 0,
+        }),
     }
 }
 
@@ -1919,16 +1961,17 @@ mod tests {
         let fake_local = || async { "http://127.0.0.1:7297".parse::<ServerAddress>().unwrap() };
 
         // Explicit saved alias selects only that server and keeps its alias name.
-        let (servers, discover_local) = load_servers_with(
+        let loaded = load_servers_with(
             &ServerConfig::Explicit("mac".to_owned()),
             &config,
             fake_local,
         )
         .await
         .unwrap();
-        assert!(!discover_local);
+        assert!(!loaded.discover_local);
+        assert!(loaded.has_configured_sources);
         assert_eq!(
-            servers,
+            loaded.servers,
             vec![Server {
                 name: "mac".to_owned(),
                 address: "https://mac.tail.ts.net".parse().unwrap(),
@@ -1936,16 +1979,17 @@ mod tests {
         );
 
         // Explicit `local` resolves to the local server without scanning other saved servers.
-        let (servers, discover_local) = load_servers_with(
+        let loaded = load_servers_with(
             &ServerConfig::Explicit("local".to_owned()),
             &config,
             fake_local,
         )
         .await
         .unwrap();
-        assert!(!discover_local);
+        assert!(!loaded.discover_local);
+        assert!(loaded.has_configured_sources);
         assert_eq!(
-            servers,
+            loaded.servers,
             vec![Server {
                 name: "local".to_owned(),
                 address: "http://127.0.0.1:7297".parse().unwrap(),
@@ -1953,13 +1997,14 @@ mod tests {
         );
 
         // REX_SERVER set to a saved alias deduplicates against saved servers.
-        let (servers, discover_local) =
-            load_servers_with(&ServerConfig::Env("mac".to_owned()), &config, fake_local)
-                .await
-                .unwrap();
-        assert!(!discover_local);
+        let loaded = load_servers_with(&ServerConfig::Env("mac".to_owned()), &config, fake_local)
+            .await
+            .unwrap();
+        assert!(!loaded.discover_local);
+        assert!(loaded.has_configured_sources);
         assert_eq!(
-            servers
+            loaded
+                .servers
                 .iter()
                 .map(|server| server.name.as_str())
                 .collect::<Vec<_>>(),
@@ -1967,21 +2012,134 @@ mod tests {
         );
 
         // REX_SERVER set to a direct URL prepends [REX_SERVER].
-        let (servers, discover_local) = load_servers_with(
+        let loaded = load_servers_with(
             &ServerConfig::Env("https://extra.example".to_owned()),
             &config,
             fake_local,
         )
         .await
         .unwrap();
-        assert!(!discover_local);
+        assert!(!loaded.discover_local);
+        assert!(loaded.has_configured_sources);
         assert_eq!(
-            servers
+            loaded
+                .servers
                 .iter()
                 .map(|server| server.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["REX_SERVER", "mac", "office"]
         );
+    }
+
+    #[tokio::test]
+    async fn distinguishes_no_server_sources_from_unreachable_or_invalid_sources() {
+        let fake_local = || async { "http://127.0.0.1:7297".parse::<ServerAddress>().unwrap() };
+
+        // 1. Default config with no saved servers and no running local server -> no sources.
+        let empty_config = config::Config::default();
+        let loaded = load_servers_with(&ServerConfig::Default, &empty_config, fake_local)
+            .await
+            .unwrap();
+        assert!(loaded.discover_local);
+        assert!(!loaded.has_configured_sources);
+        assert!(loaded.servers.is_empty());
+
+        let outcome = discover_all(
+            loaded.servers,
+            Some(async { None }),
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
+        assert!(outcome.servers.is_empty());
+        assert!(outcome.warnings.is_empty());
+        assert!(outcome.has_no_sources(loaded.has_configured_sources));
+
+        // 2. Default config with an invalid saved server URL -> configured source exists.
+        let mut invalid_config = config::Config::default();
+        invalid_config
+            .servers
+            .insert("broken".to_owned(), "ftp://bad.example".to_owned());
+        let loaded = load_servers_with(&ServerConfig::Default, &invalid_config, fake_local)
+            .await
+            .unwrap();
+        assert!(loaded.has_configured_sources);
+        assert!(loaded.servers.is_empty());
+        let outcome = discover_all(
+            loaded.servers,
+            Some(async { None }),
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
+        assert!(!outcome.has_no_sources(loaded.has_configured_sources));
+
+        // 3. Invalid REX_SERVER with empty config -> configured source exists.
+        let loaded = load_servers_with(
+            &ServerConfig::Env("ftp://bad.example".to_owned()),
+            &empty_config,
+            fake_local,
+        )
+        .await
+        .unwrap();
+        assert!(loaded.has_configured_sources);
+        assert!(!loaded.discover_local);
+        assert!(loaded.servers.is_empty());
+        let outcome = discover_all(
+            loaded.servers,
+            Option::<std::future::Ready<Option<ServerAddress>>>::None,
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
+        assert!(!outcome.has_no_sources(loaded.has_configured_sources));
+
+        // 4. Running local server detected, but fails to connect -> source existed.
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr: ServerAddress = format!("http://{}", dead_listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        drop(dead_listener);
+        let outcome = discover_all(
+            Vec::new(),
+            Some(async move { Some(dead_addr) }),
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
+        assert!(outcome.servers.is_empty());
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(!outcome.has_no_sources(false));
+
+        // 5. Local probe times out -> do not mask timeout as no sources.
+        let outcome = discover_all(
+            Vec::new(),
+            Some(std::future::pending::<Option<ServerAddress>>()),
+            Instant::now() + Duration::from_millis(10),
+        )
+        .await;
+        assert!(outcome.servers.is_empty());
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(!outcome.has_no_sources(false));
+
+        // 6. Explicit -S against an unreachable server -> always an error, never intro.
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_url = format!("http://{}", dead_listener.local_addr().unwrap());
+        drop(dead_listener);
+        let loaded = load_servers_with(
+            &ServerConfig::Explicit(dead_url),
+            &empty_config,
+            fake_local,
+        )
+        .await
+        .unwrap();
+        assert!(loaded.has_configured_sources);
+        assert!(!loaded.discover_local);
+        let outcome = discover_all(
+            loaded.servers,
+            Option::<std::future::Ready<Option<ServerAddress>>>::None,
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
+        assert!(outcome.servers.is_empty());
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(!outcome.has_no_sources(loaded.has_configured_sources));
     }
 
     #[test]
@@ -2192,6 +2350,7 @@ mod tests {
                 c
             },
             warnings: Vec::new(),
+            attempted_any: true,
         };
 
         // 1. Rename session.

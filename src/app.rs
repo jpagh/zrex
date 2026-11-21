@@ -104,8 +104,12 @@ impl Theme {
     }
 }
 
+pub fn has_terminal() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
 pub fn ensure_terminal() -> Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !has_terminal() {
         bail!("zrex needs a terminal to attach to a session");
     }
     Ok(())
