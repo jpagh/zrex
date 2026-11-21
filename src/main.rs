@@ -2,11 +2,12 @@ mod app;
 mod rex;
 mod session;
 
+use std::env;
+
 use anyhow::Result;
 
+use crate::rex::ServerAddress;
 use crate::rex::control::Control;
-
-const DEFAULT_SERVER: &str = "http://127.0.0.1:7297";
 
 const USAGE: &str = "\
 zrex: use a session on a Rex server from a terminal
@@ -17,18 +18,21 @@ Usage:
   zrex [--server ADDRESS] kill SESSION
   zrex --version
 
-The server address comes from --server, or from REX_SERVER, and defaults to
-http://127.0.0.1:7297. a is short for attach. SESSION is a label, a full ID, or
-the last four or more characters of an ID. When no session matches, attach makes
-one with that label, so the same command opens a session and returns to it
-later. Without SESSION, attach uses the first session. --window, or -w, picks
-the window: its number from one, its label, window.block (such as 1.2), or - for
-a new window with the label Rex picks. A label that no window has makes a window
-with that label, with one shell in it. --block, or -b, picks a block inside the
-window by its number from one, its label, or its ID. Without --window the client
-shows the window the session already has, and never changes it, leaving what
-Rex.app shows alone. ls lists every session, its windows, and any splits (1.1,
-1.2, ...) with a star on the active window and block.
+The server address comes from --server, or from REX_SERVER. Without either, zrex
+uses a local Rex server's Unix socket when one is running, and otherwise
+http://127.0.0.1:7297. An address may be an HTTP(S) URL or a Unix socket URL
+such as unix:///Users/you/Library/Application%20Support/rex/server.sock. a is
+short for attach. SESSION is a label, a full ID, or the last four or more
+characters of an ID. When no session matches, attach makes one with that label,
+so the same command opens a session and returns to it later. Without SESSION,
+attach uses the first session. --window, or -w, picks the window: its number from
+one, its label, window.block (such as 1.2), or - for a new window with the label
+Rex picks. A label that no window has makes a window with that label, with one
+shell in it. --block, or -b, picks a block inside the window by its number from
+one, its label, or its ID. Without --window the client shows the window the
+session already has, and never changes it, leaving what Rex.app shows alone. ls
+lists every session, its windows, and any splits (1.1, 1.2, ...) with a star on
+the active window and block.
 
 While attached:
   Ctrl-backslash          detach, and leave the session running
@@ -52,11 +56,11 @@ enum Command {
     Unknown(String),
 }
 
-fn parse_args<I>(args: I, env_server: Option<String>) -> Result<(String, Command)>
+fn parse_args<I>(args: I, env_server: Option<String>) -> Result<(Option<String>, Command)>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut server = env_server.unwrap_or_else(|| DEFAULT_SERVER.to_owned());
+    let mut server = env_server.filter(|address| !address.is_empty());
     let mut command: Option<String> = None;
     let mut target: Option<String> = None;
     let mut window: Option<String> = None;
@@ -68,7 +72,7 @@ where
             "-h" | "--help" => return Ok((server, Command::Help)),
             "-V" | "--version" => return Ok((server, Command::Version)),
             "-S" | "--server" => match args.next() {
-                Some(value) => server = value,
+                Some(value) => server = Some(value),
                 None => anyhow::bail!("--server needs an address"),
             },
             "-w" | "--window" => match args.next() {
@@ -106,7 +110,12 @@ where
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let (server, command) = parse_args(std::env::args().skip(1), std::env::var("REX_SERVER").ok())?;
+    let (configured_server, command) =
+        parse_args(env::args().skip(1), env::var("REX_SERVER").ok())?;
+    let server_address = || match configured_server.as_deref() {
+        Some(address) => address.parse(),
+        None => Ok(ServerAddress::local_or_loopback()),
+    };
 
     match command {
         Command::Help => {
@@ -117,13 +126,13 @@ async fn main() -> Result<()> {
             println!("zrex {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Command::List => list(&server).await,
+        Command::List => list(&server_address()?).await,
         Command::Attach {
             target,
             window,
             block,
-        } => app::attach(&server, target, window, block).await,
-        Command::Kill { target } => kill(&server, &target).await,
+        } => app::attach(&server_address()?, target, window, block).await,
+        Command::Kill { target } => kill(&server_address()?, &target).await,
         Command::Unknown(other) => {
             eprintln!("unknown command {other}\n\n{USAGE}");
             std::process::exit(2);
@@ -131,7 +140,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn list(server: &str) -> Result<()> {
+async fn list(server: &ServerAddress) -> Result<()> {
     let (mut ctrl, _events) = Control::connect(server, None).await?;
     let sessions = session::list_all(&mut ctrl).await?;
     if sessions.is_empty() {
@@ -190,7 +199,7 @@ fn format_session(
     lines
 }
 
-async fn kill(server: &str, target: &str) -> Result<()> {
+async fn kill(server: &ServerAddress, target: &str) -> Result<()> {
     let (mut ctrl, _events) = Control::connect(server, None).await?;
     let id = session::pick(&mut ctrl, Some(target)).await?;
     session::destroy(&mut ctrl, &id).await?;
@@ -210,15 +219,19 @@ mod tests {
     #[test]
     fn parses_cli_flags_and_commands() {
         let (server, cmd) = parse_args(args(&["ls"]), None).unwrap();
-        assert_eq!(server, DEFAULT_SERVER);
+        assert_eq!(server, None);
         assert_eq!(cmd, Command::List);
+        assert_eq!(
+            parse_args(args(&["ls"]), Some(String::new())).unwrap().0,
+            None
+        );
 
         let (server, cmd) = parse_args(
             args(&["-S", "https://example.com", "a", "work", "-w", "1.2"]),
             Some("http://env:7297".to_owned()),
         )
         .unwrap();
-        assert_eq!(server, "https://example.com");
+        assert_eq!(server.as_deref(), Some("https://example.com"));
         assert_eq!(
             cmd,
             Command::Attach {
@@ -244,7 +257,7 @@ mod tests {
 
         let (server, cmd) =
             parse_args(args(&["kill", "work"]), Some("http://env:7297".to_owned())).unwrap();
-        assert_eq!(server, "http://env:7297");
+        assert_eq!(server.as_deref(), Some("http://env:7297"));
         assert_eq!(
             cmd,
             Command::Kill {

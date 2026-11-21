@@ -15,7 +15,7 @@ A lightweight command-line client for a [Rex](https://www.superlogical.com/rex/d
 ## Requirements
 
 - Rust (`cargo`). A Nix flake (`nix develop`) is also available.
-- A Rex server reachable over HTTP or HTTPS.
+- A Rex server reachable over HTTP, HTTPS, or a Unix socket.
 
 ## Build
 
@@ -50,7 +50,7 @@ zrex -S https://server.example kill work
 
 ### Server Address
 
-The server address is read from `--server` (`-S`), then `REX_SERVER`, and defaults to `http://127.0.0.1:7297`.
+The server address is read from `--server` (`-S`), then `REX_SERVER`. Without either, `zrex` uses a local Rex server's Unix socket when one is running, and otherwise defaults to `http://127.0.0.1:7297`. An address may be an HTTP(S) URL or a Unix socket address such as `unix:///Users/you/Library/Application%20Support/rex/server.sock`.
 
 ### Selecting Sessions, Windows, and Blocks
 
