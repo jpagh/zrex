@@ -359,4 +359,39 @@ mod tests {
             "https://mac1.example".parse().unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn normalizes_saved_server_addresses_and_rejects_malformed_urls() {
+        let config = sample_config(&[
+            ("office", "https://OFFICE.EXAMPLE:443/"),
+            ("loopback", "http://127.0.0.1:7297/"),
+            ("bad_space", "http://bad host"),
+            ("bad_port", "http://:7297"),
+        ]);
+
+        let saved = parse_saved_servers(&config, "ls");
+        assert_eq!(saved.configured, 4);
+        assert_eq!(
+            saved.servers,
+            vec![
+                Server {
+                    name: "loopback".to_owned(),
+                    address: "127.0.0.1:7297".parse().unwrap(),
+                },
+                Server {
+                    name: "office".to_owned(),
+                    address: "https://office.example".parse().unwrap(),
+                },
+            ]
+        );
+
+        let fake_local = || async { "http://127.0.0.1:7297".parse().unwrap() };
+        let resolved = resolve_server_with(&config, "office", fake_local)
+            .await
+            .unwrap();
+        let direct = resolve_server_with(&config, "https://office.example", fake_local)
+            .await
+            .unwrap();
+        assert_eq!(resolved.server.address, direct.server.address);
+    }
 }

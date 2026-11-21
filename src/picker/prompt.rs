@@ -263,6 +263,10 @@ impl PickerState {
         state
     }
 
+    pub(super) fn set_feedback(&mut self, feedback: Feedback) {
+        self.feedback = Some(feedback);
+    }
+
     pub(super) fn refresh(
         &mut self,
         targets: Vec<Target>,
@@ -704,7 +708,16 @@ impl PickerState {
                 (KeyCode::Char('s' | 'S'), mods)
                     if mods.difference(KeyModifiers::SHIFT).is_empty() =>
                 {
-                    if let Some(pos) = choices.iter().position(|c| c.kind == ScopeKind::Session) {
+                    let next = if choices[*selected].kind == ScopeKind::Session {
+                        choices[*selected + 1..]
+                            .iter()
+                            .position(|c| c.kind == ScopeKind::Session)
+                            .map(|offset| *selected + 1 + offset)
+                            .or_else(|| choices.iter().position(|c| c.kind == ScopeKind::Session))
+                    } else {
+                        choices.iter().position(|c| c.kind == ScopeKind::Session)
+                    };
+                    if let Some(pos) = next {
                         *selected = pos;
                     }
                     None
@@ -1072,6 +1085,13 @@ impl Screen {
             is_error: false,
         };
         state.render_with_banner(&mut out, columns, rows, self.use_color, Some(&banner))
+    }
+
+    pub(super) fn drain_input(&mut self) -> io::Result<()> {
+        while event::poll(std::time::Duration::ZERO)? {
+            let _ = event::read()?;
+        }
+        Ok(())
     }
 }
 
@@ -1953,5 +1973,76 @@ mod tests {
         );
         // Feedback cleared after keypress.
         assert!(state.feedback.is_none());
+    }
+
+    #[test]
+    fn ctrl_k_s_cycles_through_all_sessions_including_empty_ones() {
+        let (targets, sessions, servers) = split_fixture();
+        let mut state = PickerState::new(targets, sessions, servers);
+
+        // Highlight split row 2.1 (Block selected by default in Kill mode).
+        assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None
+        );
+
+        // First 's' jumps to the active session ("work").
+        assert_eq!(
+            state.handle_key(KeyCode::Char('s'), KeyModifiers::NONE),
+            None
+        );
+        // Second 's' advances to the empty session ("idle").
+        assert_eq!(
+            state.handle_key(KeyCode::Char('s'), KeyModifiers::NONE),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Kill {
+                target: ManageTarget::Session {
+                    server_index: 0,
+                    session_id: "session:empty".to_owned(),
+                },
+            }))
+        );
+
+        // 'S' wraps back around to the first session ("work").
+        assert_eq!(
+            state.handle_key(KeyCode::Char('S'), KeyModifiers::SHIFT),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Kill {
+                target: ManageTarget::Session {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                },
+            }))
+        );
+    }
+
+    #[test]
+    fn initial_feedback_renders_in_banner_until_next_key() {
+        let (targets, sessions, servers) = sample_fixture();
+        let mut state = PickerState::new(targets, sessions, servers);
+        state.set_feedback(Feedback {
+            text: "office: connection refused".to_owned(),
+            is_error: true,
+        });
+
+        let mut buf = Vec::new();
+        state.render(&mut buf, 80, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("office: connection refused"));
+
+        assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert!(state.feedback.is_none());
+
+        let mut buf = Vec::new();
+        state.render(&mut buf, 80, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(!screen.contains("office: connection refused"));
     }
 }

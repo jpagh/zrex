@@ -173,9 +173,16 @@ struct DiscoveryOutcome {
     attempted_any: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalDiscovery {
+    None,
+    Optional,
+    Required,
+}
+
 struct LoadedServers {
     servers: Vec<Server>,
-    discover_local: bool,
+    local_discovery: LocalDiscovery,
     has_configured_sources: bool,
 }
 
@@ -274,16 +281,58 @@ impl DiscoveryOutcome {
     }
 }
 
+fn discovery_warning_feedback(warnings: &[String]) -> Option<prompt::Feedback> {
+    let first = warnings.first()?;
+    let text = match warnings.len() {
+        1 => first.clone(),
+        len => {
+            let rest = len - 1;
+            format!(
+                "{first} (and {rest} more server warning{})",
+                if rest == 1 { "" } else { "s" }
+            )
+        }
+    };
+    Some(prompt::Feedback {
+        text,
+        is_error: true,
+    })
+}
+
+enum LocalTarget {
+    #[cfg_attr(not(test), allow(dead_code))]
+    Address(ServerAddress),
+    Connected(ServerAddress, Control),
+}
+
 pub async fn run(server_config: &ServerConfig) -> Result<()> {
     app::ensure_terminal()?;
     let loaded = load_servers(server_config).await?;
     let deadline = Instant::now() + DISCOVERY_TIME;
+    let local_discovery = loaded.local_discovery;
+    let excluded: Vec<ServerAddress> = loaded
+        .servers
+        .iter()
+        .map(|server| server.address.clone())
+        .collect();
     let mut outcome = discover_all(
         loaded.servers,
-        loaded.discover_local.then(ServerAddress::local_if_running),
+        local_discovery,
+        async move {
+            match local_discovery {
+                LocalDiscovery::None => None,
+                LocalDiscovery::Optional => Control::connect_local_if_running(&excluded)
+                    .await
+                    .map(|(address, ctrl, _events)| LocalTarget::Connected(address, ctrl)),
+                LocalDiscovery::Required => Control::connect_local_if_running(&[])
+                    .await
+                    .map(|(address, ctrl, _events)| LocalTarget::Connected(address, ctrl)),
+            }
+        },
         deadline,
     )
     .await;
+    let initial_feedback = discovery_warning_feedback(&outcome.warnings);
     for warning in outcome.warnings.drain(..) {
         eprintln!("zrex pick: {warning}");
     }
@@ -307,6 +356,9 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
         outcome.sessions.clone(),
         server_names,
     );
+    if let Some(feedback) = initial_feedback {
+        state.set_feedback(feedback);
+    }
 
     loop {
         match screen.step(&mut state)? {
@@ -367,6 +419,7 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
                     &format!("Rename {kind} failed"),
                 );
                 state.refresh(outcome.choices.clone(), outcome.sessions.clone(), feedback);
+                screen.drain_input()?;
             }
             Some(prompt::Selection::Kill { target }) => {
                 let kind = target.kind_name();
@@ -397,6 +450,7 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
                     &format!("Kill {kind} failed"),
                 );
                 state.refresh(outcome.choices.clone(), outcome.sessions.clone(), feedback);
+                screen.drain_input()?;
             }
         }
     }
@@ -492,10 +546,15 @@ async fn apply_manage(
     let should_refresh = match &result {
         Ok(()) => true,
         Err(error) => error.downcast_ref::<ApiError>().is_some_and(|api| {
-            matches!(
-                api.code.as_str(),
-                "not_found" | "session_not_found" | "conflict"
-            )
+            matches!(api.status, 404 | 409)
+                || matches!(
+                    api.code.as_str(),
+                    "not_found"
+                        | "session_not_found"
+                        | "window_not_found"
+                        | "block_not_found"
+                        | "conflict"
+                )
         }),
     };
     let refreshed = if should_refresh {
@@ -550,23 +609,31 @@ fn finish_manage(
 
 async fn discover_all<F>(
     servers: Vec<Server>,
-    local_probe: Option<F>,
+    local_discovery: LocalDiscovery,
+    local_probe: F,
     deadline: Instant,
 ) -> DiscoveryOutcome
 where
-    F: Future<Output = Option<ServerAddress>>,
+    F: Future<Output = Option<LocalTarget>>,
 {
     // Resolve and query the default local server in parallel with saved servers
     // so a hung local socket never delays remote discovery.
     let local_future = async {
-        let Some(probe) = local_probe else {
+        if local_discovery == LocalDiscovery::None {
             return Ok(None);
+        }
+        let target = match timeout_at(deadline, local_probe).await {
+            Ok(Some(target)) => target,
+            Ok(None) => match local_discovery {
+                LocalDiscovery::Optional => return Ok(None),
+                LocalDiscovery::Required => bail!("local: server is not running"),
+                LocalDiscovery::None => unreachable!(),
+            },
+            Err(_) => bail!("local server detection timed out"),
         };
-        let Some(address) = timeout_at(deadline, probe)
-            .await
-            .context("local server detection timed out")?
-        else {
-            return Ok(None);
+        let (address, connected) = match target {
+            LocalTarget::Address(address) => (address, None),
+            LocalTarget::Connected(address, ctrl) => (address, Some(ctrl)),
         };
         if servers.iter().any(|server| server.address == address) {
             return Ok(None);
@@ -575,7 +642,10 @@ where
             name: "local".to_owned(),
             address,
         };
-        let result = discover_until(&server, deadline).await;
+        let result = match connected {
+            Some(mut ctrl) => discover_with_control(&mut ctrl, &server, deadline).await,
+            None => discover_until(&server, deadline).await,
+        };
         Ok::<_, anyhow::Error>(Some((server, result)))
     };
 
@@ -658,7 +728,7 @@ async fn load_servers(server_config: &ServerConfig) -> Result<LoadedServers> {
     if let ServerConfig::Explicit(target) = server_config {
         return Ok(LoadedServers {
             servers: vec![config::resolve_server(target).await?.server],
-            discover_local: false,
+            local_discovery: LocalDiscovery::None,
             has_configured_sources: true,
         });
     }
@@ -683,7 +753,7 @@ where
                     .await?
                     .server,
             ],
-            discover_local: false,
+            local_discovery: LocalDiscovery::None,
             has_configured_sources: true,
         });
     }
@@ -693,29 +763,39 @@ where
     match server_config {
         ServerConfig::Explicit(_) => unreachable!(),
         ServerConfig::Env(target) => {
-            match config::resolve_server_with(config, target, local).await {
-                Ok(mut resolved)
-                    if !servers
-                        .iter()
-                        .any(|saved| saved.address == resolved.server.address) =>
-                {
-                    if !resolved.named {
-                        resolved.server.name = "REX_SERVER".to_owned();
+            let local_discovery = if target.eq_ignore_ascii_case("local")
+                && !config
+                    .servers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("local"))
+            {
+                LocalDiscovery::Required
+            } else {
+                match config::resolve_server_with(config, target, local).await {
+                    Ok(mut resolved)
+                        if !servers
+                            .iter()
+                            .any(|saved| saved.address == resolved.server.address) =>
+                    {
+                        if !resolved.named {
+                            resolved.server.name = "REX_SERVER".to_owned();
+                        }
+                        servers.insert(0, resolved.server);
                     }
-                    servers.insert(0, resolved.server);
+                    Ok(_) => {}
+                    Err(error) => eprintln!("zrex pick: {}", clean_one_line(&format!("{error:#}"))),
                 }
-                Ok(_) => {}
-                Err(error) => eprintln!("zrex pick: {}", clean_one_line(&format!("{error:#}"))),
-            }
+                LocalDiscovery::None
+            };
             Ok(LoadedServers {
                 servers,
-                discover_local: false,
+                local_discovery,
                 has_configured_sources: true,
             })
         }
         ServerConfig::Default => Ok(LoadedServers {
             servers,
-            discover_local: true,
+            local_discovery: LocalDiscovery::Optional,
             has_configured_sources: saved.configured > 0,
         }),
     }
@@ -1864,7 +1944,8 @@ mod tests {
 
         let outcome = discover_all(
             servers,
-            Some(async { None }),
+            LocalDiscovery::Optional,
+            async { None },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1937,7 +2018,8 @@ mod tests {
 
         let outcome = discover_all(
             servers,
-            Some(async { None }),
+            LocalDiscovery::Optional,
+            async { None },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1968,7 +2050,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!loaded.discover_local);
+        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
         assert!(loaded.has_configured_sources);
         assert_eq!(
             loaded.servers,
@@ -1986,7 +2068,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!loaded.discover_local);
+        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
         assert!(loaded.has_configured_sources);
         assert_eq!(
             loaded.servers,
@@ -2000,7 +2082,7 @@ mod tests {
         let loaded = load_servers_with(&ServerConfig::Env("mac".to_owned()), &config, fake_local)
             .await
             .unwrap();
-        assert!(!loaded.discover_local);
+        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
         assert!(loaded.has_configured_sources);
         assert_eq!(
             loaded
@@ -2019,7 +2101,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!loaded.discover_local);
+        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
         assert!(loaded.has_configured_sources);
         assert_eq!(
             loaded
@@ -2028,6 +2110,55 @@ mod tests {
                 .map(|server| server.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["REX_SERVER", "mac", "office"]
+        );
+
+        // REX_SERVER=local (case-insensitive) defers local probing to discover_all.
+        let panic_local = || async {
+            panic!("local probe must not run synchronously in load_servers_with");
+            #[allow(unreachable_code)]
+            "http://127.0.0.1:7297".parse::<ServerAddress>().unwrap()
+        };
+        let loaded = load_servers_with(&ServerConfig::Env("LOCAL".to_owned()), &config, panic_local)
+            .await
+            .unwrap();
+        assert_eq!(loaded.local_discovery, LocalDiscovery::Required);
+        assert!(loaded.has_configured_sources);
+        assert_eq!(
+            loaded
+                .servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mac", "office"]
+        );
+
+        // A saved server named `local` overrides the built-in local alias for REX_SERVER=local.
+        let mut with_saved_local = config::Config::default();
+        with_saved_local
+            .servers
+            .insert("local".to_owned(), "http://127.0.0.1:9999".to_owned());
+        with_saved_local
+            .servers
+            .insert("mac".to_owned(), "https://mac.tail.ts.net".to_owned());
+        with_saved_local
+            .servers
+            .insert("office".to_owned(), "https://office.example".to_owned());
+        let loaded = load_servers_with(
+            &ServerConfig::Env("local".to_owned()),
+            &with_saved_local,
+            panic_local,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
+        assert!(loaded.has_configured_sources);
+        assert_eq!(
+            loaded
+                .servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local", "mac", "office"]
         );
     }
 
@@ -2040,13 +2171,14 @@ mod tests {
         let loaded = load_servers_with(&ServerConfig::Default, &empty_config, fake_local)
             .await
             .unwrap();
-        assert!(loaded.discover_local);
+        assert_eq!(loaded.local_discovery, LocalDiscovery::Optional);
         assert!(!loaded.has_configured_sources);
         assert!(loaded.servers.is_empty());
 
         let outcome = discover_all(
             loaded.servers,
-            Some(async { None }),
+            loaded.local_discovery,
+            async { None },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2066,7 +2198,8 @@ mod tests {
         assert!(loaded.servers.is_empty());
         let outcome = discover_all(
             loaded.servers,
-            Some(async { None }),
+            loaded.local_discovery,
+            async { None },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2081,11 +2214,12 @@ mod tests {
         .await
         .unwrap();
         assert!(loaded.has_configured_sources);
-        assert!(!loaded.discover_local);
+        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
         assert!(loaded.servers.is_empty());
         let outcome = discover_all(
             loaded.servers,
-            Option::<std::future::Ready<Option<ServerAddress>>>::None,
+            loaded.local_discovery,
+            async { None },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2099,7 +2233,8 @@ mod tests {
         drop(dead_listener);
         let outcome = discover_all(
             Vec::new(),
-            Some(async move { Some(dead_addr) }),
+            LocalDiscovery::Optional,
+            async move { Some(LocalTarget::Address(dead_addr)) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2110,7 +2245,8 @@ mod tests {
         // 5. Local probe times out -> do not mask timeout as no sources.
         let outcome = discover_all(
             Vec::new(),
-            Some(std::future::pending::<Option<ServerAddress>>()),
+            LocalDiscovery::Optional,
+            std::future::pending::<Option<LocalTarget>>(),
             Instant::now() + Duration::from_millis(10),
         )
         .await;
@@ -2130,10 +2266,32 @@ mod tests {
         .await
         .unwrap();
         assert!(loaded.has_configured_sources);
-        assert!(!loaded.discover_local);
+        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
         let outcome = discover_all(
             loaded.servers,
-            Option::<std::future::Ready<Option<ServerAddress>>>::None,
+            loaded.local_discovery,
+            async { None },
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
+        assert!(outcome.servers.is_empty());
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(!outcome.has_no_sources(loaded.has_configured_sources));
+
+        // 7. REX_SERVER=local with absent/unreachable local server -> warning & configured source, never intro.
+        let loaded = load_servers_with(
+            &ServerConfig::Env("local".to_owned()),
+            &empty_config,
+            fake_local,
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.local_discovery, LocalDiscovery::Required);
+        assert!(loaded.has_configured_sources);
+        let outcome = discover_all(
+            loaded.servers,
+            loaded.local_discovery,
+            async { None },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2533,5 +2691,235 @@ mod tests {
         assert_eq!(outcome.choices.len(), 1);
         assert_eq!(outcome.choices[0].server_index, 1);
         assert_eq!(outcome.choices[0].session_index, 0);
+    }
+
+    #[test]
+    fn discovery_warning_feedback_formats_single_and_multiple_warnings() {
+        assert_eq!(discovery_warning_feedback(&[]), None);
+        assert_eq!(
+            discovery_warning_feedback(&["dead: connection refused".to_owned()]),
+            Some(prompt::Feedback {
+                text: "dead: connection refused".to_owned(),
+                is_error: true,
+            })
+        );
+        assert_eq!(
+            discovery_warning_feedback(&[
+                "dead: connection refused".to_owned(),
+                "slow: discovery timed out".to_owned(),
+            ]),
+            Some(prompt::Feedback {
+                text: "dead: connection refused (and 1 more server warning)".to_owned(),
+                is_error: true,
+            })
+        );
+        assert_eq!(
+            discovery_warning_feedback(&[
+                "dead: connection refused".to_owned(),
+                "slow: discovery timed out".to_owned(),
+                "bad: invalid token".to_owned(),
+            ]),
+            Some(prompt::Feedback {
+                text: "dead: connection refused (and 2 more server warnings)".to_owned(),
+                is_error: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_all_runs_required_local_in_parallel_and_deduplicates() {
+        use futures_util::SinkExt;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    #[allow(
+                        clippy::result_large_err,
+                        reason = "tungstenite fixes the callback error type"
+                    )]
+                    let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                        if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                            res.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", proto.clone());
+                        }
+                        Ok(res)
+                    })
+                    .await
+                    .unwrap();
+
+                    let _ = ws.next().await;
+                    ws.send(Message::text(
+                        json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let req: Value = serde_json::from_str(&text).unwrap();
+                        let id = req["id"].as_str().unwrap();
+                        let payload = match req["method"].as_str().unwrap() {
+                            "session.attach_all" => json!({"sessions": []}),
+                            other => panic!("unexpected method {other}"),
+                        };
+                        ws.send(Message::text(
+                            json!({"type": "response", "id": id, "seq": 0, "payload": payload})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                });
+            }
+        });
+
+        let saved_url = format!("http://{live_addr}");
+
+        // Hanging local probe still allows saved servers to succeed under deadline.
+        let outcome = discover_all(
+            vec![Server {
+                name: "office".to_owned(),
+                address: saved_url.parse().unwrap(),
+            }],
+            LocalDiscovery::Required,
+            std::future::pending::<Option<LocalTarget>>(),
+            Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(outcome.servers.len(), 1);
+        assert_eq!(outcome.servers[0].name, "office");
+        assert_eq!(outcome.warnings, vec!["local server detection timed out"]);
+
+        // Matching saved server address deduplicates cleanly.
+        let saved_addr: ServerAddress = saved_url.parse().unwrap();
+        let outcome = discover_all(
+            vec![Server {
+                name: "office".to_owned(),
+                address: saved_url.parse().unwrap(),
+            }],
+            LocalDiscovery::Required,
+            async move { Some(LocalTarget::Address(saved_addr)) },
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
+        assert_eq!(outcome.servers.len(), 1);
+        assert_eq!(outcome.servers[0].name, "office");
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_manage_refreshes_on_404_status_and_skips_500() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use futures_util::SinkExt;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let status_to_return = Arc::new(AtomicUsize::new(404));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_flag = Arc::clone(&status_to_return);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let status_flag = Arc::clone(&status_flag);
+                tokio::spawn(async move {
+                    #[allow(
+                        clippy::result_large_err,
+                        reason = "tungstenite fixes the callback error type"
+                    )]
+                    let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                        if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                            res.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", proto.clone());
+                        }
+                        Ok(res)
+                    })
+                    .await
+                    .unwrap();
+
+                    let _ = ws.next().await;
+                    ws.send(Message::text(
+                        json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let req: Value = serde_json::from_str(&text).unwrap();
+                        let id = req["id"].as_str().unwrap();
+                        let msg = match req["method"].as_str().unwrap() {
+                            "session.attach" => json!({
+                                "type": "response",
+                                "id": id,
+                                "seq": 0,
+                                "payload": {"session_id": "session:1"}
+                            }),
+                            "session.close_window" => {
+                                let status = status_flag.load(Ordering::Relaxed);
+                                json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "seq": 0,
+                                    "error": {
+                                        "code": "custom_code",
+                                        "message": "gone",
+                                        "status": status
+                                    }
+                                })
+                            }
+                            "session.attach_all" => json!({
+                                "type": "response",
+                                "id": id,
+                                "seq": 0,
+                                "payload": {"sessions": []}
+                            }),
+                            other => panic!("unexpected method {other}"),
+                        };
+                        ws.send(Message::text(msg.to_string())).await.unwrap();
+                    }
+                });
+            }
+        });
+
+        let server = Server {
+            name: "office".to_owned(),
+            address: format!("http://{addr}").parse().unwrap(),
+        };
+        let target = ManageTarget::Window {
+            server_index: 0,
+            session_id: "session:1".to_owned(),
+            window_id: "window:1".to_owned(),
+        };
+
+        let applied_404 = apply_manage(
+            &server,
+            ManageOp::Kill { target: &target },
+            Instant::now() + DISCOVERY_TIME,
+            DISCOVERY_TIME,
+        )
+        .await;
+        assert!(applied_404.result.is_err());
+        assert!(matches!(applied_404.refreshed, Some(Ok(_))));
+
+        status_to_return.store(500, Ordering::Relaxed);
+        let applied_500 = apply_manage(
+            &server,
+            ManageOp::Kill { target: &target },
+            Instant::now() + DISCOVERY_TIME,
+            DISCOVERY_TIME,
+        )
+        .await;
+        assert!(applied_500.result.is_err());
+        assert!(applied_500.refreshed.is_none());
     }
 }

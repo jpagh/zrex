@@ -3,6 +3,8 @@ _zrex_complete()
     local candidate word trimmed escaped i last=0
     local current="${COMP_WORDS[COMP_CWORD]}"
     local quote=""
+    local sq="'"
+    local rep="'\\''"
     local rest="${COMP_LINE}"
     local -a words prior
     words=()
@@ -48,7 +50,7 @@ _zrex_complete()
         [ -z "$candidate" ] && continue
         case $quote in
             "'")
-                escaped="${candidate//\'/\'\\\'\'}"
+                escaped="${candidate//$sq/$rep}"
                 COMPREPLY+=("'${escaped}'")
                 ;;
             '"')

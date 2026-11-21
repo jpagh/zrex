@@ -45,9 +45,10 @@ shows the window the session already has, and never changes it, leaving what
 Rex.app shows alone. ls lists every session, its windows, and any splits (1.1,
 1.2, ...) with a star on the active window and block, and the terminal title a
 window's focused block reports beside the window's label. Without --server or
-REX_SERVER, ls also lists saved servers from ~/.config/zrex/config.toml (or
-$XDG_CONFIG_HOME/zrex/config.toml) and skips the local server when none is
-running. completion prints a shell completion script that completes server names,
+REX_SERVER, ls lists any running local server and saved servers from
+~/.config/zrex/config.toml (or $XDG_CONFIG_HOME/zrex/config.toml), skipping an
+absent local server when saved servers are configured and returning an error
+when neither is available. completion prints a shell completion script that completes server names,
 session labels, window numbers and labels, and block numbers and labels. Running
 zrex with no command (or zrex pick) fuzzy-searches existing sessions, windows,
 and splits on the default (when running) and saved servers
@@ -213,7 +214,12 @@ fn parse_args(
     }
     let cmd = match command.as_deref() {
         Some(name) => match Subcommand::parse(name) {
-            Some(Subcommand::List) => Command::List,
+            Some(Subcommand::List) => {
+                if target.is_some() || window.is_some() || block.is_some() {
+                    anyhow::bail!("usage: zrex [--server SERVER] ls");
+                }
+                Command::List
+            }
             Some(Subcommand::Pick) => {
                 if target.is_some() || window.is_some() || block.is_some() {
                     anyhow::bail!("usage: zrex [--server SERVER] [pick]");
@@ -225,19 +231,29 @@ fn parse_args(
                 window,
                 block,
             },
-            Some(Subcommand::Kill) => match target {
-                Some(target) => Command::Kill { target },
-                None => anyhow::bail!("kill needs a session"),
-            },
-            Some(Subcommand::Completion) => match target.as_deref() {
-                Some(other) => match Shell::parse(other) {
-                    Some(shell) => Command::Completion(shell),
-                    None => {
-                        anyhow::bail!("no completion script for {other}; use zsh, bash, or fish")
-                    }
-                },
-                None => anyhow::bail!("completion needs zsh, bash, or fish"),
-            },
+            Some(Subcommand::Kill) => {
+                if window.is_some() || block.is_some() {
+                    anyhow::bail!("usage: zrex [--server SERVER] kill SESSION");
+                }
+                match target {
+                    Some(target) => Command::Kill { target },
+                    None => anyhow::bail!("kill needs a session"),
+                }
+            }
+            Some(Subcommand::Completion) => {
+                if window.is_some() || block.is_some() {
+                    anyhow::bail!("usage: zrex completion zsh|bash|fish");
+                }
+                match target.as_deref() {
+                    Some(other) => match Shell::parse(other) {
+                        Some(shell) => Command::Completion(shell),
+                        None => {
+                            anyhow::bail!("no completion script for {other}; use zsh, bash, or fish")
+                        }
+                    },
+                    None => anyhow::bail!("completion needs zsh, bash, or fish"),
+                }
+            }
             None => Command::Unknown(name.to_owned()),
         },
         None => {
@@ -304,6 +320,12 @@ struct MultiListReport {
     reachable: usize,
 }
 
+enum LocalProbe {
+    #[cfg_attr(not(test), allow(dead_code))]
+    Address(ServerAddress),
+    Connected(ServerAddress, Control),
+}
+
 async fn list(server_config: &ServerConfig) -> Result<()> {
     match server_config {
         ServerConfig::Explicit(_) | ServerConfig::Env(_) => {
@@ -313,11 +335,13 @@ async fn list(server_config: &ServerConfig) -> Result<()> {
         ServerConfig::Default => {
             let saved = config::load_saved_servers("ls")?;
             if saved.configured == 0 {
-                let Some(server) = ServerAddress::local_if_running().await else {
-                    println!("no sessions");
-                    return Ok(());
+                let Some((_addr, ctrl, _events)) = Control::connect_local_if_running(&[]).await
+                else {
+                    anyhow::bail!(
+                        "no Rex server found; start a local Rex server, pass --server / set REX_SERVER, or configure ~/.config/zrex/config.toml"
+                    );
                 };
-                return list_single(&server).await;
+                return list_single_with_control(ctrl).await;
             }
             list_multi(saved.servers).await
         }
@@ -325,7 +349,11 @@ async fn list(server_config: &ServerConfig) -> Result<()> {
 }
 
 async fn list_single(server: &ServerAddress) -> Result<()> {
-    let (mut ctrl, _events) = Control::connect(server, None).await?;
+    let (ctrl, _events) = Control::connect(server, None).await?;
+    list_single_with_control(ctrl).await
+}
+
+async fn list_single_with_control(mut ctrl: Control) -> Result<()> {
     let sessions = session::list_all(&mut ctrl).await?;
     if sessions.is_empty() {
         println!("no sessions");
@@ -339,7 +367,17 @@ async fn list_single(server: &ServerAddress) -> Result<()> {
 
 async fn list_multi(servers: Vec<Server>) -> Result<()> {
     let deadline = Instant::now() + DISCOVERY_TIME;
-    let report = collect_multi_list(servers, ServerAddress::local_if_running(), deadline).await;
+    let excluded: Vec<ServerAddress> = servers.iter().map(|s| s.address.clone()).collect();
+    let report = collect_multi_list(
+        servers,
+        async move {
+            Control::connect_local_if_running(&excluded)
+                .await
+                .map(|(address, ctrl, _events)| LocalProbe::Connected(address, ctrl))
+        },
+        deadline,
+    )
+    .await;
     for error in report.errors {
         eprintln!("zrex ls: {error}");
     }
@@ -364,15 +402,19 @@ async fn list_multi(servers: Vec<Server>) -> Result<()> {
 
 async fn collect_multi_list(
     servers: Vec<Server>,
-    local_probe: impl Future<Output = Option<ServerAddress>>,
+    local_probe: impl Future<Output = Option<LocalProbe>>,
     deadline: Instant,
 ) -> MultiListReport {
     let local_future = async {
-        let Some(address) = timeout_at(deadline, local_probe)
+        let Some(probe) = timeout_at(deadline, local_probe)
             .await
             .context("local server detection timed out")?
         else {
             return Ok(None);
+        };
+        let (address, connected) = match probe {
+            LocalProbe::Address(address) => (address, None),
+            LocalProbe::Connected(address, ctrl) => (address, Some(ctrl)),
         };
         if servers.iter().any(|server| server.address == address) {
             return Ok(None);
@@ -381,7 +423,10 @@ async fn collect_multi_list(
             name: "local".to_owned(),
             address,
         };
-        let result = list_server_until(&server, deadline).await;
+        let result = match connected {
+            Some(mut ctrl) => list_with_control(&mut ctrl, deadline).await,
+            None => list_server_until(&server, deadline).await,
+        };
         Ok::<_, anyhow::Error>(Some((server, result)))
     };
 
@@ -434,17 +479,20 @@ async fn collect_multi_list(
 }
 
 async fn list_server_until(server: &Server, deadline: Instant) -> Result<Vec<String>> {
-    let (mut ctrl, sessions) = timeout_at(deadline, async {
-        let (mut ctrl, _events) = Control::connect(&server.address, None).await?;
-        let sessions = session::list_all(&mut ctrl).await?;
-        Ok::<_, anyhow::Error>((ctrl, sessions))
-    })
-    .await
-    .context("listing timed out")??;
+    let (mut ctrl, _events) = timeout_at(deadline, Control::connect(&server.address, None))
+        .await
+        .context("listing timed out")??;
+    list_with_control(&mut ctrl, deadline).await
+}
+
+async fn list_with_control(ctrl: &mut Control, deadline: Instant) -> Result<Vec<String>> {
+    let sessions = timeout_at(deadline, session::list_all(ctrl))
+        .await
+        .context("listing timed out")??;
     if sessions.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(format_sessions(&mut ctrl, sessions, Some(deadline)).await)
+    Ok(format_sessions(ctrl, sessions, Some(deadline)).await)
 }
 
 async fn format_sessions(
@@ -454,7 +502,7 @@ async fn format_sessions(
 ) -> Vec<String> {
     let width = sessions
         .iter()
-        .map(|session| session::label_of(session).chars().count())
+        .map(|session| clean_one_line(session::label_of(session)).chars().count())
         .max()
         .unwrap_or(0);
     let pending_views: Vec<_> = sessions
@@ -567,8 +615,9 @@ fn format_session(
     width: usize,
     titles: &HashMap<String, String>,
 ) -> Vec<String> {
-    let id = session::id_of(entry);
-    let mut lines = vec![format!("{:width$}  {id}", session::label_of(entry))];
+    let id = clean_one_line(&session::id_of(entry));
+    let label = clean_one_line(session::label_of(entry));
+    let mut lines = vec![format!("{label:width$}  {id}")];
     let Some(view) = view else {
         return lines;
     };
@@ -580,14 +629,15 @@ fn format_session(
         } else {
             " "
         };
+        let window_label = clean_one_line(&window.label);
         let title = titles
             .get(&window.id)
             .map(|title| clean_title(title))
             .unwrap_or_default();
-        if title.is_empty() || title == window.label {
-            lines.push(format!("  {mark} {win_num}  {}", window.label));
+        if title.is_empty() || title == window_label {
+            lines.push(format!("  {mark} {win_num}  {window_label}"));
         } else {
-            lines.push(format!("  {mark} {win_num}  {} — {title}", window.label));
+            lines.push(format!("  {mark} {win_num}  {window_label} — {title}"));
         }
         if window.blocks.len() > 1 {
             for (b_idx, block) in window.blocks.iter().enumerate() {
@@ -596,10 +646,10 @@ fn format_session(
                 } else {
                     " "
                 };
+                let block_label = clean_one_line(&block.label);
                 lines.push(format!(
-                    "    {b_mark} {win_num}.{}  {}",
+                    "    {b_mark} {win_num}.{}  {block_label}",
                     b_idx + 1,
-                    block.label
                 ));
             }
         }
@@ -632,6 +682,9 @@ pub(crate) fn clean_one_line(text: &str) -> String {
 }
 
 pub(crate) fn clean_truncated(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     let cleaned = clean_one_line(text);
     let mut chars = cleaned.chars();
     let mut short: String = chars.by_ref().take(max_chars).collect();
@@ -726,17 +779,23 @@ async fn complete(mut args: impl Iterator<Item = String>) {
             let server_config =
                 ServerConfig::from_sources(parsed.server, env::var("REX_SERVER").ok());
             let Ok(Some(candidates)) = timeout(COMPLETION_TIME, async {
-                let server = match server_config {
-                    ServerConfig::Default => ServerAddress::local_if_running().await?,
-                    other => other.resolve().await.ok()?,
+                let (mut ctrl, _events) = match server_config {
+                    ServerConfig::Default => {
+                        let (_addr, ctrl, events) = Control::connect_local_if_running(&[]).await?;
+                        (ctrl, events)
+                    }
+                    other => {
+                        let server = other.resolve().await.ok()?;
+                        Control::connect(&server, None).await.ok()?
+                    }
                 };
                 Some(match context {
-                    Completion::Sessions => session_candidates(&server).await,
+                    Completion::Sessions => session_candidates(&mut ctrl).await,
                     Completion::Windows { session } => {
-                        window_candidates(&server, session.as_deref()).await
+                        window_candidates(&mut ctrl, session.as_deref()).await
                     }
                     Completion::Blocks { session, window } => {
-                        block_candidates(&server, session.as_deref(), window.as_deref()).await
+                        block_candidates(&mut ctrl, session.as_deref(), window.as_deref()).await
                     }
                     _ => unreachable!(),
                 })
@@ -748,12 +807,17 @@ async fn complete(mut args: impl Iterator<Item = String>) {
             candidates
         }
     };
-    let prefix = current.to_lowercase();
-    for candidate in candidates {
-        if candidate.to_lowercase().starts_with(&prefix) {
-            println!("{candidate}");
-        }
+    for candidate in filter_completion_candidates(candidates, &current) {
+        println!("{candidate}");
     }
+}
+
+fn filter_completion_candidates(candidates: Vec<String>, current: &str) -> Vec<String> {
+    let prefix = current.to_lowercase();
+    sanitize_candidates(candidates)
+        .into_iter()
+        .filter(|candidate| candidate.to_lowercase().starts_with(&prefix))
+        .collect()
 }
 
 fn flags(attach: bool) -> Vec<String> {
@@ -769,10 +833,11 @@ fn flags(attach: bool) -> Vec<String> {
 
 async fn server_candidates() -> Vec<String> {
     let config = config::load_config().unwrap_or_default();
-    let local = timeout(COMPLETION_TIME, ServerAddress::local_if_running())
+    let local = timeout(COMPLETION_TIME, Control::connect_local_if_running(&[]))
         .await
         .ok()
-        .flatten();
+        .flatten()
+        .map(|(address, _, _)| address);
     server_candidates_from(&config, local.as_ref())
 }
 
@@ -781,7 +846,7 @@ fn server_candidates_from(config: &config::Config, local: Option<&ServerAddress>
     let has_local_name = config
         .servers
         .keys()
-        .any(|name| name.eq_ignore_ascii_case("local"));
+        .any(|name| clean_one_line(name).eq_ignore_ascii_case("local"));
     let has_local_addr = local.is_some_and(|local_addr| {
         config
             .servers
@@ -793,76 +858,86 @@ fn server_candidates_from(config: &config::Config, local: Option<&ServerAddress>
         candidates.push("local".to_owned());
     }
     candidates.extend(config.servers.keys().cloned());
-    candidates
+    sanitize_candidates(candidates)
 }
 
-async fn session_candidates(server: &ServerAddress) -> Vec<String> {
-    let Ok((mut ctrl, _events)) = Control::connect(server, None).await else {
+async fn session_candidates(ctrl: &mut Control) -> Vec<String> {
+    let Ok(sessions) = session::list(ctrl).await else {
         return Vec::new();
     };
-    let Ok(sessions) = session::list(&mut ctrl).await else {
-        return Vec::new();
-    };
-    dedupe(
+    session_candidates_from(&sessions)
+}
+
+fn session_candidates_from(sessions: &[Value]) -> Vec<String> {
+    sanitize_candidates(
         sessions
             .iter()
-            .map(|session| session::label_of(session).to_owned())
-            .filter(|label| !label.is_empty())
-            .collect(),
+            .map(|session| session::label_of(session).to_owned()),
     )
 }
 
-async fn view_for(server: &ServerAddress, target: Option<&str>) -> Option<Value> {
-    let (mut ctrl, _events) = Control::connect(server, None).await.ok()?;
-    let sessions = session::list_all(&mut ctrl).await.ok()?;
+async fn view_for(ctrl: &mut Control, target: Option<&str>) -> Option<Value> {
+    let sessions = session::list_all(ctrl).await.ok()?;
     let session = session::select_session(&sessions, target)?;
-    session::view(&mut ctrl, &session::id_of(session))
-        .await
-        .ok()
+    session::view(ctrl, &session::id_of(session)).await.ok()
 }
 
-async fn window_candidates(server: &ServerAddress, target: Option<&str>) -> Vec<String> {
-    let Some(view) = view_for(server, target).await else {
+async fn window_candidates(ctrl: &mut Control, target: Option<&str>) -> Vec<String> {
+    let Some(view) = view_for(ctrl, target).await else {
         return Vec::new();
     };
+    window_candidates_from(&view)
+}
+
+fn window_candidates_from(view: &Value) -> Vec<String> {
     let mut candidates = Vec::new();
-    for (number, window) in session::windows(&view).into_iter().enumerate() {
+    for (number, window) in session::windows(view).into_iter().enumerate() {
         let number = number + 1;
         candidates.push(number.to_string());
-        if !window.label.is_empty() {
-            candidates.push(window.label.clone());
-        }
+        candidates.push(window.label);
         if window.blocks.len() > 1 {
             for block in 1..=window.blocks.len() {
                 candidates.push(format!("{number}.{block}"));
             }
         }
     }
-    dedupe(candidates)
+    sanitize_candidates(candidates)
 }
 
 async fn block_candidates(
-    server: &ServerAddress,
+    ctrl: &mut Control,
     target: Option<&str>,
     window_selector: Option<&str>,
 ) -> Vec<String> {
-    let Some(view) = view_for(server, target).await else {
+    let Some(view) = view_for(ctrl, target).await else {
         return Vec::new();
     };
+    block_candidates_from(&view, window_selector)
+}
+
+fn block_candidates_from(view: &Value, window_selector: Option<&str>) -> Vec<String> {
     // Completion runs after an explicit --block flag, so a dotted window
     // label must resolve as-is, just as it will when the command runs.
-    let windows = session::windows(&view);
-    let Some(window) = session::select_window(&view, &windows, window_selector) else {
+    let windows = session::windows(view);
+    let Some(window) = session::select_window(view, &windows, window_selector) else {
         return Vec::new();
     };
     let mut candidates = Vec::new();
     for (number, block) in window.blocks.iter().enumerate() {
         candidates.push((number + 1).to_string());
-        if !block.label.is_empty() {
-            candidates.push(block.label.clone());
-        }
+        candidates.push(block.label.clone());
     }
-    dedupe(candidates)
+    sanitize_candidates(candidates)
+}
+
+fn sanitize_candidates(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    dedupe(
+        items
+            .into_iter()
+            .map(|item| clean_one_line(&item))
+            .filter(|item| !item.is_empty())
+            .collect(),
+    )
 }
 
 fn dedupe(items: Vec<String>) -> Vec<String> {
@@ -1329,7 +1404,7 @@ mod tests {
                 name: "office".to_owned(),
                 address: office_addr,
             }],
-            async { Some(local_addr) },
+            async { Some(LocalProbe::Address(local_addr)) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1343,16 +1418,13 @@ mod tests {
         // When local matches a saved server address, it is listed once under the saved name.
         let shared_addr =
             spawn_mock_ls_server(json!([{"session_id": "session:2", "label": "lab"}])).await;
-        let shared_copy: ServerAddress = match &shared_addr {
-            ServerAddress::Network(url) => url.parse().unwrap(),
-            ServerAddress::Unix(path) => ServerAddress::Unix(path.clone()),
-        };
+        let shared_copy = shared_addr.clone();
         let deduped = collect_multi_list(
             vec![Server {
                 name: "saved-local".to_owned(),
                 address: shared_addr,
             }],
-            async { Some(shared_copy) },
+            async { Some(LocalProbe::Address(shared_copy)) },
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1361,5 +1433,178 @@ mod tests {
         assert!(deduped.errors.is_empty());
         assert_eq!(deduped.groups.len(), 1);
         assert_eq!(deduped.groups[0].0, "saved-local");
+    }
+
+    #[test]
+    fn parse_args_rejects_unused_flags_and_positional_targets() {
+        for bad_ls in [
+            args(&["ls", "work"]),
+            args(&["ls", "--window", "1"]),
+            args(&["ls", "-w", "1"]),
+            args(&["ls", "--block", "1"]),
+            args(&["ls", "-b", "1"]),
+        ] {
+            let err = parse_args(bad_ls, None).unwrap_err();
+            assert_eq!(err.to_string(), "usage: zrex [--server SERVER] ls");
+        }
+
+        for bad_kill in [
+            args(&["kill", "work", "--window", "1"]),
+            args(&["kill", "work", "-w", "1"]),
+            args(&["kill", "work", "--block", "1"]),
+            args(&["kill", "work", "-b", "1"]),
+            args(&["kill", "--window", "1"]),
+        ] {
+            let err = parse_args(bad_kill, None).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "usage: zrex [--server SERVER] kill SESSION"
+            );
+        }
+
+        for bad_completion in [
+            args(&["completion", "zsh", "--window", "1"]),
+            args(&["completion", "zsh", "-w", "1"]),
+            args(&["completion", "bash", "--block", "1"]),
+            args(&["completion", "fish", "-b", "1"]),
+            args(&["completion", "--window", "1"]),
+        ] {
+            let err = parse_args(bad_completion, None).unwrap_err();
+            assert_eq!(err.to_string(), "usage: zrex completion zsh|bash|fish");
+        }
+    }
+
+    #[test]
+    fn format_session_sanitizes_labels_and_compares_cleaned_window_title() {
+        let entry = json!({"session_id": "session:1", "label": "work\x1b[31m\n"});
+        let view = json!({
+            "active_window_id": "window:1",
+            "windows": [
+                {
+                    "window_id": "window:1",
+                    "label": "  dev\x1b[2J\n",
+                    "focused_block_id": "block:1",
+                    "layers": [{
+                        "layer_id": "layer:1",
+                        "blocks": [
+                            {"block_id": "block:1", "label": "shell\x07\n"},
+                            {"block_id": "block:2", "label": "logs\x1b]0;pwn\x07"},
+                        ]
+                    }]
+                },
+                {
+                    "window_id": "window:2",
+                    "label": "  editor\n",
+                    "focused_block_id": "block:3",
+                    "layers": [{
+                        "layer_id": "layer:2",
+                        "blocks": [
+                            {"block_id": "block:3", "label": "vim"},
+                        ]
+                    }]
+                }
+            ]
+        });
+        let titles = HashMap::from([
+            ("window:1".to_owned(), "vim".to_owned()),
+            ("window:2".to_owned(), "editor".to_owned()),
+        ]);
+
+        let lines = format_session(&entry, Some(&view), 9, &titles);
+        assert_eq!(
+            lines,
+            vec![
+                "work [31m  session:1",
+                "  * 1  dev [2J — vim",
+                "    * 1.1  shell",
+                "      1.2  logs ]0;pwn",
+                "    2  editor",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn format_sessions_computes_width_from_sanitized_labels() {
+        let addr = spawn_mock_ls_server(json!([
+            {"session_id": "session:1", "label": "work\n\t\x07   "},
+            {"session_id": "session:2", "label": "a"},
+        ]))
+        .await;
+        let (mut ctrl, _events) = Control::connect(&addr, None).await.unwrap();
+        let sessions = session::list_all(&mut ctrl).await.unwrap();
+        let lines = format_sessions(&mut ctrl, sessions, None).await;
+        assert_eq!(lines[0], "work  session:1");
+        assert_eq!(lines[2], "a     session:2");
+    }
+
+    #[test]
+    fn clean_truncated_handles_zero_max_chars() {
+        assert_eq!(clean_truncated("abc", 0), "");
+        assert_eq!(clean_truncated("", 0), "");
+        assert_eq!(clean_truncated("abc", 1), "…");
+    }
+
+    #[test]
+    fn completion_candidates_sanitize_control_chars_and_newlines() {
+        let sessions = vec![
+            json!({"session_id": "s1", "label": "work\x1b[31m\n"}),
+            json!({"session_id": "s2", "label": "\x07\n\t"}),
+            json!({"session_id": "s3", "label": "work [31m"}),
+            json!({"session_id": "s4", "label": "play\r\nbox"}),
+        ];
+        assert_eq!(
+            session_candidates_from(&sessions),
+            vec!["work [31m", "play  box"]
+        );
+
+        let view = json!({
+            "windows": [
+                {
+                    "window_id": "w1",
+                    "label": "build\n\x1b[2J",
+                    "layers": [{
+                        "blocks": [
+                            {"block_id": "b1", "label": "pane\x07\none"},
+                            {"block_id": "b2", "label": "\x1b\n\t"},
+                        ]
+                    }]
+                },
+                {
+                    "window_id": "w2",
+                    "label": "\x07\n",
+                    "layers": [{"blocks": [{"block_id": "b3", "label": "ok"}]}]
+                }
+            ]
+        });
+        assert_eq!(
+            window_candidates_from(&view),
+            vec!["1", "build  [2J", "1.1", "1.2", "2"]
+        );
+        assert_eq!(
+            block_candidates_from(&view, Some("1")),
+            vec!["1", "pane  one", "2"]
+        );
+
+        let mut config = config::Config::default();
+        config
+            .servers
+            .insert("lab\n\x1b[31m".to_owned(), "https://lab.example".to_owned());
+        config
+            .servers
+            .insert("\x07\t\n".to_owned(), "https://empty.example".to_owned());
+        assert_eq!(server_candidates_from(&config, None), vec!["lab  [31m"]);
+
+        assert_eq!(
+            filter_completion_candidates(
+                vec![
+                    "alpha\x1b[31m\n".to_owned(),
+                    "\x07\n".to_owned(),
+                    "alpha [31m".to_owned(),
+                    "beta".to_owned(),
+                ],
+                "al",
+            ),
+            vec!["alpha [31m"]
+        );
     }
 }

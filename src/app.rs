@@ -308,6 +308,12 @@ async fn attach_block(
                             lost = Some(error);
                         }
                     }
+                    Err(error) if write_target_gone(&error) => {
+                        // The block or session already closed on the server;
+                        // wait for the close event or data stream end instead
+                        // of failing the attach loop with an error.
+                        attached.write_queue.clear();
+                    }
                     Err(error) => lost = Some(error),
                 }
             }
@@ -1486,6 +1492,16 @@ fn transient(ctrl: &Control, error: &anyhow::Error) -> bool {
     }
 }
 
+fn write_target_gone(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<proto::ApiError>().is_some_and(|api| {
+        api.status == 404
+            || matches!(
+                api.code.as_str(),
+                "not_found" | "block_not_found" | "session_not_found" | "block_closed"
+            )
+    })
+}
+
 fn data_ended() -> anyhow::Error {
     anyhow::Error::new(StreamClosed {
         code: None,
@@ -1662,9 +1678,11 @@ mod tests {
         Attached, BlockSelection, Ending, Flow, RETRY_FIRST, RETRY_MAX, Replies, Theme, backoff,
         closed_block, detach, finish_write, has_da1_reply, is_detach, parse_theme_reply,
         reports_scheme, split_replies, take_utf8, take_write_chunk, theme_query,
+        write_target_gone,
     };
     use crate::rex::control::Control;
     use crate::rex::data::StreamClosed;
+    use crate::rex::proto::ApiError;
     use base64::Engine as _;
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
@@ -2486,5 +2504,221 @@ mod tests {
         detach(&mut ctrl, &attached).await;
         let writes = server.await.unwrap();
         assert_eq!(writes, vec!["\x1b[200~", "pasted text\x1b[201~"]);
+    }
+
+    #[test]
+    fn detects_write_target_gone_errors() {
+        for (code, status) in [
+            ("unknown", 404),
+            ("not_found", 404),
+            ("not_found", 400),
+            ("block_not_found", 400),
+            ("session_not_found", 400),
+            ("block_closed", 410),
+        ] {
+            let err = anyhow::Error::new(ApiError {
+                code: code.to_owned(),
+                message: "gone".to_owned(),
+                status,
+            });
+            assert!(write_target_gone(&err), "expected gone for {code} {status}");
+        }
+
+        for (code, status) in [("conflict", 409), ("internal", 500), ("forbidden", 403)] {
+            let err = anyhow::Error::new(ApiError {
+                code: code.to_owned(),
+                message: "other".to_owned(),
+                status,
+            });
+            assert!(
+                !write_target_gone(&err),
+                "expected not gone for {code} {status}"
+            );
+        }
+
+        assert!(!write_target_gone(&anyhow::anyhow!(
+            "the control connection ended"
+        )));
+        assert!(!write_target_gone(&anyhow::Error::new(StreamClosed {
+            code: Some(4000),
+            reason: String::new(),
+        })));
+    }
+
+    #[tokio::test]
+    async fn ignores_write_target_gone_until_block_closed_arrives() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (ctrl_tcp, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ctrl_ws = tokio_tungstenite::accept_hdr_async(
+                ctrl_tcp,
+                |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                },
+            )
+            .await
+            .unwrap();
+
+            let _hello = ctrl_ws.next().await.unwrap().unwrap();
+            ctrl_ws
+                .send(Message::Text(
+                    json!({
+                        "type": "welcome",
+                        "api_revision": 8,
+                        "client": {"reconnect_token": "tok-1"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let data_task = tokio::spawn(async move {
+                let (data_tcp, _) = listener.accept().await.unwrap();
+                #[allow(
+                    clippy::result_large_err,
+                    reason = "tungstenite fixes the callback error type"
+                )]
+                let mut data_ws = tokio_tungstenite::accept_hdr_async(
+                    data_tcp,
+                    |req: &Request, mut res: Response| {
+                        if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                            res.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", proto.clone());
+                        }
+                        Ok(res)
+                    },
+                )
+                .await
+                .unwrap();
+                let _hello = data_ws.next().await.unwrap().unwrap();
+                let mut welcome = vec![0u8; 32];
+                welcome[0] = 0x81;
+                welcome[1..17].copy_from_slice(&[9u8; 16]);
+                welcome[24..32].copy_from_slice(&42u64.to_le_bytes());
+                data_ws.send(Message::Binary(welcome.into())).await.unwrap();
+                data_ws
+            });
+
+            while let Some(Ok(Message::Text(text))) = ctrl_ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_str().unwrap_or("");
+                let method = req["method"].as_str().unwrap();
+                if method == "block.event" {
+                    continue;
+                }
+                if method == "com.superlogical.terminal.write" {
+                    ctrl_ws
+                        .send(Message::Text(
+                            json!({
+                                "type": "response",
+                                "id": id,
+                                "error": {
+                                    "code": "block_not_found",
+                                    "message": "block already closed",
+                                    "status": 404
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    ctrl_ws
+                        .send(Message::Text(
+                            json!({
+                                "type": "event",
+                                "payload": {
+                                    "type": "session_event",
+                                    "payload": {
+                                        "session_id": "session:1",
+                                        "event": {
+                                            "type": "block_closed",
+                                            "payload": {"block_id": "block:1"}
+                                        }
+                                    }
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    break;
+                }
+                let result = match method {
+                    "session.bootstrap" => json!({
+                        "client_id": "client:1",
+                        "selected_session": {
+                            "view": {
+                                "label": "work",
+                                "active_window_id": "window:1",
+                                "windows": [{
+                                    "window_id": "window:1",
+                                    "focused_block_id": "block:1",
+                                    "active_layer_id": "layer:1",
+                                    "layers": [{
+                                        "id": "layer:1",
+                                        "focused_block_id": "block:1",
+                                        "root": {"type": "block", "block_id": "block:1"}
+                                    }]
+                                }]
+                            }
+                        }
+                    }),
+                    "data.connect" => json!({
+                        "ticket": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16])
+                    }),
+                    _ => json!({}),
+                };
+                ctrl_ws
+                    .send(Message::Text(
+                        json!({"type": "response", "id": id, "payload": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let _data_ws = data_task.await.unwrap();
+        });
+
+        let address = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, mut events) = Control::connect(&address, None).await.unwrap();
+        let mut attached = Attached::start(
+            &mut ctrl,
+            "session:1",
+            &address,
+            BlockSelection::Selectors(None, None),
+            (80, 24),
+            Theme::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        attached.burst(b"a", &mut in_rx, &mut ctrl).await.unwrap();
+        attached.write_queue.push_str("queued");
+
+        let err = finish_write(&mut attached.write_inflight).await.unwrap_err();
+        assert!(write_target_gone(&err));
+        attached.write_queue.clear();
+        assert!(attached.write_queue.is_empty());
+
+        let (name, payload) = events.recv().await.unwrap();
+        let ending = attached.event(&name, &payload, &mut ctrl).await.unwrap();
+        assert!(matches!(ending, Some(Ending::Block)));
+
+        server.await.unwrap();
     }
 }

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::os::unix::fs::FileTypeExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -10,7 +13,10 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::proto::{self, Incoming};
-use super::{CONNECT_TIME, ServerAddress, frame};
+use super::{
+    CONNECT_TIME, DEFAULT_LOOPBACK_ADDR, LOCAL_PROBE_TIME, ServerAddress, Socket, format_timeout,
+    frame_with_timeout, local_socket_candidates,
+};
 
 pub const SUBPROTOCOL: &str = "rex.control.v1";
 
@@ -40,19 +46,71 @@ impl Control {
         server: &ServerAddress,
         reconnect_token: Option<&str>,
     ) -> Result<(Self, Events)> {
-        let mut socket = server.open("/api/control", SUBPROTOCOL).await?;
+        let socket = server.open("/api/control", SUBPROTOCOL).await?;
+        Self::handshake(socket, reconnect_token, CONNECT_TIME).await
+    }
 
+    pub async fn connect_once(
+        server: &ServerAddress,
+        reconnect_token: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(Self, Events)> {
+        let socket = server
+            .endpoint("/api/control")
+            .open_once(SUBPROTOCOL, timeout)
+            .await?;
+        Self::handshake(socket, reconnect_token, timeout).await
+    }
+
+    pub async fn connect_local_if_running(
+        exclude: &[ServerAddress],
+    ) -> Option<(ServerAddress, Self, Events)> {
+        Self::connect_local_in(local_socket_candidates(), DEFAULT_LOOPBACK_ADDR, exclude).await
+    }
+
+    pub(super) async fn connect_local_in(
+        candidates: impl IntoIterator<Item = PathBuf>,
+        loopback: &str,
+        exclude: &[ServerAddress],
+    ) -> Option<(ServerAddress, Self, Events)> {
+        for path in candidates {
+            if !path.metadata().is_ok_and(|m| m.file_type().is_socket()) {
+                continue;
+            }
+            let address = ServerAddress::Unix(path);
+            if exclude.contains(&address) {
+                // This local socket is already configured explicitly; do not
+                // fall through to loopback TCP and risk listing the same local
+                // server twice.
+                return None;
+            }
+            if let Ok((ctrl, events)) =
+                Self::connect_once(&address, None, LOCAL_PROBE_TIME).await
+            {
+                return Some((address, ctrl, events));
+            }
+        }
+        let loopback = ServerAddress::Network(format!("ws://{loopback}"));
+        if !exclude.contains(&loopback)
+            && let Ok((ctrl, events)) =
+                Self::connect_once(&loopback, None, LOCAL_PROBE_TIME).await
+        {
+            return Some((loopback, ctrl, events));
+        }
+        None
+    }
+
+    async fn handshake(
+        mut socket: Socket,
+        reconnect_token: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(Self, Events)> {
         let hello = serde_json::to_string(&proto::hello(reconnect_token))?;
-        tokio::time::timeout(CONNECT_TIME, socket.send(Message::text(hello)))
+        tokio::time::timeout(timeout, socket.send(Message::text(hello)))
             .await
-            .map_err(|_| {
-                anyhow!(
-                    "the server took no hello within {}s",
-                    CONNECT_TIME.as_secs()
-                )
-            })??;
+            .map_err(|_| anyhow!("the server took no hello within {}", format_timeout(timeout)))??;
 
-        let Some(message) = frame(&mut socket, "a welcome").await? else {
+        let Some(message) = frame_with_timeout(&mut socket, "a welcome", timeout).await? else {
             bail!("the server closed the connection before the welcome");
         };
         let text = match message {
@@ -355,5 +413,60 @@ mod tests {
 
         let reply = ctrl.call("server.version", Value::Null).await.unwrap();
         assert_eq!(reply["version"], "1.0");
+    }
+
+    #[tokio::test]
+    async fn connect_once_connects_and_rejects_unreachable_without_retrying() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                    res.headers_mut()
+                        .insert("Sec-WebSocket-Protocol", proto.clone());
+                }
+                Ok(res)
+            })
+            .await
+            .unwrap();
+
+            let Some(Ok(Message::Text(_))) = ws.next().await else {
+                panic!("expected hello");
+            };
+            ws.send(Message::text(
+                json!({
+                    "type": "welcome",
+                    "api_revision": proto::API_REVISION,
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            // Keep socket open until client drops.
+            let _ = ws.next().await;
+        });
+
+        let server: ServerAddress = format!("http://{addr}").parse().unwrap();
+        let (ctrl, _events) = Control::connect_once(&server, None, Duration::from_secs(1))
+            .await
+            .unwrap();
+        drop(ctrl);
+
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr: ServerAddress = format!("http://{}", dead.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        drop(dead);
+        assert!(
+            Control::connect_once(&dead_addr, None, Duration::from_millis(200))
+                .await
+                .is_err()
+        );
     }
 }
