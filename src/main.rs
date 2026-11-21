@@ -53,7 +53,8 @@ fuzzy-searches existing sessions, windows, and splits on the default (when
 running) and saved servers (~/.config/zrex/config.toml, or
 $XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that server.
 Enter attaches, Ctrl-N creates a new session, Ctrl-T creates a new window in a
-session, and Esc cancels.
+session, Ctrl-R renames a session, window, or block, Ctrl-K kills a session,
+window, or block, and Esc cancels.
 
 While attached:
   Ctrl-backslash          detach, and leave the session running

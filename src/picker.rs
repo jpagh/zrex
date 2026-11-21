@@ -2,15 +2,15 @@ mod prompt;
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{StreamExt, future::join_all, stream::FuturesUnordered};
 use serde_json::{Value, json};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Duration, Instant, timeout_at};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app;
 use crate::config::{self, DISCOVERY_TIME, Server, ServerConfig};
-use crate::rex::{ServerAddress, control::Control};
+use crate::rex::{ServerAddress, control::Control, proto::ApiError};
 use crate::session::{self, PendingCall};
 use crate::{clean_one_line, clean_truncated};
 
@@ -59,17 +59,71 @@ pub(super) fn styled_server_row(server_name: &str, columns: usize) -> Vec<Styled
     styled_label(&format!("[{server_name}]"), columns)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ManageTarget {
+    Session {
+        server_index: usize,
+        session_id: String,
+    },
+    Window {
+        server_index: usize,
+        session_id: String,
+        window_id: String,
+    },
+    Block {
+        server_index: usize,
+        session_id: String,
+        block_id: String,
+    },
+}
+
+impl ManageTarget {
+    pub(super) fn server_index(&self) -> usize {
+        match self {
+            Self::Session { server_index, .. }
+            | Self::Window { server_index, .. }
+            | Self::Block { server_index, .. } => *server_index,
+        }
+    }
+
+    pub(super) fn session_id(&self) -> &str {
+        match self {
+            Self::Session { session_id, .. }
+            | Self::Window { session_id, .. }
+            | Self::Block { session_id, .. } => session_id,
+        }
+    }
+
+    pub(super) fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Session { .. } => "session",
+            Self::Window { .. } => "window",
+            Self::Block { .. } => "block",
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct Target {
     pub(super) server_index: usize,
     pub(super) session_index: usize,
+    pub(super) window_id: String,
+    pub(super) window_number: usize,
+    pub(super) window_label: Option<String>,
+    pub(super) window_block_count: usize,
+    pub(super) block_id: String,
+    pub(super) block_number: usize,
+    pub(super) block_label: Option<String>,
+    pub(super) block_raw_label: String,
+    pub(super) process: Option<String>,
     label: String,
     label_parts: TargetLabel,
     title: String,
     status: Option<ProgramStatus>,
-    session_id: String,
-    block_id: String,
+    pub(super) session_id: String,
 }
 
+#[derive(Clone)]
 struct TargetLabel {
     prefix: String,
     window: Option<String>,
@@ -117,17 +171,102 @@ struct ServerDiscovery {
     missing_views: usize,
 }
 
+impl DiscoveryOutcome {
+    fn replace_server(
+        &mut self,
+        server_index: usize,
+        discovery: ServerDiscovery,
+    ) -> Option<String> {
+        let server_name = clean_one_line(&self.servers[server_index].name);
+        let warning = (discovery.missing_views > 0).then(|| {
+            format!(
+                "{server_name}: could not list windows for {} session(s)",
+                discovery.missing_views
+            )
+        });
+
+        let old_sessions = std::mem::take(&mut self.sessions);
+        let old_choices = std::mem::take(&mut self.choices);
+        let mut new_sessions = Vec::with_capacity(old_sessions.len() + discovery.sessions.len());
+        let mut new_choices = Vec::with_capacity(old_choices.len() + discovery.targets.len());
+
+        let mut old_session_map: Vec<Option<usize>> = vec![None; old_sessions.len()];
+        let mut replacement_session_offset = None;
+        for (old_idx, session) in old_sessions.into_iter().enumerate() {
+            if session.server_index == server_index {
+                continue;
+            }
+            if replacement_session_offset.is_none() && session.server_index > server_index {
+                replacement_session_offset = Some(new_sessions.len());
+                for (session_id, label) in &discovery.sessions {
+                    new_sessions.push(SessionChoice {
+                        server_index,
+                        server_name: server_name.clone(),
+                        session_id: session_id.clone(),
+                        label: label.clone(),
+                    });
+                }
+            }
+            old_session_map[old_idx] = Some(new_sessions.len());
+            new_sessions.push(session);
+        }
+        let replacement_session_offset = replacement_session_offset.unwrap_or_else(|| {
+            let offset = new_sessions.len();
+            for (session_id, label) in discovery.sessions {
+                new_sessions.push(SessionChoice {
+                    server_index,
+                    server_name: server_name.clone(),
+                    session_id,
+                    label,
+                });
+            }
+            offset
+        });
+
+        let mut inserted_targets = false;
+        let mut replacement_targets = discovery.targets;
+        for mut target in old_choices {
+            if target.server_index == server_index {
+                continue;
+            }
+            if !inserted_targets && target.server_index > server_index {
+                for mut replacement in std::mem::take(&mut replacement_targets) {
+                    replacement.server_index = server_index;
+                    replacement.session_index += replacement_session_offset;
+                    new_choices.push(replacement);
+                }
+                inserted_targets = true;
+            }
+            if let Some(mapped) = old_session_map.get(target.session_index).copied().flatten() {
+                target.session_index = mapped;
+                new_choices.push(target);
+            }
+        }
+        if !inserted_targets {
+            for mut replacement in replacement_targets {
+                replacement.server_index = server_index;
+                replacement.session_index += replacement_session_offset;
+                new_choices.push(replacement);
+            }
+        }
+
+        self.sessions = new_sessions;
+        self.choices = new_choices;
+        warning
+    }
+}
+
 pub async fn run(server_config: &ServerConfig) -> Result<()> {
     app::ensure_terminal()?;
     let (servers, discover_local) = load_servers(server_config).await?;
     let deadline = Instant::now() + DISCOVERY_TIME;
-    let outcome = discover_all(
+    let mut outcome = discover_all(
         servers,
         discover_local.then(ServerAddress::local_if_running),
         deadline,
     )
     .await;
-    for warning in outcome.warnings {
+    for warning in outcome.warnings.drain(..) {
         eprintln!("zrex pick: {warning}");
     }
     if outcome.servers.is_empty() {
@@ -139,30 +278,252 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
         .iter()
         .map(|server| clean_one_line(&server.name))
         .collect();
-    match prompt::select(&outcome.choices, &outcome.sessions, &server_names)? {
-        Some(prompt::Selection::Attach(index)) => {
-            let target = &outcome.choices[index];
-            let server = &outcome.servers[target.server_index];
-            app::attach_existing(&server.address, &target.session_id, &target.block_id).await?;
+
+    let mut screen = prompt::Screen::enter()?;
+    let mut state = prompt::PickerState::new(
+        outcome.choices.clone(),
+        outcome.sessions.clone(),
+        server_names,
+    );
+
+    loop {
+        match screen.step(&mut state)? {
+            None => return Ok(()),
+            Some(prompt::Selection::Attach(index)) => {
+                let target = outcome.choices[index].clone();
+                let server = &outcome.servers[target.server_index];
+                drop(screen);
+                return app::attach_existing(&server.address, &target.session_id, &target.block_id)
+                    .await;
+            }
+            Some(prompt::Selection::NewSession {
+                server_index,
+                label,
+            }) => {
+                let server = &outcome.servers[server_index];
+                drop(screen);
+                return app::attach_new_session(&server.address, label.as_deref()).await;
+            }
+            Some(prompt::Selection::NewWindow {
+                session_index,
+                label,
+            }) => {
+                let session = outcome.sessions[session_index].clone();
+                let server = &outcome.servers[session.server_index];
+                drop(screen);
+                return app::attach_new_window(
+                    &server.address,
+                    &session.session_id,
+                    label.as_deref(),
+                )
+                .await;
+            }
+            Some(prompt::Selection::Rename { target, label }) => {
+                let kind = target.kind_name();
+                screen.render_busy(&mut state, &format!("Renaming {kind}…"))?;
+                let server_index = target.server_index();
+                let applied = apply_manage(
+                    &outcome.servers[server_index],
+                    ManageOp::Rename {
+                        target: &target,
+                        label: &label,
+                    },
+                    Instant::now() + DISCOVERY_TIME,
+                    DISCOVERY_TIME,
+                )
+                .await;
+                let ok_msg = if label.is_empty() {
+                    format!("Reset {kind} name to default")
+                } else {
+                    format!("Renamed {kind} to {}", clean_one_line(&label))
+                };
+                let feedback = finish_manage(
+                    &mut outcome,
+                    server_index,
+                    applied,
+                    ok_msg,
+                    &format!("Rename {kind} failed"),
+                );
+                state.refresh(outcome.choices.clone(), outcome.sessions.clone(), feedback);
+            }
+            Some(prompt::Selection::Kill { target }) => {
+                let kind = target.kind_name();
+                let verb = if matches!(target, ManageTarget::Session { .. }) {
+                    "Destroying"
+                } else {
+                    "Closing"
+                };
+                screen.render_busy(&mut state, &format!("{verb} {kind}…"))?;
+                let server_index = target.server_index();
+                let applied = apply_manage(
+                    &outcome.servers[server_index],
+                    ManageOp::Kill { target: &target },
+                    Instant::now() + DISCOVERY_TIME,
+                    DISCOVERY_TIME,
+                )
+                .await;
+                let ok_msg = if matches!(target, ManageTarget::Session { .. }) {
+                    "Destroyed session".to_owned()
+                } else {
+                    format!("Closed {kind}")
+                };
+                let feedback = finish_manage(
+                    &mut outcome,
+                    server_index,
+                    applied,
+                    ok_msg,
+                    &format!("Kill {kind} failed"),
+                );
+                state.refresh(outcome.choices.clone(), outcome.sessions.clone(), feedback);
+            }
         }
-        Some(prompt::Selection::NewSession {
-            server_index,
-            label,
-        }) => {
-            let server = &outcome.servers[server_index];
-            app::attach_new_session(&server.address, label.as_deref()).await?;
-        }
-        Some(prompt::Selection::NewWindow {
-            session_index,
-            label,
-        }) => {
-            let session = &outcome.sessions[session_index];
-            let server = &outcome.servers[session.server_index];
-            app::attach_new_window(&server.address, &session.session_id, label.as_deref()).await?;
-        }
-        None => {}
     }
-    Ok(())
+}
+
+enum ManageOp<'a> {
+    Rename {
+        target: &'a ManageTarget,
+        label: &'a str,
+    },
+    Kill {
+        target: &'a ManageTarget,
+    },
+}
+
+struct ManageOutcome {
+    result: Result<()>,
+    refreshed: Option<Result<ServerDiscovery>>,
+}
+
+async fn apply_manage(
+    server: &Server,
+    op: ManageOp<'_>,
+    op_deadline: Instant,
+    refresh_timeout: Duration,
+) -> ManageOutcome {
+    let mut ctrl = match timeout_at(op_deadline, Control::connect(&server.address, None)).await {
+        Ok(Ok((ctrl, _events))) => ctrl,
+        Ok(Err(error)) => {
+            return ManageOutcome {
+                result: Err(error),
+                refreshed: None,
+            };
+        }
+        Err(_) => {
+            return ManageOutcome {
+                result: Err(anyhow!("operation timed out")),
+                refreshed: None,
+            };
+        }
+    };
+
+    let result = timeout_at(op_deadline, async {
+        match op {
+            ManageOp::Rename { target, label } => {
+                ctrl.call("session.attach", json!({"session_id": target.session_id()}))
+                    .await?;
+                match target {
+                    ManageTarget::Session { session_id, .. } => {
+                        session::set_label(&mut ctrl, session_id, label).await
+                    }
+                    ManageTarget::Window {
+                        session_id,
+                        window_id,
+                        ..
+                    } => session::set_window_label(&mut ctrl, session_id, window_id, label).await,
+                    ManageTarget::Block {
+                        session_id,
+                        block_id,
+                        ..
+                    } => session::set_block_label(&mut ctrl, session_id, block_id, label).await,
+                }
+            }
+            ManageOp::Kill { target } => match target {
+                ManageTarget::Session { session_id, .. } => {
+                    session::destroy(&mut ctrl, session_id).await
+                }
+                ManageTarget::Window {
+                    session_id,
+                    window_id,
+                    ..
+                } => {
+                    ctrl.call("session.attach", json!({"session_id": session_id}))
+                        .await?;
+                    session::close_window(&mut ctrl, session_id, window_id).await
+                }
+                ManageTarget::Block {
+                    session_id,
+                    block_id,
+                    ..
+                } => {
+                    ctrl.call("session.attach", json!({"session_id": session_id}))
+                        .await?;
+                    session::close_block(&mut ctrl, session_id, block_id).await
+                }
+            },
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("operation timed out"))
+    .and_then(|inner| inner);
+
+    let should_refresh = match &result {
+        Ok(()) => true,
+        Err(error) => error.downcast_ref::<ApiError>().is_some_and(|api| {
+            matches!(
+                api.code.as_str(),
+                "not_found" | "session_not_found" | "conflict"
+            )
+        }),
+    };
+    let refreshed = if should_refresh {
+        Some(discover_with_control(&mut ctrl, server, Instant::now() + refresh_timeout).await)
+    } else {
+        None
+    };
+
+    ManageOutcome { result, refreshed }
+}
+
+fn finish_manage(
+    outcome: &mut DiscoveryOutcome,
+    server_index: usize,
+    applied: ManageOutcome,
+    ok_message: String,
+    err_prefix: &str,
+) -> prompt::Feedback {
+    let mut refresh_note = None;
+    if let Some(refreshed) = applied.refreshed {
+        match refreshed {
+            Ok(discovery) => {
+                if let Some(warning) = outcome.replace_server(server_index, discovery) {
+                    refresh_note = Some(warning);
+                }
+            }
+            Err(error) => {
+                refresh_note = Some(format!(
+                    "refresh failed: {}",
+                    clean_one_line(&format!("{error:#}"))
+                ));
+            }
+        }
+    }
+    match applied.result {
+        Ok(()) => {
+            let text = match refresh_note {
+                Some(note) => format!("{ok_message} ({note})"),
+                None => ok_message,
+            };
+            prompt::Feedback {
+                text,
+                is_error: false,
+            }
+        }
+        Err(error) => prompt::Feedback {
+            text: format!("{err_prefix}: {}", clean_one_line(&format!("{error:#}"))),
+            is_error: true,
+        },
+    }
 }
 
 async fn discover_all<F>(
@@ -319,13 +680,20 @@ where
 }
 
 async fn discover_until(server: &Server, deadline: Instant) -> Result<ServerDiscovery> {
-    let (mut ctrl, entries) = timeout_at(deadline, async {
-        let (mut ctrl, _events) = Control::connect(&server.address, None).await?;
-        let entries = session::list_all(&mut ctrl).await?;
-        Ok::<_, anyhow::Error>((ctrl, entries))
-    })
-    .await
-    .context("discovery timed out")??;
+    let (mut ctrl, _events) = timeout_at(deadline, Control::connect(&server.address, None))
+        .await
+        .context("discovery timed out")??;
+    discover_with_control(&mut ctrl, server, deadline).await
+}
+
+async fn discover_with_control(
+    ctrl: &mut Control,
+    server: &Server,
+    deadline: Instant,
+) -> Result<ServerDiscovery> {
+    let entries = timeout_at(deadline, session::list_all(ctrl))
+        .await
+        .context("discovery timed out")??;
 
     // Send all view requests before waiting, so one slow session does not
     // prevent other sessions on the same server from appearing.
@@ -339,7 +707,7 @@ async fn discover_until(server: &Server, deadline: Instant) -> Result<ServerDisc
         let session_index = sessions.len();
         let session_label = label_or_id(session::label_of(entry), &id);
         sessions.push((id.clone(), session_label.clone()));
-        let reply = session::start_view(&mut ctrl, &id);
+        let reply = session::start_view(ctrl, &id);
         let server_name = server.name.clone();
         views.push(async move {
             let view = optional_reply(deadline, reply).await?;
@@ -355,7 +723,7 @@ async fn discover_until(server: &Server, deadline: Instant) -> Result<ServerDisc
         if let Some((index, targets)) = view {
             // Start metadata queries as soon as this session's view arrives,
             // without waiting for other views or extending the server deadline.
-            pending.push(describe_targets(&mut ctrl, deadline, index, targets));
+            pending.push(describe_targets(ctrl, deadline, index, targets));
         } else {
             missing_views += 1;
         }
@@ -419,6 +787,7 @@ fn describe_targets(
         for target in &mut targets {
             if let Some((title, status, process)) = details.get(&target.block_id) {
                 target.label = target.label_parts.format(process.as_deref());
+                target.process.clone_from(process);
                 target.title.clone_from(title);
                 target.status.clone_from(status);
             }
@@ -577,11 +946,17 @@ fn is_default_window_label(label: &str) -> bool {
 
 fn custom_block_label(label: &str) -> Option<String> {
     let clean = clean_one_line(label);
-    if clean.is_empty() || clean.eq_ignore_ascii_case("shell") {
+    if clean.is_empty() || clean.eq_ignore_ascii_case("shell") || is_default_block_label(&clean) {
         None
     } else {
         Some(clean)
     }
+}
+
+fn is_default_block_label(label: &str) -> bool {
+    label
+        .strip_prefix("Block ")
+        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn targets(
@@ -593,60 +968,80 @@ fn targets(
 ) -> Vec<Target> {
     let session = format!("[{}] {}", clean_one_line(server), session_label);
     let mut targets = Vec::new();
-    let mut add = |label_parts: TargetLabel, block_id: &str| {
-        let label = label_parts.format(None);
-        targets.push(Target {
-            server_index: 0,
-            session_index,
-            label,
-            label_parts,
-            title: String::new(),
-            status: None,
-            session_id: session_id.to_owned(),
-            block_id: block_id.to_owned(),
-        });
-    };
     let windows = session::windows(view);
     for (index, window) in windows.iter().enumerate() {
         let number = index + 1;
         let window_label = custom_window_label(&window.label);
         if window.blocks.len() > 1 {
+            let block_count = window.blocks.len();
             for (split_index, block) in window.blocks.iter().enumerate() {
                 let fallback = label_or_id(&block.label, &block.id);
-                add(
-                    TargetLabel {
-                        prefix: format!("{session} / {number}.{}", split_index + 1),
-                        window: window_label.clone(),
-                        block: custom_block_label(&block.label),
-                        fallback,
-                    },
-                    &block.id,
-                );
+                let block_label = custom_block_label(&block.label);
+                let label_parts = TargetLabel {
+                    prefix: format!("{session} / {number}.{}", split_index + 1),
+                    window: window_label.clone(),
+                    block: block_label.clone(),
+                    fallback,
+                };
+                let label = label_parts.format(None);
+                targets.push(Target {
+                    server_index: 0,
+                    session_index,
+                    window_id: window.id.clone(),
+                    window_number: number,
+                    window_label: window_label.clone(),
+                    window_block_count: block_count,
+                    block_id: block.id.clone(),
+                    block_number: split_index + 1,
+                    block_label,
+                    block_raw_label: clean_one_line(&block.label),
+                    process: None,
+                    label,
+                    label_parts,
+                    title: String::new(),
+                    status: None,
+                    session_id: session_id.to_owned(),
+                });
             }
         } else if let Some(block_id) = window.active_or_first_block_id() {
-            let block_label = window
+            let block_label_str = window
                 .blocks
                 .iter()
                 .find(|block| block.id == block_id)
                 .map(|block| block.label.as_str())
                 .unwrap_or_default();
-            let fallback = {
-                let clean = clean_one_line(block_label);
-                if clean.is_empty() {
-                    label_or_id(&window.label, &window.id)
-                } else {
-                    clean
-                }
+            let block_raw_label = clean_one_line(block_label_str);
+            let fallback = if block_raw_label.is_empty() {
+                label_or_id(&window.label, &window.id)
+            } else {
+                block_raw_label.clone()
             };
-            add(
-                TargetLabel {
-                    prefix: format!("{session} / {number}"),
-                    window: window_label,
-                    block: custom_block_label(block_label),
-                    fallback,
-                },
-                block_id,
-            );
+            let block_label = custom_block_label(block_label_str);
+            let label_parts = TargetLabel {
+                prefix: format!("{session} / {number}"),
+                window: window_label.clone(),
+                block: block_label.clone(),
+                fallback,
+            };
+            let label = label_parts.format(None);
+            targets.push(Target {
+                server_index: 0,
+                session_index,
+                window_id: window.id.clone(),
+                window_number: number,
+                window_label,
+                window_block_count: 1,
+                block_id: block_id.to_owned(),
+                block_number: 1,
+                block_label,
+                block_raw_label,
+                process: None,
+                label,
+                label_parts,
+                title: String::new(),
+                status: None,
+                session_id: session_id.to_owned(),
+            });
         }
     }
     targets
@@ -872,6 +1267,91 @@ fn push_label_spans(
     }
 }
 
+pub(super) fn styled_scope_row(
+    tag: &str,
+    target: &str,
+    detail: &str,
+    columns: usize,
+) -> Vec<StyledSpan> {
+    if columns == 0 {
+        return Vec::new();
+    }
+    let ellipsis_width = '…'.width().unwrap_or(1);
+    let mut spans = Vec::new();
+    let tag_width = tag.width();
+    if tag_width >= columns {
+        let visible = prefix_to_columns(tag, columns.saturating_sub(ellipsis_width));
+        if !visible.is_empty() {
+            spans.push(StyledSpan {
+                role: StyleRole::Title,
+                text: visible,
+                search_offset: None,
+            });
+        }
+        if columns >= ellipsis_width {
+            spans.push(StyledSpan {
+                role: StyleRole::Title,
+                text: "…".to_owned(),
+                search_offset: None,
+            });
+        }
+        return spans;
+    }
+
+    spans.push(StyledSpan {
+        role: StyleRole::Title,
+        text: tag.to_owned(),
+        search_offset: None,
+    });
+    let remaining = columns - tag_width;
+
+    if detail.is_empty() {
+        let (visible, truncated) = if target.width() <= remaining {
+            (target.to_owned(), false)
+        } else {
+            (
+                prefix_to_columns(target, remaining.saturating_sub(ellipsis_width)),
+                true,
+            )
+        };
+        push_label_spans(&mut spans, &visible, 0, truncated);
+        return spans;
+    }
+
+    let target_width = target.width();
+    let detail_width = detail.width();
+    if target_width + 1 + detail_width <= remaining {
+        push_label_spans(&mut spans, target, 0, false);
+        spans.push(StyledSpan {
+            role: StyleRole::Title,
+            text: format!(" {detail}"),
+            search_offset: None,
+        });
+    } else if target_width + 1 + ellipsis_width < remaining {
+        push_label_spans(&mut spans, target, 0, false);
+        let detail_budget = remaining - target_width - 1;
+        let visible = prefix_to_columns(detail, detail_budget.saturating_sub(ellipsis_width));
+        if !visible.is_empty() {
+            spans.push(StyledSpan {
+                role: StyleRole::Title,
+                text: format!(" {visible}…"),
+                search_offset: None,
+            });
+        }
+    } else {
+        let (visible, truncated) = if target_width <= remaining {
+            (target.to_owned(), false)
+        } else {
+            (
+                prefix_to_columns(target, remaining.saturating_sub(ellipsis_width)),
+                true,
+            )
+        };
+        push_label_spans(&mut spans, &visible, 0, truncated);
+    }
+    spans
+}
+
 fn styled_label(text: &str, columns: usize) -> Vec<StyledSpan> {
     if columns == 0 || text.is_empty() {
         return Vec::new();
@@ -921,20 +1401,62 @@ pub(super) fn test_target(
     session_id: &str,
     block_id: &str,
 ) -> Target {
+    test_target_full(
+        server_index,
+        session_index,
+        label,
+        session_id,
+        "window:1",
+        1,
+        None,
+        1,
+        block_id,
+        1,
+        None,
+        "shell",
+        None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn test_target_full(
+    server_index: usize,
+    session_index: usize,
+    label: &str,
+    session_id: &str,
+    window_id: &str,
+    window_number: usize,
+    window_label: Option<&str>,
+    window_block_count: usize,
+    block_id: &str,
+    block_number: usize,
+    block_label: Option<&str>,
+    block_raw_label: &str,
+    process: Option<&str>,
+) -> Target {
     Target {
         server_index,
         session_index,
+        window_id: window_id.to_owned(),
+        window_number,
+        window_label: window_label.map(str::to_owned),
+        window_block_count,
+        block_id: block_id.to_owned(),
+        block_number,
+        block_label: block_label.map(str::to_owned),
+        block_raw_label: block_raw_label.to_owned(),
+        process: process.map(str::to_owned),
         label: label.to_owned(),
         label_parts: TargetLabel {
             prefix: label.to_owned(),
-            window: None,
-            block: None,
+            window: window_label.map(str::to_owned),
+            block: block_label.map(str::to_owned),
             fallback: String::new(),
         },
         title: String::new(),
         status: None,
         session_id: session_id.to_owned(),
-        block_id: block_id.to_owned(),
     }
 }
 
@@ -955,6 +1477,15 @@ mod tests {
         Target {
             server_index: 0,
             session_index: 0,
+            window_id: "window:1".to_owned(),
+            window_number: 1,
+            window_label: None,
+            window_block_count: 1,
+            block_id: "block:1".to_owned(),
+            block_number: 1,
+            block_label: None,
+            block_raw_label: "shell".to_owned(),
+            process: None,
             label: label.to_owned(),
             label_parts: TargetLabel {
                 prefix: label.to_owned(),
@@ -965,7 +1496,6 @@ mod tests {
             title: title.to_owned(),
             status,
             session_id: "session:1".to_owned(),
-            block_id: "block:1".to_owned(),
         }
     }
 
@@ -1452,5 +1982,397 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["REX_SERVER", "mac", "office"]
         );
+    }
+
+    #[test]
+    fn custom_block_label_hides_default_shell_and_block_id_labels() {
+        assert_eq!(custom_block_label("shell"), None);
+        assert_eq!(custom_block_label("SHELL"), None);
+        assert_eq!(custom_block_label("Block 89abcdef"), None);
+        assert_eq!(custom_block_label("Block 1234ABCD"), None);
+        assert_eq!(
+            custom_block_label("Block short"),
+            Some("Block short".to_owned())
+        );
+        assert_eq!(custom_block_label("editor"), Some("editor".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn apply_manage_renames_and_kills_and_refreshes_server_in_place() {
+        use std::sync::{Arc, Mutex};
+
+        use futures_util::SinkExt;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        #[derive(Clone)]
+        struct FakeState {
+            session_label: String,
+            window_label: String,
+            block_label: String,
+            has_block2: bool,
+            has_window: bool,
+            has_session: bool,
+            calls: Vec<String>,
+        }
+
+        let state = Arc::new(Mutex::new(FakeState {
+            session_label: "work".to_owned(),
+            window_label: "dev".to_owned(),
+            block_label: "editor".to_owned(),
+            has_block2: true,
+            has_window: true,
+            has_session: true,
+            calls: Vec::new(),
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let st = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    #[allow(
+                        clippy::result_large_err,
+                        reason = "tungstenite fixes the callback error type"
+                    )]
+                    let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                        if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                            res.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", proto.clone());
+                        }
+                        Ok(res)
+                    })
+                    .await
+                    .unwrap();
+
+                    let _ = ws.next().await;
+                    ws.send(Message::text(
+                        json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let req: Value = serde_json::from_str(&text).unwrap();
+                        let id = req["id"].as_str().unwrap();
+                        let method = req["method"].as_str().unwrap();
+                        let payload = {
+                            let mut s = st.lock().unwrap();
+                            s.calls.push(method.to_owned());
+                            match method {
+                                "session.attach" => json!({"session_id": "session:1"}),
+                                "session.set_label" => {
+                                    s.session_label =
+                                        req["payload"]["label"].as_str().unwrap().to_owned();
+                                    json!({"revision": 1})
+                                }
+                                "session.set_window_label" => {
+                                    s.window_label =
+                                        req["payload"]["label"].as_str().unwrap().to_owned();
+                                    json!({"revision": 2})
+                                }
+                                "session.set_block_label" => {
+                                    s.block_label =
+                                        req["payload"]["label"].as_str().unwrap().to_owned();
+                                    json!({"revision": 3})
+                                }
+                                "block.close" => {
+                                    assert_eq!(req["payload"]["block_id"], "block:2");
+                                    s.has_block2 = false;
+                                    json!({"block_id": "block:2", "revision": 4})
+                                }
+                                "session.close_window" => {
+                                    assert_eq!(req["payload"]["window_id"], "window:1");
+                                    s.has_window = false;
+                                    json!({"revision": 5})
+                                }
+                                "session.destroy" => {
+                                    assert_eq!(req["payload"]["session_id"], "session:1");
+                                    s.has_session = false;
+                                    json!({})
+                                }
+                                "session.attach_all" => {
+                                    if s.has_session {
+                                        json!({"sessions": [{"session_id": "session:1", "label": s.session_label}]})
+                                    } else {
+                                        json!({"sessions": []})
+                                    }
+                                }
+                                "session.view" => {
+                                    if s.has_window {
+                                        let mut blocks = vec![
+                                            json!({"block_id": "block:1", "label": s.block_label}),
+                                        ];
+                                        if s.has_block2 {
+                                            blocks.push(
+                                                json!({"block_id": "block:2", "label": "shell"}),
+                                            );
+                                        }
+                                        json!({
+                                            "active_window_id": "window:1",
+                                            "windows": [{
+                                                "window_id": "window:1",
+                                                "label": s.window_label,
+                                                "focused_block_id": "block:1",
+                                                "layers": [{"blocks": blocks}]
+                                            }]
+                                        })
+                                    } else {
+                                        json!({"windows": []})
+                                    }
+                                }
+                                "com.superlogical.terminal.title" => json!({"title": ""}),
+                                "com.superlogical.terminal.program_status" => {
+                                    json!({"records": []})
+                                }
+                                "com.superlogical.terminal.process" => {
+                                    json!({"foreground": null, "child": null})
+                                }
+                                other => panic!("unexpected method {other}"),
+                            }
+                        };
+                        ws.send(Message::text(
+                            json!({"type": "response", "id": id, "seq": 0, "payload": payload})
+                                .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                });
+            }
+        });
+
+        let server = Server {
+            name: "office".to_owned(),
+            address: format!("http://{addr}").parse().unwrap(),
+        };
+        let other_server = Server {
+            name: "other".to_owned(),
+            address: "http://127.0.0.1:1".parse().unwrap(),
+        };
+        let initial = discover_until(&server, Instant::now() + DISCOVERY_TIME)
+            .await
+            .unwrap();
+        let mut outcome = DiscoveryOutcome {
+            servers: vec![
+                Server {
+                    name: server.name.clone(),
+                    address: format!("http://{addr}").parse().unwrap(),
+                },
+                other_server,
+            ],
+            sessions: vec![
+                SessionChoice {
+                    server_index: 0,
+                    server_name: "office".to_owned(),
+                    session_id: "session:1".to_owned(),
+                    label: "work".to_owned(),
+                },
+                SessionChoice {
+                    server_index: 1,
+                    server_name: "other".to_owned(),
+                    session_id: "session:other".to_owned(),
+                    label: "keep".to_owned(),
+                },
+            ],
+            choices: {
+                let mut c = initial.targets;
+                c.push(test_target(
+                    1,
+                    1,
+                    "[other] keep / 1 zsh",
+                    "session:other",
+                    "block:other",
+                ));
+                c
+            },
+            warnings: Vec::new(),
+        };
+
+        // 1. Rename session.
+        let applied = apply_manage(
+            &outcome.servers[0],
+            ManageOp::Rename {
+                target: &ManageTarget::Session {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                },
+                label: "core",
+            },
+            Instant::now() + DISCOVERY_TIME,
+            DISCOVERY_TIME,
+        )
+        .await;
+        let fb = finish_manage(
+            &mut outcome,
+            0,
+            applied,
+            "Renamed session".to_owned(),
+            "Rename failed",
+        );
+        assert!(!fb.is_error);
+        assert_eq!(outcome.sessions[0].label, "core");
+        // Other server's session and target remain intact with valid session_index.
+        assert_eq!(outcome.sessions[1].label, "keep");
+        let other_target = outcome
+            .choices
+            .iter()
+            .find(|t| t.server_index == 1)
+            .unwrap();
+        assert_eq!(other_target.session_index, 1);
+
+        // 2. Rename window.
+        let applied = apply_manage(
+            &outcome.servers[0],
+            ManageOp::Rename {
+                target: &ManageTarget::Window {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                    window_id: "window:1".to_owned(),
+                },
+                label: "api",
+            },
+            Instant::now() + DISCOVERY_TIME,
+            DISCOVERY_TIME,
+        )
+        .await;
+        let fb = finish_manage(
+            &mut outcome,
+            0,
+            applied,
+            "Renamed window".to_owned(),
+            "Rename failed",
+        );
+        assert!(!fb.is_error);
+        assert_eq!(outcome.choices[0].window_label.as_deref(), Some("api"));
+
+        // 3. Rename block.
+        let applied = apply_manage(
+            &outcome.servers[0],
+            ManageOp::Rename {
+                target: &ManageTarget::Block {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                    block_id: "block:1".to_owned(),
+                },
+                label: "tests",
+            },
+            Instant::now() + DISCOVERY_TIME,
+            DISCOVERY_TIME,
+        )
+        .await;
+        let fb = finish_manage(
+            &mut outcome,
+            0,
+            applied,
+            "Renamed block".to_owned(),
+            "Rename failed",
+        );
+        assert!(!fb.is_error);
+        assert_eq!(outcome.choices[0].block_label.as_deref(), Some("tests"));
+        assert_eq!(outcome.choices[0].label, "[office] core / 1.1 api / tests");
+
+        // 4. Kill block:2 -> window now has 1 block.
+        let applied = apply_manage(
+            &outcome.servers[0],
+            ManageOp::Kill {
+                target: &ManageTarget::Block {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                    block_id: "block:2".to_owned(),
+                },
+            },
+            Instant::now() + DISCOVERY_TIME,
+            DISCOVERY_TIME,
+        )
+        .await;
+        let fb = finish_manage(
+            &mut outcome,
+            0,
+            applied,
+            "Closed block".to_owned(),
+            "Kill failed",
+        );
+        assert!(!fb.is_error);
+        assert_eq!(
+            outcome
+                .choices
+                .iter()
+                .filter(|t| t.server_index == 0)
+                .count(),
+            1
+        );
+        assert_eq!(outcome.choices[0].window_block_count, 1);
+
+        // 5. Kill window:1 -> session:1 remains with 0 windows.
+        let applied = apply_manage(
+            &outcome.servers[0],
+            ManageOp::Kill {
+                target: &ManageTarget::Window {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                    window_id: "window:1".to_owned(),
+                },
+            },
+            Instant::now() + DISCOVERY_TIME,
+            DISCOVERY_TIME,
+        )
+        .await;
+        let fb = finish_manage(
+            &mut outcome,
+            0,
+            applied,
+            "Closed window".to_owned(),
+            "Kill failed",
+        );
+        assert!(!fb.is_error);
+        assert_eq!(
+            outcome
+                .choices
+                .iter()
+                .filter(|t| t.server_index == 0)
+                .count(),
+            0
+        );
+        assert_eq!(
+            outcome
+                .sessions
+                .iter()
+                .filter(|s| s.server_index == 0)
+                .count(),
+            1
+        );
+
+        // 6. Kill session:1 -> server 0 has 0 sessions, server 1 target's session_index remaps to 0.
+        let applied = apply_manage(
+            &outcome.servers[0],
+            ManageOp::Kill {
+                target: &ManageTarget::Session {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                },
+            },
+            Instant::now() + DISCOVERY_TIME,
+            DISCOVERY_TIME,
+        )
+        .await;
+        let fb = finish_manage(
+            &mut outcome,
+            0,
+            applied,
+            "Destroyed session".to_owned(),
+            "Kill failed",
+        );
+        assert!(!fb.is_error);
+        assert_eq!(outcome.sessions.len(), 1);
+        assert_eq!(outcome.sessions[0].server_index, 1);
+        assert_eq!(outcome.choices.len(), 1);
+        assert_eq!(outcome.choices[0].server_index, 1);
+        assert_eq!(outcome.choices[0].session_index, 0);
     }
 }

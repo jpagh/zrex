@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, Write};
 
@@ -13,11 +14,17 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    ProgramState, SessionChoice, StyleRole, StyledSpan, Target, prefix_to_columns,
-    styled_server_row,
+    ManageTarget, ProgramState, SessionChoice, StyleRole, StyledSpan, Target, prefix_to_columns,
+    styled_scope_row, styled_server_row,
 };
 
 const MIN_INPUT_WIDTH: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Feedback {
+    pub(super) text: String,
+    pub(super) is_error: bool,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Selection {
@@ -29,6 +36,13 @@ pub(super) enum Selection {
     NewWindow {
         session_index: usize,
         label: Option<String>,
+    },
+    Rename {
+        target: ManageTarget,
+        label: String,
+    },
+    Kill {
+        target: ManageTarget,
     },
 }
 
@@ -52,6 +66,12 @@ struct TextInput {
 }
 
 impl TextInput {
+    fn from_text(text: &str) -> Self {
+        let chars: Vec<char> = text.chars().collect();
+        let cursor = chars.len();
+        Self { chars, cursor }
+    }
+
     fn text(&self) -> String {
         self.chars.iter().collect()
     }
@@ -146,6 +166,39 @@ impl TextInput {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScopeKind {
+    Session,
+    Window,
+    Block,
+}
+
+impl ScopeKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Window => "window",
+            Self::Block => "block",
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Session => "Session  ",
+            Self::Window => "Window   ",
+            Self::Block => "Block    ",
+        }
+    }
+}
+
+struct ManageChoice {
+    kind: ScopeKind,
+    target: ManageTarget,
+    display: String,
+    detail: String,
+    initial_label: String,
+}
+
 enum Mode {
     Attach,
     NewSession {
@@ -158,12 +211,24 @@ enum Mode {
         first: usize,
         input: TextInput,
     },
+    Rename {
+        choices: Vec<ManageChoice>,
+        selected: usize,
+        first: usize,
+        input: TextInput,
+        dirty: bool,
+    },
+    Kill {
+        choices: Vec<ManageChoice>,
+        selected: usize,
+        first: usize,
+    },
 }
 
-struct PickerState<'a> {
-    targets: &'a [Target],
-    sessions: &'a [SessionChoice],
-    servers: &'a [String],
+pub(super) struct PickerState {
+    targets: Vec<Target>,
+    sessions: Vec<SessionChoice>,
+    servers: Vec<String>,
     labels: Vec<String>,
     matcher: SkimMatcherV2,
     attach_input: TextInput,
@@ -171,10 +236,15 @@ struct PickerState<'a> {
     attach_selected: usize,
     attach_first: usize,
     mode: Mode,
+    feedback: Option<Feedback>,
 }
 
-impl<'a> PickerState<'a> {
-    fn new(targets: &'a [Target], sessions: &'a [SessionChoice], servers: &'a [String]) -> Self {
+impl PickerState {
+    pub(super) fn new(
+        targets: Vec<Target>,
+        sessions: Vec<SessionChoice>,
+        servers: Vec<String>,
+    ) -> Self {
         let labels = targets.iter().map(Target::search_text).collect();
         let mut state = Self {
             targets,
@@ -187,9 +257,59 @@ impl<'a> PickerState<'a> {
             attach_selected: 0,
             attach_first: 0,
             mode: Mode::Attach,
+            feedback: None,
         };
         state.recompute_matches();
         state
+    }
+
+    pub(super) fn refresh(
+        &mut self,
+        targets: Vec<Target>,
+        sessions: Vec<SessionChoice>,
+        feedback: Feedback,
+    ) {
+        let prev_key = self.matches.get(self.attach_selected).map(|&(index, _)| {
+            let target = &self.targets[index];
+            (
+                target.server_index,
+                target.session_id.clone(),
+                target.window_id.clone(),
+                target.block_id.clone(),
+            )
+        });
+        let prev_selected = self.attach_selected;
+
+        self.targets = targets;
+        self.sessions = sessions;
+        self.labels = self.targets.iter().map(Target::search_text).collect();
+        self.recompute_matches();
+
+        if let Some((server_index, session_id, window_id, block_id)) = prev_key {
+            if let Some(pos) = self.matches.iter().position(|&(index, _)| {
+                let target = &self.targets[index];
+                target.server_index == server_index
+                    && target.session_id == session_id
+                    && target.window_id == window_id
+                    && target.block_id == block_id
+            }) {
+                self.attach_selected = pos;
+            } else if let Some(pos) = self.matches.iter().position(|&(index, _)| {
+                let target = &self.targets[index];
+                target.server_index == server_index
+                    && target.session_id == session_id
+                    && target.window_id == window_id
+            }) {
+                self.attach_selected = pos;
+            } else if !self.matches.is_empty() {
+                self.attach_selected = prev_selected.min(self.matches.len() - 1);
+            }
+        } else if !self.matches.is_empty() {
+            self.attach_selected = prev_selected.min(self.matches.len() - 1);
+        }
+
+        self.mode = Mode::Attach;
+        self.feedback = Some(feedback);
     }
 
     fn recompute_matches(&mut self) {
@@ -227,7 +347,151 @@ impl<'a> PickerState<'a> {
             .unwrap_or(0)
     }
 
+    fn session_counts(&self, session_index: usize) -> (usize, usize) {
+        let mut windows = HashSet::new();
+        let mut blocks = 0;
+        for target in &self.targets {
+            if target.session_index == session_index {
+                windows.insert(target.window_id.as_str());
+                blocks += 1;
+            }
+        }
+        (windows.len(), blocks)
+    }
+
+    fn build_manage_choices(&self, for_kill: bool) -> Option<(Vec<ManageChoice>, usize)> {
+        if self.sessions.is_empty() {
+            return None;
+        }
+        if self.targets.is_empty() {
+            let choices = self
+                .sessions
+                .iter()
+                .map(|session| ManageChoice {
+                    kind: ScopeKind::Session,
+                    target: ManageTarget::Session {
+                        server_index: session.server_index,
+                        session_id: session.session_id.clone(),
+                    },
+                    display: session.display_name(),
+                    detail: "(no windows)".to_owned(),
+                    initial_label: session.label.clone(),
+                })
+                .collect();
+            return Some((choices, 0));
+        }
+
+        let &(target_index, _) = self.matches.get(self.attach_selected)?;
+        let target = &self.targets[target_index];
+        let session = &self.sessions[target.session_index];
+        let session_display = session.display_name();
+        let (win_count, blk_count) = self.session_counts(target.session_index);
+
+        let session_detail = if for_kill {
+            format!(
+                "({win_count} {}, {blk_count} {})",
+                plural(win_count, "window", "windows"),
+                plural(blk_count, "block", "blocks"),
+            )
+        } else {
+            String::new()
+        };
+
+        let window_display = match &target.window_label {
+            Some(label) => format!("{session_display} / {} {label}", target.window_number),
+            None => format!("{session_display} / {}", target.window_number),
+        };
+        let window_detail = if for_kill {
+            format!(
+                "({} {})",
+                target.window_block_count,
+                plural(target.window_block_count, "block", "blocks"),
+            )
+        } else {
+            String::new()
+        };
+
+        let block_index_text = if target.window_block_count > 1 {
+            format!("{}.{}", target.window_number, target.block_number)
+        } else {
+            target.window_number.to_string()
+        };
+        let block_name = target
+            .block_label
+            .as_deref()
+            .or(target.process.as_deref())
+            .or((!target.block_raw_label.is_empty()).then_some(target.block_raw_label.as_str()));
+        let block_display = match block_name {
+            Some(name) => format!("{session_display} / {block_index_text} {name}"),
+            None => format!("{session_display} / {block_index_text}"),
+        };
+        let block_detail = if for_kill && target.window_block_count == 1 {
+            "(closes window)".to_owned()
+        } else {
+            String::new()
+        };
+
+        let mut choices = vec![
+            ManageChoice {
+                kind: ScopeKind::Session,
+                target: ManageTarget::Session {
+                    server_index: target.server_index,
+                    session_id: target.session_id.clone(),
+                },
+                display: session_display,
+                detail: session_detail,
+                initial_label: session.label.clone(),
+            },
+            ManageChoice {
+                kind: ScopeKind::Window,
+                target: ManageTarget::Window {
+                    server_index: target.server_index,
+                    session_id: target.session_id.clone(),
+                    window_id: target.window_id.clone(),
+                },
+                display: window_display,
+                detail: window_detail,
+                initial_label: target.window_label.clone().unwrap_or_default(),
+            },
+            ManageChoice {
+                kind: ScopeKind::Block,
+                target: ManageTarget::Block {
+                    server_index: target.server_index,
+                    session_id: target.session_id.clone(),
+                    block_id: target.block_id.clone(),
+                },
+                display: block_display,
+                detail: block_detail,
+                initial_label: target.block_label.clone().unwrap_or_default(),
+            },
+        ];
+
+        // Also include any empty sessions so they remain manageable even when
+        // other sessions have open windows.
+        for (idx, other) in self.sessions.iter().enumerate() {
+            if idx == target.session_index {
+                continue;
+            }
+            if !self.targets.iter().any(|t| t.session_index == idx) {
+                choices.push(ManageChoice {
+                    kind: ScopeKind::Session,
+                    target: ManageTarget::Session {
+                        server_index: other.server_index,
+                        session_id: other.session_id.clone(),
+                    },
+                    display: other.display_name(),
+                    detail: "(no windows)".to_owned(),
+                    initial_label: other.label.clone(),
+                });
+            }
+        }
+
+        let default_selected = if target.window_block_count > 1 { 2 } else { 1 };
+        Some((choices, default_selected))
+    }
+
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<Outcome> {
+        self.feedback = None;
         if matches!(
             (code, modifiers),
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
@@ -256,6 +520,29 @@ impl<'a> PickerState<'a> {
                         first: 0,
                         input: TextInput::default(),
                     };
+                    None
+                }
+                (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                    if let Some((choices, selected)) = self.build_manage_choices(false) {
+                        let input = TextInput::from_text(&choices[selected].initial_label);
+                        self.mode = Mode::Rename {
+                            choices,
+                            selected,
+                            first: 0,
+                            input,
+                            dirty: false,
+                        };
+                    }
+                    None
+                }
+                (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                    if let Some((choices, selected)) = self.build_manage_choices(true) {
+                        self.mode = Mode::Kill {
+                            choices,
+                            selected,
+                            first: 0,
+                        };
+                    }
                     None
                 }
                 (KeyCode::Up | KeyCode::BackTab, _) if !self.matches.is_empty() => {
@@ -350,6 +637,104 @@ impl<'a> PickerState<'a> {
                     None
                 }
             },
+            Mode::Rename {
+                choices,
+                selected,
+                input,
+                dirty,
+                ..
+            } => match (code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.mode = Mode::Attach;
+                    None
+                }
+                (KeyCode::Enter, _) => {
+                    if !*dirty {
+                        self.mode = Mode::Attach;
+                        return None;
+                    }
+                    let target = choices[*selected].target.clone();
+                    let label = input.text().trim().to_owned();
+                    Some(Outcome::Selected(Selection::Rename { target, label }))
+                }
+                (KeyCode::Up | KeyCode::BackTab, _) if choices.len() > 1 => {
+                    *selected = (*selected + choices.len() - 1) % choices.len();
+                    if !*dirty {
+                        *input = TextInput::from_text(&choices[*selected].initial_label);
+                    }
+                    None
+                }
+                (KeyCode::Down | KeyCode::Tab, _) if choices.len() > 1 => {
+                    *selected = (*selected + 1) % choices.len();
+                    if !*dirty {
+                        *input = TextInput::from_text(&choices[*selected].initial_label);
+                    }
+                    None
+                }
+                _ => {
+                    if input.handle_key(code, modifiers) == EditOutcome::Changed {
+                        *dirty = true;
+                    }
+                    None
+                }
+            },
+            Mode::Kill {
+                choices, selected, ..
+            } => match (code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.mode = Mode::Attach;
+                    None
+                }
+                (KeyCode::Char('n' | 'N'), mods)
+                    if mods.difference(KeyModifiers::SHIFT).is_empty() =>
+                {
+                    self.mode = Mode::Attach;
+                    None
+                }
+                (KeyCode::Enter, _) => Some(Outcome::Selected(Selection::Kill {
+                    target: choices[*selected].target.clone(),
+                })),
+                (KeyCode::Char('y' | 'Y'), mods)
+                    if mods.difference(KeyModifiers::SHIFT).is_empty() =>
+                {
+                    Some(Outcome::Selected(Selection::Kill {
+                        target: choices[*selected].target.clone(),
+                    }))
+                }
+                (KeyCode::Char('s' | 'S'), mods)
+                    if mods.difference(KeyModifiers::SHIFT).is_empty() =>
+                {
+                    if let Some(pos) = choices.iter().position(|c| c.kind == ScopeKind::Session) {
+                        *selected = pos;
+                    }
+                    None
+                }
+                (KeyCode::Char('w' | 'W'), mods)
+                    if mods.difference(KeyModifiers::SHIFT).is_empty() =>
+                {
+                    if let Some(pos) = choices.iter().position(|c| c.kind == ScopeKind::Window) {
+                        *selected = pos;
+                    }
+                    None
+                }
+                (KeyCode::Char('b' | 'B'), mods)
+                    if mods.difference(KeyModifiers::SHIFT).is_empty() =>
+                {
+                    if let Some(pos) = choices.iter().position(|c| c.kind == ScopeKind::Block) {
+                        *selected = pos;
+                    }
+                    None
+                }
+                (KeyCode::Up | KeyCode::BackTab, _) if choices.len() > 1 => {
+                    *selected = (*selected + choices.len() - 1) % choices.len();
+                    None
+                }
+                (KeyCode::Down | KeyCode::Tab, _) if choices.len() > 1 => {
+                    *selected = (*selected + 1) % choices.len();
+                    None
+                }
+                _ => None,
+            },
         }
     }
 
@@ -360,19 +745,37 @@ impl<'a> PickerState<'a> {
         rows: u16,
         use_color: bool,
     ) -> io::Result<()> {
+        let banner = self.feedback.clone();
+        self.render_with_banner(out, columns, rows, use_color, banner.as_ref())
+    }
+
+    fn render_with_banner(
+        &mut self,
+        out: &mut impl Write,
+        columns: u16,
+        rows: u16,
+        use_color: bool,
+        banner: Option<&Feedback>,
+    ) -> io::Result<()> {
         let width = usize::from(columns.saturating_sub(1));
-        let visible = usize::from(rows.saturating_sub(1)).max(1);
+        let show_banner = banner.is_some() && rows > 2 && width > 2;
+        let list_rows = if show_banner {
+            usize::from(rows.saturating_sub(2)).max(1)
+        } else {
+            usize::from(rows.saturating_sub(1)).max(1)
+        };
         queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
 
-        let (prompt, displayed, offset) = match &mut self.mode {
+        let (prompt, displayed, offset, prompt_color) = match &mut self.mode {
             Mode::Attach => {
-                self.attach_first = scroll_first(self.attach_first, self.attach_selected, visible);
+                self.attach_first =
+                    scroll_first(self.attach_first, self.attach_selected, list_rows);
                 if rows > 1 && width > 2 {
                     if self.targets.is_empty() {
                         let hint = if self.sessions.is_empty() {
                             "No sessions yet — press Ctrl-N to create one"
                         } else {
-                            "No open windows — press Ctrl-T for a new window or Ctrl-N for a new session"
+                            "No open windows — Ctrl-T new window, Ctrl-N new session, Ctrl-R rename, Ctrl-K kill"
                         };
                         queue!(out, MoveTo(0, 1))?;
                         render_hint(out, hint, width - 2)?;
@@ -381,7 +784,7 @@ impl<'a> PickerState<'a> {
                             .matches
                             .iter()
                             .skip(self.attach_first)
-                            .take(visible)
+                            .take(list_rows)
                             .enumerate()
                         {
                             let active = self.attach_first + line == self.attach_selected;
@@ -404,8 +807,9 @@ impl<'a> PickerState<'a> {
                     choose_prompt(
                         width,
                         &[
-                            "Attach (Ctrl-N session, Ctrl-T window, Esc)> ",
-                            "Attach (^N/^T/Esc)> ",
+                            "Attach (Ctrl-N session, Ctrl-T window, Ctrl-R rename, Ctrl-K kill, Esc)> ",
+                            "Attach (^N session, ^T window, ^R rename, ^K kill, Esc)> ",
+                            "Attach (^N/^T/^R/^K/Esc)> ",
                             "Attach> ",
                         ],
                     )
@@ -413,18 +817,18 @@ impl<'a> PickerState<'a> {
                 let (displayed, offset) = self
                     .attach_input
                     .visible(width.saturating_sub(prompt.width()));
-                (prompt.to_owned(), displayed, offset)
+                (prompt.to_owned(), displayed, offset, Color::DarkCyan)
             }
             Mode::NewSession {
                 server_index,
                 first,
                 input,
             } => {
-                *first = scroll_first(*first, *server_index, visible);
+                *first = scroll_first(*first, *server_index, list_rows);
                 if rows > 1 && width > 2 {
                     if self.servers.len() > 1 {
                         for (line, server) in
-                            self.servers.iter().skip(*first).take(visible).enumerate()
+                            self.servers.iter().skip(*first).take(list_rows).enumerate()
                         {
                             let active = *first + line == *server_index;
                             queue!(out, MoveTo(0, (line + 1) as u16))?;
@@ -457,18 +861,22 @@ impl<'a> PickerState<'a> {
                     .to_owned()
                 };
                 let (displayed, offset) = input.visible(width.saturating_sub(prompt.width()));
-                (prompt, displayed, offset)
+                (prompt, displayed, offset, Color::DarkCyan)
             }
             Mode::NewWindow {
                 session_index,
                 first,
                 input,
             } => {
-                *first = scroll_first(*first, *session_index, visible);
+                *first = scroll_first(*first, *session_index, list_rows);
                 if rows > 1 && width > 2 {
                     if self.sessions.len() > 1 {
-                        for (line, session) in
-                            self.sessions.iter().skip(*first).take(visible).enumerate()
+                        for (line, session) in self
+                            .sessions
+                            .iter()
+                            .skip(*first)
+                            .take(list_rows)
+                            .enumerate()
                         {
                             let active = *first + line == *session_index;
                             queue!(out, MoveTo(0, (line + 1) as u16))?;
@@ -501,15 +909,106 @@ impl<'a> PickerState<'a> {
                     .to_owned()
                 };
                 let (displayed, offset) = input.visible(width.saturating_sub(prompt.width()));
-                (prompt, displayed, offset)
+                (prompt, displayed, offset, Color::DarkCyan)
+            }
+            Mode::Rename {
+                choices,
+                selected,
+                first,
+                input,
+                ..
+            } => {
+                *first = scroll_first(*first, *selected, list_rows);
+                if rows > 1 && width > 2 {
+                    let mut rendered = 0;
+                    for (line, choice) in choices.iter().skip(*first).take(list_rows).enumerate() {
+                        let active = *first + line == *selected;
+                        queue!(out, MoveTo(0, (line + 1) as u16))?;
+                        let spans = styled_scope_row(
+                            choice.kind.tag(),
+                            &choice.display,
+                            &choice.detail,
+                            width - 2,
+                        );
+                        render_row(out, &spans, &[], active, use_color)?;
+                        rendered += 1;
+                    }
+                    if rendered < list_rows {
+                        queue!(out, MoveTo(0, (rendered + 1) as u16))?;
+                        render_hint(
+                            out,
+                            "Type a new name, or clear with Ctrl-U to restore the server default",
+                            width - 2,
+                        )?;
+                    }
+                }
+                let kind = choices[*selected].kind.name();
+                let prompt = if choices.len() > 1 {
+                    let full = format!("Rename {kind} (Tab: target, Ctrl-U: reset, Esc: back)> ");
+                    let medium = format!("Rename {kind} (Tab: target, Esc: back)> ");
+                    let short = format!("Rename {kind} (Tab)> ");
+                    let minimal = format!("Rename {kind}> ");
+                    choose_prompt(width, &[&full, &medium, &short, &minimal, "Rename> "]).to_owned()
+                } else {
+                    let full = format!("Rename {kind} (Ctrl-U: reset, Esc: back)> ");
+                    let medium = format!("Rename {kind} (Esc: back)> ");
+                    let minimal = format!("Rename {kind}> ");
+                    choose_prompt(width, &[&full, &medium, &minimal, "Rename> "]).to_owned()
+                };
+                let (displayed, offset) = input.visible(width.saturating_sub(prompt.width()));
+                (prompt, displayed, offset, Color::DarkCyan)
+            }
+            Mode::Kill {
+                choices,
+                selected,
+                first,
+            } => {
+                *first = scroll_first(*first, *selected, list_rows);
+                if rows > 1 && width > 2 {
+                    for (line, choice) in choices.iter().skip(*first).take(list_rows).enumerate() {
+                        let active = *first + line == *selected;
+                        queue!(out, MoveTo(0, (line + 1) as u16))?;
+                        let spans = styled_scope_row(
+                            choice.kind.tag(),
+                            &choice.display,
+                            &choice.detail,
+                            width - 2,
+                        );
+                        render_row(out, &spans, &[], active, use_color)?;
+                    }
+                }
+                let kind = choices[*selected].kind.name();
+                let prompt = if choices.len() > 1 {
+                    let full =
+                        format!("Kill {kind}? (Enter/y: kill, Tab/s/w/b: target, Esc: back) ");
+                    let medium = format!("Kill {kind}? (Enter/y: kill, Tab: target, Esc: back) ");
+                    let short = format!("Kill {kind}? (y/n, Tab) ");
+                    let minimal = format!("Kill {kind}? (y/n) ");
+                    choose_prompt_with_tail(width, 0, &[&full, &medium, &short, &minimal, "Kill? "])
+                        .to_owned()
+                } else {
+                    let full = format!("Kill {kind}? (Enter/y: kill, Esc: back) ");
+                    let minimal = format!("Kill {kind}? (y/n) ");
+                    choose_prompt_with_tail(width, 0, &[&full, &minimal, "Kill? "]).to_owned()
+                };
+                (prompt, String::new(), 0, Color::DarkRed)
             }
         };
 
+        if show_banner && let Some(banner) = banner {
+            queue!(out, MoveTo(0, rows - 1))?;
+            render_banner(out, banner, width - 2, use_color)?;
+        }
+
         queue!(out, MoveTo(0, 0))?;
-        render_prompt(out, &prompt, &displayed, use_color)?;
+        render_prompt(out, &prompt, &displayed, prompt_color, use_color)?;
         queue!(out, MoveTo((prompt.width() + offset) as u16, 0))?;
         out.flush()
     }
+}
+
+fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }
 
 fn scroll_first(first: usize, selected: usize, visible: usize) -> usize {
@@ -519,15 +1018,62 @@ fn scroll_first(first: usize, selected: usize, visible: usize) -> usize {
 }
 
 fn choose_prompt<'a>(width: usize, candidates: &[&'a str]) -> &'a str {
+    choose_prompt_with_tail(width, MIN_INPUT_WIDTH, candidates)
+}
+
+fn choose_prompt_with_tail<'a>(width: usize, min_tail: usize, candidates: &[&'a str]) -> &'a str {
     for candidate in candidates {
-        if width >= candidate.width() + MIN_INPUT_WIDTH {
+        if width >= candidate.width() + min_tail {
             return candidate;
         }
     }
     if width > 2 { "> " } else { "" }
 }
 
-struct Screen;
+pub(super) struct Screen {
+    use_color: bool,
+}
+
+impl Screen {
+    pub(super) fn enter() -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        let screen = Self {
+            use_color: color_enabled(),
+        };
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        Ok(screen)
+    }
+
+    pub(super) fn step(&mut self, state: &mut PickerState) -> io::Result<Option<Selection>> {
+        let mut out = io::stdout();
+        loop {
+            let (columns, rows) = terminal::size()?;
+            state.render(&mut out, columns, rows, self.use_color)?;
+
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind == KeyEventKind::Release {
+                continue;
+            }
+            match state.handle_key(key.code, key.modifiers) {
+                Some(Outcome::Cancel) => return Ok(None),
+                Some(Outcome::Selected(selection)) => return Ok(Some(selection)),
+                None => {}
+            }
+        }
+    }
+
+    pub(super) fn render_busy(&mut self, state: &mut PickerState, message: &str) -> io::Result<()> {
+        let mut out = io::stdout();
+        let (columns, rows) = terminal::size()?;
+        let banner = Feedback {
+            text: message.to_owned(),
+            is_error: false,
+        };
+        state.render_with_banner(&mut out, columns, rows, self.use_color, Some(&banner))
+    }
+}
 
 impl Drop for Screen {
     fn drop(&mut self) {
@@ -544,44 +1090,16 @@ fn color_enabled() -> bool {
     env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
-pub(super) fn select(
-    targets: &[Target],
-    sessions: &[SessionChoice],
-    servers: &[String],
-) -> io::Result<Option<Selection>> {
-    terminal::enable_raw_mode()?;
-    let _screen = Screen;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
-    let use_color = color_enabled();
-    let mut state = PickerState::new(targets, sessions, servers);
-    loop {
-        let (columns, rows) = terminal::size()?;
-        state.render(&mut out, columns, rows, use_color)?;
-
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        match state.handle_key(key.code, key.modifiers) {
-            Some(Outcome::Cancel) => return Ok(None),
-            Some(Outcome::Selected(selection)) => return Ok(Some(selection)),
-            None => {}
-        }
-    }
-}
-
 fn render_prompt(
     out: &mut impl Write,
     prompt: &str,
     query: &str,
+    color: Color,
     use_color: bool,
 ) -> io::Result<()> {
     if !prompt.is_empty() {
         if use_color {
-            queue!(out, SetForegroundColor(Color::DarkCyan))?;
+            queue!(out, SetForegroundColor(color))?;
         }
         queue!(
             out,
@@ -591,6 +1109,35 @@ fn render_prompt(
         )?;
     }
     queue!(out, Print(query))
+}
+
+fn render_banner(
+    out: &mut impl Write,
+    banner: &Feedback,
+    max_width: usize,
+    use_color: bool,
+) -> io::Result<()> {
+    let visible = if banner.text.width() <= max_width {
+        banner.text.clone()
+    } else {
+        let ellipsis_width = '…'.width().unwrap_or(1);
+        format!(
+            "{}…",
+            prefix_to_columns(&banner.text, max_width.saturating_sub(ellipsis_width))
+        )
+    };
+    queue!(out, Print("  "))?;
+    if banner.is_error {
+        if use_color {
+            queue!(out, SetForegroundColor(Color::DarkRed))?;
+        }
+        queue!(out, SetAttribute(Attribute::Bold))?;
+    } else if use_color {
+        queue!(out, SetForegroundColor(Color::DarkGreen))?;
+    } else {
+        queue!(out, SetAttribute(Attribute::Dim))?;
+    }
+    queue!(out, Print(visible), SetAttribute(Attribute::Reset))
 }
 
 fn render_hint(out: &mut impl Write, text: &str, max_width: usize) -> io::Result<()> {
@@ -743,13 +1290,13 @@ fn word_distance<'a>(chars: impl Iterator<Item = &'a char>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::test_target;
+    use crate::picker::{test_target, test_target_full};
 
     fn chars(text: &str) -> Vec<char> {
         text.chars().collect()
     }
 
-    fn type_text(state: &mut PickerState<'_>, text: &str) {
+    fn type_text(state: &mut PickerState, text: &str) {
         for ch in text.chars() {
             assert_eq!(
                 state.handle_key(KeyCode::Char(ch), KeyModifiers::NONE),
@@ -863,7 +1410,7 @@ mod tests {
     #[test]
     fn ctrl_n_creates_new_session_with_default_or_custom_label_and_server_choice() {
         let (targets, sessions, servers) = sample_fixture();
-        let mut state = PickerState::new(&targets, &sessions, &servers);
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers.clone());
 
         // Highlight [office] api, then press Ctrl-N: office (index 1) is pre-selected.
         assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
@@ -883,7 +1430,7 @@ mod tests {
         );
 
         // Blank or whitespace-only name produces None (default Rex label).
-        let mut state = PickerState::new(&targets, &sessions, &servers);
+        let mut state = PickerState::new(targets, sessions, servers);
         assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
         assert_eq!(
             state.handle_key(KeyCode::Char('n'), KeyModifiers::CONTROL),
@@ -902,7 +1449,7 @@ mod tests {
     #[test]
     fn ctrl_t_creates_new_window_in_highlighted_or_cycled_session() {
         let (targets, sessions, servers) = sample_fixture();
-        let mut state = PickerState::new(&targets, &sessions, &servers);
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers.clone());
 
         // Highlight [office] api, then press Ctrl-T: session 1 is pre-selected.
         assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
@@ -920,7 +1467,7 @@ mod tests {
         );
 
         // Can cycle to another session and submit empty name for default label.
-        let mut state = PickerState::new(&targets, &sessions, &servers);
+        let mut state = PickerState::new(targets, sessions, servers);
         assert_eq!(
             state.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL),
             None
@@ -938,7 +1485,7 @@ mod tests {
     #[test]
     fn esc_returns_to_attach_preserving_query_and_ctrl_c_cancels_from_any_mode() {
         let (targets, sessions, servers) = sample_fixture();
-        let mut state = PickerState::new(&targets, &sessions, &servers);
+        let mut state = PickerState::new(targets, sessions, servers);
 
         type_text(&mut state, "api");
         assert_eq!(
@@ -967,11 +1514,21 @@ mod tests {
     #[test]
     fn empty_server_allows_ctrl_n_and_ignores_ctrl_t() {
         let servers = vec!["local".to_owned()];
-        let mut state = PickerState::new(&[], &[], &servers);
+        let mut state = PickerState::new(Vec::new(), Vec::new(), servers);
 
-        // Ctrl-T is ignored when there are no sessions.
+        // Ctrl-T, Ctrl-R, Ctrl-K are ignored when there are no sessions.
         assert_eq!(
             state.handle_key(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            None
+        );
+        assert!(matches!(state.mode, Mode::Attach));
+        assert_eq!(
+            state.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None
+        );
+        assert!(matches!(state.mode, Mode::Attach));
+        assert_eq!(
+            state.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
             None
         );
         assert!(matches!(state.mode, Mode::Attach));
@@ -1007,7 +1564,7 @@ mod tests {
     #[test]
     fn switching_between_new_session_and_new_window_preserves_context() {
         let (targets, sessions, servers) = sample_fixture();
-        let mut state = PickerState::new(&targets, &sessions, &servers);
+        let mut state = PickerState::new(targets, sessions, servers);
 
         // Open NewSession on local (index 0), move to office (index 1), then press Ctrl-T.
         assert_eq!(
@@ -1056,7 +1613,7 @@ mod tests {
                 "block:2",
             ),
         ];
-        let mut state = PickerState::new(&targets, &sessions, &servers);
+        let mut state = PickerState::new(targets, sessions, servers);
 
         assert_eq!(
             state.handle_key(KeyCode::Char('n'), KeyModifiers::CONTROL),
@@ -1085,5 +1642,316 @@ mod tests {
                 assert!(output.contains("開発セッション"));
             }
         }
+
+        // Also render Rename and Kill modes across narrow and Unicode sizes.
+        assert_eq!(state.handle_key(KeyCode::Esc, KeyModifiers::NONE), None);
+        assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None
+        );
+        for (cols, rows) in [(100, 10), (40, 5), (10, 3), (3, 2), (1, 1)] {
+            let mut buf = Vec::new();
+            state.render(&mut buf, cols, rows, true).unwrap();
+        }
+        assert_eq!(state.handle_key(KeyCode::Esc, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None
+        );
+        for (cols, rows) in [(100, 10), (40, 5), (10, 3), (3, 2), (1, 1)] {
+            let mut buf = Vec::new();
+            state.render(&mut buf, cols, rows, true).unwrap();
+        }
+    }
+
+    fn split_fixture() -> (Vec<Target>, Vec<SessionChoice>, Vec<String>) {
+        let servers = vec!["local".to_owned()];
+        let sessions = vec![
+            SessionChoice {
+                server_index: 0,
+                server_name: "local".to_owned(),
+                session_id: "session:1".to_owned(),
+                label: "work".to_owned(),
+            },
+            SessionChoice {
+                server_index: 0,
+                server_name: "local".to_owned(),
+                session_id: "session:empty".to_owned(),
+                label: "idle".to_owned(),
+            },
+        ];
+        let targets = vec![
+            test_target_full(
+                0,
+                0,
+                "[local] work / 1 zsh",
+                "session:1",
+                "window:1",
+                1,
+                None,
+                1,
+                "block:1",
+                1,
+                None,
+                "shell",
+                Some("zsh"),
+            ),
+            test_target_full(
+                0,
+                0,
+                "[local] work / 2.1 dev / editor / nvim",
+                "session:1",
+                "window:2",
+                2,
+                Some("dev"),
+                2,
+                "block:2",
+                1,
+                Some("editor"),
+                "editor",
+                Some("nvim"),
+            ),
+            test_target_full(
+                0,
+                0,
+                "[local] work / 2.2 dev / zsh",
+                "session:1",
+                "window:2",
+                2,
+                Some("dev"),
+                2,
+                "block:3",
+                2,
+                None,
+                "shell",
+                Some("zsh"),
+            ),
+        ];
+        (targets, sessions, servers)
+    }
+
+    #[test]
+    fn ctrl_r_renames_session_window_or_block_with_prefill_and_reset() {
+        let (targets, sessions, servers) = split_fixture();
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers.clone());
+
+        // Single-block window defaults to Window scope with empty pre-fill for default label.
+        assert_eq!(
+            state.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None
+        );
+        // Pressing Enter untouched is a no-op and returns to Attach.
+        assert_eq!(state.handle_key(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(matches!(state.mode, Mode::Attach));
+
+        // Open Rename on split row 2.1 (custom window "dev", custom block "editor").
+        // Split rows default to Block scope, pre-filled with "editor".
+        assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None
+        );
+        // Before editing, Up moves to Window ("dev") and updates the input pre-fill.
+        assert_eq!(state.handle_key(KeyCode::Up, KeyModifiers::NONE), None);
+        // Clear with Ctrl-U to restore default label, then press Enter.
+        assert_eq!(
+            state.handle_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Rename {
+                target: ManageTarget::Window {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                    window_id: "window:2".to_owned(),
+                },
+                label: String::new(),
+            }))
+        );
+
+        // Editing sets dirty so switching scope preserves the typed text.
+        let mut state = PickerState::new(targets, sessions, servers);
+        assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None
+        );
+        type_text(&mut state, "  backend  ");
+        // Move to Session (index 0: Block 2 -> Up -> Window 1 -> Up -> Session 0).
+        assert_eq!(state.handle_key(KeyCode::Up, KeyModifiers::NONE), None);
+        assert_eq!(state.handle_key(KeyCode::Up, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Rename {
+                target: ManageTarget::Session {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                },
+                label: "backend".to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn ctrl_k_kills_session_window_or_block_with_confirmation_and_shortcuts() {
+        let (targets, sessions, servers) = split_fixture();
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers.clone());
+
+        // Highlight split row 2.1, open Kill: defaults to Block.
+        assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None
+        );
+
+        let mut buf = Vec::new();
+        state.render(&mut buf, 100, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("Kill block?"));
+        assert!(screen.contains("(2 windows, 3 blocks)"));
+        assert!(screen.contains("(2 blocks)"));
+        assert!(screen.contains("(no windows)"));
+
+        // 'n' backs out to Attach without killing.
+        assert_eq!(
+            state.handle_key(KeyCode::Char('n'), KeyModifiers::NONE),
+            None
+        );
+        assert!(matches!(state.mode, Mode::Attach));
+
+        // Re-open Kill on split row 2.1: confirm default Block with 'y'.
+        assert_eq!(
+            state.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Char('y'), KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Kill {
+                target: ManageTarget::Block {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                    block_id: "block:2".to_owned(),
+                },
+            }))
+        );
+
+        // 'w' selects Window, 's' selects Session, 'b' selects Block.
+        let mut state = PickerState::new(targets, sessions, servers);
+        assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Char('w'), KeyModifiers::NONE),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Kill {
+                target: ManageTarget::Window {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                    window_id: "window:2".to_owned(),
+                },
+            }))
+        );
+
+        assert_eq!(
+            state.handle_key(KeyCode::Char('s'), KeyModifiers::NONE),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Kill {
+                target: ManageTarget::Session {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                },
+            }))
+        );
+    }
+
+    #[test]
+    fn empty_windows_still_allow_renaming_and_killing_sessions() {
+        let servers = vec!["local".to_owned()];
+        let sessions = vec![SessionChoice {
+            server_index: 0,
+            server_name: "local".to_owned(),
+            session_id: "session:1".to_owned(),
+            label: "empty-work".to_owned(),
+        }];
+        let mut state = PickerState::new(Vec::new(), sessions, servers);
+
+        assert_eq!(
+            state.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            None
+        );
+        type_text(&mut state, "fresh");
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Rename {
+                target: ManageTarget::Session {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                },
+                label: "fresh".to_owned(),
+            }))
+        );
+
+        assert_eq!(state.handle_key(KeyCode::Esc, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Kill {
+                target: ManageTarget::Session {
+                    server_index: 0,
+                    session_id: "session:1".to_owned(),
+                },
+            }))
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_query_selection_and_clears_feedback_on_next_key() {
+        let (targets, sessions, servers) = split_fixture();
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers);
+        type_text(&mut state, "dev");
+        assert_eq!(state.matches.len(), 2);
+        // Select second match (block:3).
+        assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
+
+        // Simulate renaming block:3 and refreshing.
+        let mut updated = targets;
+        updated[2].block_label = Some("logs".to_owned());
+        state.refresh(
+            updated,
+            sessions,
+            Feedback {
+                text: "Renamed block to logs".to_owned(),
+                is_error: false,
+            },
+        );
+        assert_eq!(state.attach_input.text(), "dev");
+        // Previously selected block:3 stays selected after refresh.
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Attach(2)))
+        );
+        // Feedback cleared after keypress.
+        assert!(state.feedback.is_none());
     }
 }
