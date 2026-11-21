@@ -180,8 +180,9 @@ impl Control {
         Ok(rx)
     }
 
-    /// Calls travel in order on one connection, so fire-and-forget writes stay
-    /// ordered without waiting a round-trip per key.
+    /// Fire-and-forget send for server-ordered methods such as `block.event`.
+    /// Block methods like `com.superlogical.terminal.write` run concurrently on
+    /// the server and must use `start_write` instead so writes stay ordered.
     pub fn post(&mut self, method: &str, payload: Value) -> Result<()> {
         let id = self.next_request_id()?;
         self.send_request(&id, method, payload)
@@ -202,8 +203,16 @@ impl Control {
             .map_err(|_| anyhow!("the control connection is closed"))
     }
 
-    pub fn post_write(&mut self, session_id: &str, block_id: &str, data: &str) -> Result<()> {
-        self.post(
+    /// Starts a `com.superlogical.terminal.write` call and returns its reply
+    /// channel. Rex runs block methods concurrently, so callers must wait for
+    /// this reply before sending the next write to preserve input ordering.
+    pub fn start_write(
+        &mut self,
+        session_id: &str,
+        block_id: &str,
+        data: &str,
+    ) -> Result<oneshot::Receiver<Result<Value>>> {
+        self.start_call(
             "com.superlogical.terminal.write",
             serde_json::json!({
                 "session_id": session_id,

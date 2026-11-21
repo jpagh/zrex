@@ -18,6 +18,9 @@ use crate::session;
 
 const DATA_REF: &str = "terminal";
 const MAX_BLOB_BYTES: usize = 983_040;
+/// Cap each `com.superlogical.terminal.write` request so huge pastes stay well
+/// within WebSocket frame limits while normal input goes out in one call.
+const MAX_WRITE_BYTES: usize = 64 * 1024;
 const PROBE_EVERY: Duration = Duration::from_secs(10);
 const PROBE_TIME: Duration = Duration::from_secs(5);
 const RETRY_FIRST: Duration = Duration::from_millis(250);
@@ -291,6 +294,19 @@ async fn attach_block(
                     Err(error) => lost = Some(error),
                 }
             }
+            // Rex runs `com.superlogical.terminal.write` calls concurrently, so
+            // wait for each write to be queued on the server before sending the
+            // next coalesced batch.
+            result = finish_write(&mut attached.write_inflight) => {
+                match result {
+                    Ok(_) => {
+                        if let Err(error) = attached.pump_write(&mut ctrl) {
+                            lost = Some(error);
+                        }
+                    }
+                    Err(error) => lost = Some(error),
+                }
+            }
             // A fragment the host stopped sending was typing after all.
             _ = stalled(attached.replies.due()) => {
                 // Another arm can hold the loop long enough for the host's
@@ -403,6 +419,8 @@ struct Attached<'a> {
     pending: Vec<u8>,
     out: Vec<u8>,
     input_buf: Vec<u8>,
+    write_queue: String,
+    write_inflight: Option<tokio::sync::oneshot::Receiver<Result<Value>>>,
     replies: Replies,
     primed: bool,
     theme_dirty: bool,
@@ -474,6 +492,8 @@ impl<'a> Attached<'a> {
             pending: Vec::new(),
             out: Vec::new(),
             input_buf: Vec::new(),
+            write_queue: String::new(),
+            write_inflight: None,
             replies: Replies::default(),
             primed: false,
             theme_dirty: false,
@@ -621,8 +641,17 @@ impl<'a> Attached<'a> {
     fn flush_input(&mut self, ctrl: &mut Control) -> Result<()> {
         let text = take_utf8(&mut self.input_buf);
         if !text.is_empty() {
-            ctrl.post_write(&self.session_id, &self.block_id, &text)?;
+            self.write_queue.push_str(&text);
         }
+        self.pump_write(ctrl)
+    }
+
+    fn pump_write(&mut self, ctrl: &mut Control) -> Result<()> {
+        if self.write_inflight.is_some() || self.write_queue.is_empty() {
+            return Ok(());
+        }
+        let chunk = take_write_chunk(&mut self.write_queue, MAX_WRITE_BYTES);
+        self.write_inflight = Some(ctrl.start_write(&self.session_id, &self.block_id, &chunk)?);
         Ok(())
     }
 
@@ -1137,6 +1166,33 @@ fn take_utf8(buf: &mut Vec<u8>) -> String {
     }
 }
 
+fn take_write_chunk(queue: &mut String, max_bytes: usize) -> String {
+    if queue.len() <= max_bytes {
+        return std::mem::take(queue);
+    }
+    let mut split = max_bytes;
+    while split > 0 && !queue.is_char_boundary(split) {
+        split -= 1;
+    }
+    if split == 0 {
+        // Never stall if max_bytes is smaller than the leading UTF-8 char.
+        split = queue.chars().next().map_or(0, char::len_utf8);
+    }
+    let rest = queue.split_off(split);
+    std::mem::replace(queue, rest)
+}
+
+async fn finish_write(
+    inflight: &mut Option<tokio::sync::oneshot::Receiver<Result<Value>>>,
+) -> Result<Value> {
+    let Some(rx) = inflight.as_mut() else {
+        return std::future::pending().await;
+    };
+    let received = rx.await;
+    *inflight = None;
+    received.map_err(|_| anyhow!("the control connection ended"))?
+}
+
 async fn finish_call(rx: tokio::sync::oneshot::Receiver<Result<Value>>) -> Result<Value> {
     rx.await
         .map_err(|_| anyhow!("the control connection ended"))?
@@ -1339,9 +1395,16 @@ fn spawn_input() -> mpsc::UnboundedReceiver<Vec<u8>> {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
-        while let Ok(n) = stdin.read(&mut buf) {
-            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
-                return;
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
             }
         }
     });
@@ -1369,6 +1432,9 @@ async fn recover(
                 // and the reply a held fragment belonged to is gone with them.
                 while input.try_recv().is_ok() {}
                 attached.replies = Replies::default();
+                attached.input_buf.clear();
+                attached.write_queue.clear();
+                attached.write_inflight = None;
                 return Ok(Recovered::Live);
             }
             Ok(Some(ending)) => return Ok(Recovered::Ended(ending)),
@@ -1590,8 +1656,8 @@ fn has_da1_reply(bytes: &[u8]) -> bool {
 mod tests {
     use super::{
         Attached, BlockSelection, Ending, Flow, RETRY_FIRST, RETRY_MAX, Replies, Theme, backoff,
-        closed_block, detach, has_da1_reply, is_detach, parse_theme_reply, reports_scheme,
-        split_replies, take_utf8, theme_query,
+        closed_block, detach, finish_write, has_da1_reply, is_detach, parse_theme_reply,
+        reports_scheme, split_replies, take_utf8, take_write_chunk, theme_query,
     };
     use crate::rex::control::Control;
     use crate::rex::data::StreamClosed;
@@ -1934,7 +2000,20 @@ mod tests {
                 let id = req["id"].as_str().unwrap_or("");
                 let method = req["method"].as_str().unwrap();
                 if method == "com.superlogical.terminal.write" {
-                    wrote.push_str(req["payload"]["args"]["data"].as_str().unwrap_or(""));
+                    let data = req["payload"]["args"]["data"].as_str().unwrap_or("");
+                    wrote.push_str(data);
+                    ctrl_ws
+                        .send(Message::Text(
+                            json!({
+                                "type": "response",
+                                "id": id,
+                                "payload": {"bytes_written": data.len()}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
                     continue;
                 }
                 if method == "block.event" {
@@ -2126,6 +2205,9 @@ mod tests {
         let flow = attached.burst(b"ls", &mut in_rx, &mut ctrl).await.unwrap();
         assert!(matches!(flow, Flow::Continue));
         assert!(attached.owns);
+        finish_write(&mut attached.write_inflight).await.unwrap();
+        attached.pump_write(&mut ctrl).unwrap();
+        assert!(attached.write_inflight.is_none());
 
         // The other client gives the block up, so the server hands it to the
         // client in line: this one. It takes this terminal's size and colors
@@ -2192,5 +2274,213 @@ mod tests {
         // Attach and the claim on typing; the other client's claim does not
         // make zrex claim back.
         assert_eq!(take_calls, 2);
+    }
+
+    #[test]
+    fn chunks_writes_on_utf8_boundaries() {
+        let mut queue = "hi🦀ok".to_owned();
+        assert_eq!(take_write_chunk(&mut queue, 4), "hi");
+        assert_eq!(queue, "🦀ok");
+        assert_eq!(take_write_chunk(&mut queue, 2), "🦀");
+        assert_eq!(queue, "ok");
+        assert_eq!(take_write_chunk(&mut queue, 10), "ok");
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serializes_terminal_writes_and_coalesces_split_bracketed_paste() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel::<()>();
+        let (saw_first_tx, saw_first_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (ctrl_tcp, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ctrl_ws = tokio_tungstenite::accept_hdr_async(
+                ctrl_tcp,
+                |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                },
+            )
+            .await
+            .unwrap();
+
+            let _hello = ctrl_ws.next().await.unwrap().unwrap();
+            ctrl_ws
+                .send(Message::Text(
+                    json!({
+                        "type": "welcome",
+                        "api_revision": 8,
+                        "client": {"reconnect_token": "tok-1"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let data_task = tokio::spawn(async move {
+                let (data_tcp, _) = listener.accept().await.unwrap();
+                #[allow(
+                    clippy::result_large_err,
+                    reason = "tungstenite fixes the callback error type"
+                )]
+                let mut data_ws = tokio_tungstenite::accept_hdr_async(
+                    data_tcp,
+                    |req: &Request, mut res: Response| {
+                        if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                            res.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", proto.clone());
+                        }
+                        Ok(res)
+                    },
+                )
+                .await
+                .unwrap();
+                let _hello = data_ws.next().await.unwrap().unwrap();
+                let mut welcome = vec![0u8; 32];
+                welcome[0] = 0x81;
+                welcome[1..17].copy_from_slice(&[9u8; 16]);
+                welcome[24..32].copy_from_slice(&42u64.to_le_bytes());
+                data_ws.send(Message::Binary(welcome.into())).await.unwrap();
+                data_ws
+            });
+
+            let mut writes = Vec::new();
+            let mut saw_first_tx = Some(saw_first_tx);
+            let mut release_first_rx = Some(release_first_rx);
+            while let Some(Ok(Message::Text(text))) = ctrl_ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_str().unwrap_or("");
+                let method = req["method"].as_str().unwrap();
+                if method == "block.event" {
+                    continue;
+                }
+                if method == "com.superlogical.terminal.write" {
+                    let data = req["payload"]["args"]["data"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned();
+                    writes.push(data.clone());
+                    if writes.len() == 1 {
+                        if let Some(tx) = saw_first_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = release_first_rx.take() {
+                            let _ = rx.await;
+                        }
+                    }
+                    ctrl_ws
+                        .send(Message::Text(
+                            json!({
+                                "type": "response",
+                                "id": id,
+                                "payload": {"bytes_written": data.len()}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                let result = match method {
+                    "session.bootstrap" => json!({
+                        "client_id": "client:1",
+                        "selected_session": {
+                            "view": {
+                                "label": "work",
+                                "active_window_id": "window:1",
+                                "windows": [{
+                                    "window_id": "window:1",
+                                    "focused_block_id": "block:1",
+                                    "active_layer_id": "layer:1",
+                                    "layers": [{
+                                        "id": "layer:1",
+                                        "focused_block_id": "block:1",
+                                        "root": {"type": "block", "block_id": "block:1"}
+                                    }]
+                                }]
+                            }
+                        }
+                    }),
+                    "data.connect" => json!({
+                        "ticket": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16])
+                    }),
+                    _ => json!({}),
+                };
+                ctrl_ws
+                    .send(Message::Text(
+                        json!({"type": "response", "id": id, "payload": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if method == "session.detach" {
+                    break;
+                }
+            }
+            let _data_ws = data_task.await.unwrap();
+            writes
+        });
+
+        let address = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, _events) = Control::connect(&address, None).await.unwrap();
+        let mut attached = Attached::start(
+            &mut ctrl,
+            "session:1",
+            &address,
+            BlockSelection::Selectors(None, None),
+            (80, 24),
+            Theme::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Simulate a terminal like foot emitting bracketed paste across
+        // separate reads: ESC[200~, body, ESC[201~.
+        attached
+            .burst(b"\x1b[200~", &mut in_rx, &mut ctrl)
+            .await
+            .unwrap();
+        saw_first_rx.await.unwrap();
+        assert!(attached.write_inflight.is_some());
+
+        // While the first write is still in flight, later chunks must queue
+        // locally instead of racing concurrently on the server.
+        attached
+            .burst(b"pasted text", &mut in_rx, &mut ctrl)
+            .await
+            .unwrap();
+        attached
+            .burst(b"\x1b[201~", &mut in_rx, &mut ctrl)
+            .await
+            .unwrap();
+        assert_eq!(attached.write_queue, "pasted text\x1b[201~");
+
+        // Completing the first write flushes the coalesced remainder in order.
+        release_first_tx.send(()).unwrap();
+        finish_write(&mut attached.write_inflight).await.unwrap();
+        attached.pump_write(&mut ctrl).unwrap();
+        assert!(attached.write_queue.is_empty());
+        assert!(attached.write_inflight.is_some());
+
+        finish_write(&mut attached.write_inflight).await.unwrap();
+        attached.pump_write(&mut ctrl).unwrap();
+        assert!(attached.write_inflight.is_none());
+
+        detach(&mut ctrl, &attached).await;
+        let writes = server.await.unwrap();
+        assert_eq!(writes, vec!["\x1b[200~", "pasted text\x1b[201~"]);
     }
 }
