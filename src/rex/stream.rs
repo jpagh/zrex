@@ -167,8 +167,13 @@ impl Filter {
                 } else {
                     data.push(byte);
                     if data.len() >= 4096 {
+                        // The nonempty title has outgrown the lookahead used to
+                        // preserve short cancelled sequences. Prefix it now, then
+                        // pass the rest through (including a split UTF-8 scalar).
                         self.out.extend_from_slice(b"\x1b]");
-                        self.out.extend_from_slice(data);
+                        self.out.extend_from_slice(&data[..2]);
+                        self.out.extend_from_slice(b"zrex: ");
+                        self.out.extend_from_slice(&data[2..]);
                         self.state = State::Ground;
                     }
                 }
@@ -266,6 +271,24 @@ mod tests {
             out,
             b"a\x1b]0;zrex: vim src/main.rs\x07b\x1b]2;zrex\x1b\\c\x1b]52;c;YWJj\x07d\x1b]22;other\x07e"
         );
+    }
+
+    #[test]
+    fn streams_long_titles_without_losing_prefix_or_splitting_utf8() {
+        for (code, terminator) in [("0", "\x07"), ("2", "\x1b\\")] {
+            let title = format!("{}界tail", "a".repeat(4093));
+            let mut filter = Filter::new(1);
+            let input = format!("\x1b]{code};{title}{terminator}after");
+            let out: Vec<_> = input
+                .as_bytes()
+                .chunks(31)
+                .flat_map(|chunk| filter.push(chunk))
+                .collect();
+            assert_eq!(
+                out,
+                format!("\x1b]{code};zrex: {title}{terminator}after").as_bytes()
+            );
+        }
     }
 
     #[test]

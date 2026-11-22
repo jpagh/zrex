@@ -547,7 +547,7 @@ impl<'a> Attached<'a> {
         let title_rx = session::start_terminal_title(ctrl, block);
         let process_rx = session::start_terminal_process(ctrl, block);
         let screen = format_vt(ctrl, block).await?;
-        let deadline = Some(tokio::time::Instant::now() + TITLE_QUERY_TIMEOUT);
+        let deadline = tokio::time::Instant::now() + TITLE_QUERY_TIMEOUT;
         let (title_reply, process_reply) = tokio::join!(
             session::optional_reply(title_rx, deadline),
             session::optional_reply(process_rx, deadline),
@@ -590,6 +590,7 @@ impl<'a> Attached<'a> {
         self.flush(out)?;
         out.write_all(theme_query().as_bytes())?;
         out.flush()?;
+        self.replies.expect_reply();
         let deadline = Instant::now() + THEME_PROBE_TIMEOUT;
         let mut replies = Vec::new();
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
@@ -711,6 +712,7 @@ impl<'a> Attached<'a> {
         ctrl: &mut Control,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
+        self.input_buf.extend(self.replies.give_up_typed());
         self.flush_input(ctrl)?;
         loop {
             if self.write_inflight.is_some() {
@@ -989,9 +991,14 @@ fn split_replies(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
 #[derive(Default)]
 struct Replies {
     held: Vec<u8>,
+    /// True when `held` came from a startup probe tail or an active reply burst
+    /// rather than standalone typing, so detaching drops it instead of writing
+    /// a truncated host reply into the remote PTY.
+    held_from_reply: bool,
     /// When the host has been silent long enough for `held` to be typing.
     until: Option<Instant>,
-    /// When the last read carried a reply, so the host may still be sending one.
+    /// When the last read carried (or a query just solicited) a reply, so the
+    /// host may still be sending one.
     answered: Option<Instant>,
 }
 
@@ -999,6 +1006,7 @@ impl Replies {
     fn push(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let now = Instant::now();
         let resumed = !self.held.is_empty();
+        let was_from_reply = self.held_from_reply;
         let answering = self.answered.is_some_and(|at| now < at + REPLY_HOLD);
         let mut pending = std::mem::take(&mut self.held);
         pending.extend_from_slice(bytes);
@@ -1012,19 +1020,27 @@ impl Replies {
             typed.extend_from_slice(&fragment);
             fragment.clear();
         }
-        self.hold_at(fragment, now);
+        let from_reply = !replies.is_empty() || answering || (resumed && was_from_reply);
+        self.hold_at(fragment, from_reply, now);
         self.answered = (!replies.is_empty()).then_some(now);
         (replies, typed)
     }
 
-    /// Keeps a fragment back for the read that finishes it, and starts the clock
-    /// that gives up on it.
+    /// Keeps a probe-tail fragment back for the read that finishes it, and
+    /// starts the clock that gives up on it.
     fn hold(&mut self, fragment: Vec<u8>) {
-        self.hold_at(fragment, Instant::now());
+        self.hold_at(fragment, true, Instant::now());
     }
 
-    fn hold_at(&mut self, fragment: Vec<u8>, now: Instant) {
+    /// Marks that a host query was just sent so a split first chunk is treated
+    /// as a reply fragment rather than typed input.
+    fn expect_reply(&mut self) {
+        self.answered = Some(Instant::now());
+    }
+
+    fn hold_at(&mut self, fragment: Vec<u8>, from_reply: bool, now: Instant) {
         self.until = (!fragment.is_empty()).then(|| now + REPLY_HOLD);
+        self.held_from_reply = !fragment.is_empty() && from_reply;
         self.held = fragment;
     }
 
@@ -1044,7 +1060,16 @@ impl Replies {
     fn give_up(&mut self) -> Vec<u8> {
         self.until = None;
         self.answered = None;
+        self.held_from_reply = false;
         std::mem::take(&mut self.held)
+    }
+
+    /// Like `give_up`, but drops fragments that originated from a host reply
+    /// stream so detaching mid-reply does not inject escape garbage into the PTY.
+    fn give_up_typed(&mut self) -> Vec<u8> {
+        let from_reply = self.held_from_reply;
+        let held = self.give_up();
+        if from_reply { Vec::new() } else { held }
     }
 }
 
@@ -2038,6 +2063,32 @@ mod tests {
     }
 
     #[test]
+    fn give_up_typed_flushes_standalone_typing_but_drops_host_reply_fragments() {
+        // Standalone ambiguous input is flushed on detach.
+        let mut replies = Replies::default();
+        assert_eq!(replies.push(b"abc\x1b[?").1, b"abc");
+        assert_eq!(replies.give_up_typed(), b"\x1b[?");
+
+        // A startup probe tail is dropped on detach instead of entering the PTY.
+        let mut replies = Replies::default();
+        replies.hold(b"\x1b]4;12;rgb:ffff/".to_vec());
+        assert!(replies.give_up_typed().is_empty());
+
+        // A partial reply trailing a host reply burst is dropped on detach.
+        let mut replies = Replies::default();
+        let (found, typed) = replies.push(b"\x1b]10;rgb:1111/2222/3333\x07\x1b]4;12;rgb:ffff/");
+        assert_eq!(found, b"\x1b]10;rgb:1111/2222/3333\x07");
+        assert!(typed.is_empty());
+        assert!(replies.give_up_typed().is_empty());
+
+        // A split first chunk after `expect_reply` (e.g. `refresh_theme`) is dropped.
+        let mut replies = Replies::default();
+        replies.expect_reply();
+        assert!(replies.push(b"\x1b]10;rgb:ffff/").1.is_empty());
+        assert!(replies.give_up_typed().is_empty());
+    }
+
+    #[test]
     fn spots_color_scheme_reports_from_the_host() {
         let (replies, typed) = split_replies(b"\x1b[?997;2n");
         assert!(reports_scheme(&replies));
@@ -2839,7 +2890,7 @@ mod tests {
         // While the first write is in flight, the user types more text batched
         // with Ctrl-\ in the same read.
         let flow = attached
-            .burst(b"second\x1cignored", &mut in_rx, &mut ctrl)
+            .burst(b"second\x1b[?\x1cignored", &mut in_rx, &mut ctrl)
             .await
             .unwrap();
         assert!(matches!(flow, Flow::Detach));
@@ -2847,7 +2898,7 @@ mod tests {
         release_first_tx.send(()).unwrap();
         detach(&mut ctrl, &mut attached).await;
         let order = server.await.unwrap();
-        assert_eq!(order, vec!["write:first-", "write:second", "detach"]);
+        assert_eq!(order, vec!["write:first-", "write:second\x1b[?", "detach"]);
     }
 
     #[tokio::test]

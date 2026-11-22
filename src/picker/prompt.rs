@@ -14,8 +14,8 @@ use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    ManageTarget, ProgramState, SessionChoice, StyleRole, StyledSpan, Target, styled_scope_row,
-    styled_server_row,
+    ManageScope, ManageTarget, ProgramState, SessionChoice, StyleRole, StyledSpan, Target,
+    styled_scope_row, styled_server_row,
 };
 use crate::text::truncate_with_ellipsis;
 
@@ -169,46 +169,11 @@ impl TextInput {
 
 const SCOPE_COLUMN_WIDTH: usize = 9;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScopeKind {
-    Session,
-    Window,
-    Block,
-}
-
-impl ScopeKind {
-    fn of(target: &ManageTarget) -> Self {
-        match target {
-            ManageTarget::Session { .. } => Self::Session,
-            ManageTarget::Window { .. } => Self::Window,
-            ManageTarget::Block { .. } => Self::Block,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Session => "Session",
-            Self::Window => "Window",
-            Self::Block => "Block",
-        }
-    }
-
-    fn padded_label(self) -> String {
-        format!("{:<width$}", self.label(), width = SCOPE_COLUMN_WIDTH)
-    }
-}
-
 struct ManageChoice {
     target: ManageTarget,
     display: String,
     detail: String,
     initial_label: String,
-}
-
-impl ManageChoice {
-    fn kind(&self) -> ScopeKind {
-        ScopeKind::of(&self.target)
-    }
 }
 
 enum Mode {
@@ -376,9 +341,10 @@ impl PickerState {
                 .sessions
                 .iter()
                 .map(|session| ManageChoice {
-                    target: ManageTarget::Session {
+                    target: ManageTarget {
                         server_index: session.server_index,
                         session_id: session.session_id.clone(),
+                        scope: ManageScope::Session,
                     },
                     display: session.display_name(),
                     detail: "(no windows)".to_owned(),
@@ -440,29 +406,30 @@ impl PickerState {
 
         let mut choices = vec![
             ManageChoice {
-                target: ManageTarget::Session {
+                target: ManageTarget {
                     server_index: target.server_index,
                     session_id: target.session_id.clone(),
+                    scope: ManageScope::Session,
                 },
                 display: session_display,
                 detail: session_detail,
                 initial_label: session.label.clone(),
             },
             ManageChoice {
-                target: ManageTarget::Window {
+                target: ManageTarget {
                     server_index: target.server_index,
                     session_id: target.session_id.clone(),
-                    window_id: target.window_id.clone(),
+                    scope: ManageScope::Window(target.window_id.clone()),
                 },
                 display: window_display,
                 detail: window_detail,
                 initial_label: target.window_label.clone().unwrap_or_default(),
             },
             ManageChoice {
-                target: ManageTarget::Block {
+                target: ManageTarget {
                     server_index: target.server_index,
                     session_id: target.session_id.clone(),
-                    block_id: target.block_id.clone(),
+                    scope: ManageScope::Block(target.block_id.clone()),
                 },
                 display: block_display,
                 detail: block_detail,
@@ -478,9 +445,10 @@ impl PickerState {
             }
             if !self.targets.iter().any(|t| t.session_index == idx) {
                 choices.push(ManageChoice {
-                    target: ManageTarget::Session {
+                    target: ManageTarget {
                         server_index: other.server_index,
                         session_id: other.session_id.clone(),
+                        scope: ManageScope::Session,
                     },
                     display: other.display_name(),
                     detail: "(no windows)".to_owned(),
@@ -707,14 +675,20 @@ impl PickerState {
                 (KeyCode::Char('s' | 'S'), mods)
                     if mods.difference(KeyModifiers::SHIFT).is_empty() =>
                 {
-                    let next = if choices[*selected].kind() == ScopeKind::Session {
+                    let next = if matches!(choices[*selected].target.scope, ManageScope::Session) {
                         choices[*selected + 1..]
                             .iter()
-                            .position(|c| c.kind() == ScopeKind::Session)
+                            .position(|c| matches!(c.target.scope, ManageScope::Session))
                             .map(|offset| *selected + 1 + offset)
-                            .or_else(|| choices.iter().position(|c| c.kind() == ScopeKind::Session))
+                            .or_else(|| {
+                                choices
+                                    .iter()
+                                    .position(|c| matches!(c.target.scope, ManageScope::Session))
+                            })
                     } else {
-                        choices.iter().position(|c| c.kind() == ScopeKind::Session)
+                        choices
+                            .iter()
+                            .position(|c| matches!(c.target.scope, ManageScope::Session))
                     };
                     if let Some(pos) = next {
                         *selected = pos;
@@ -724,7 +698,10 @@ impl PickerState {
                 (KeyCode::Char('w' | 'W'), mods)
                     if mods.difference(KeyModifiers::SHIFT).is_empty() =>
                 {
-                    if let Some(pos) = choices.iter().position(|c| c.kind() == ScopeKind::Window) {
+                    if let Some(pos) = choices
+                        .iter()
+                        .position(|c| matches!(c.target.scope, ManageScope::Window(_)))
+                    {
                         *selected = pos;
                     }
                     None
@@ -732,7 +709,10 @@ impl PickerState {
                 (KeyCode::Char('b' | 'B'), mods)
                     if mods.difference(KeyModifiers::SHIFT).is_empty() =>
                 {
-                    if let Some(pos) = choices.iter().position(|c| c.kind() == ScopeKind::Block) {
+                    if let Some(pos) = choices
+                        .iter()
+                        .position(|c| matches!(c.target.scope, ManageScope::Block(_)))
+                    {
                         *selected = pos;
                     }
                     None
@@ -1048,7 +1028,7 @@ fn render_manage_choices(
     for (line, choice) in choices.iter().skip(first).take(list_rows).enumerate() {
         let active = first + line == selected;
         queue!(out, MoveTo(0, (line + 1) as u16))?;
-        let tag = choice.kind().padded_label();
+        let tag = format!("{:<SCOPE_COLUMN_WIDTH$}", choice.target.scope.label());
         let spans = styled_scope_row(&tag, &choice.display, &choice.detail, max_width);
         render_row(out, &spans, &[], active, use_color)?;
         rendered += 1;
@@ -1839,10 +1819,10 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Outcome::Selected(Selection::Rename {
-                target: ManageTarget::Window {
+                target: ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
-                    window_id: "window:2".to_owned(),
+                    scope: ManageScope::Window("window:2".to_owned()),
                 },
                 label: String::new(),
             }))
@@ -1866,9 +1846,10 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Outcome::Selected(Selection::Rename {
-                target: ManageTarget::Session {
+                target: ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
+                    scope: ManageScope::Session,
                 },
                 label: "backend".to_owned(),
             }))
@@ -1910,10 +1891,10 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyCode::Char('y'), KeyModifiers::NONE),
             Some(Outcome::Selected(Selection::Kill {
-                target: ManageTarget::Block {
+                target: ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
-                    block_id: "block:2".to_owned(),
+                    scope: ManageScope::Block("block:2".to_owned()),
                 },
             }))
         );
@@ -1932,10 +1913,10 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Outcome::Selected(Selection::Kill {
-                target: ManageTarget::Window {
+                target: ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
-                    window_id: "window:2".to_owned(),
+                    scope: ManageScope::Window("window:2".to_owned()),
                 },
             }))
         );
@@ -1947,9 +1928,10 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Outcome::Selected(Selection::Kill {
-                target: ManageTarget::Session {
+                target: ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
+                    scope: ManageScope::Session,
                 },
             }))
         );
@@ -1978,9 +1960,10 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Outcome::Selected(Selection::Rename {
-                target: ManageTarget::Session {
+                target: ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
+                    scope: ManageScope::Session,
                 },
                 label: "fresh".to_owned(),
             }))
@@ -1994,9 +1977,10 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Outcome::Selected(Selection::Kill {
-                target: ManageTarget::Session {
+                target: ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
+                    scope: ManageScope::Session,
                 },
             }))
         );
@@ -2057,9 +2041,10 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Outcome::Selected(Selection::Kill {
-                target: ManageTarget::Session {
+                target: ManageTarget {
                     server_index: 0,
                     session_id: "session:empty".to_owned(),
+                    scope: ManageScope::Session,
                 },
             }))
         );
@@ -2072,9 +2057,10 @@ mod tests {
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
             Some(Outcome::Selected(Selection::Kill {
-                target: ManageTarget::Session {
+                target: ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
+                    scope: ManageScope::Session,
                 },
             }))
         );

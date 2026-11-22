@@ -63,7 +63,8 @@ zrex -S office ls
 zrex -S office a work
 zrex -S office kill work
 
-# Target only the local server (even when saved servers or REX_SERVER are configured)
+# Target only the local server. The name `local` is reserved (case-insensitive);
+# use another alias for a saved server.
 zrex -S local ls
 ```
 

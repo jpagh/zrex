@@ -355,7 +355,7 @@ async fn list_single_with_control(mut ctrl: Control) -> Result<()> {
         println!("no sessions");
         return Ok(());
     }
-    for line in format_sessions(&mut ctrl, sessions, None).await {
+    for line in format_sessions(&mut ctrl, sessions, Instant::now() + DISCOVERY_TIME).await {
         println!("{line}");
     }
     Ok(())
@@ -363,10 +363,9 @@ async fn list_single_with_control(mut ctrl: Control) -> Result<()> {
 
 async fn list_multi(servers: Vec<Server>) -> Result<()> {
     let deadline = Instant::now() + DISCOVERY_TIME;
-    let excluded: Vec<ServerAddress> = servers.iter().map(|s| s.address.clone()).collect();
     let report = collect_multi_list(
         servers,
-        async move { probe_local(LocalDiscovery::Optional, &excluded).await },
+        async |excluded| probe_local(LocalDiscovery::Optional, excluded).await,
         deadline,
     )
     .await;
@@ -394,7 +393,7 @@ async fn list_multi(servers: Vec<Server>) -> Result<()> {
 
 async fn collect_multi_list(
     servers: Vec<Server>,
-    local_probe: impl Future<Output = Result<Option<(ServerAddress, Control)>>>,
+    local_probe: impl AsyncFnOnce(&[ServerAddress]) -> Result<Option<(ServerAddress, Control)>>,
     deadline: Instant,
 ) -> MultiListReport {
     let outcome = fan_out(
@@ -443,13 +442,13 @@ async fn list_with_control(ctrl: &mut Control, deadline: Instant) -> Result<Vec<
     if sessions.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(format_sessions(ctrl, sessions, Some(deadline)).await)
+    Ok(format_sessions(ctrl, sessions, deadline).await)
 }
 
 async fn format_sessions(
     ctrl: &mut Control,
     sessions: Vec<Value>,
-    deadline: Option<Instant>,
+    deadline: Instant,
 ) -> Vec<String> {
     let width = sessions
         .iter()
@@ -525,7 +524,7 @@ fn start_window_titles(
 
 async fn finish_window_titles(
     pending: Vec<PendingWindowTitle>,
-    deadline: Option<Instant>,
+    deadline: Instant,
 ) -> HashMap<String, String> {
     let resolved = join_all(pending.into_iter().map(
         |(window_id, title_reply, process_reply)| async move {
@@ -756,21 +755,24 @@ async fn server_candidates() -> Vec<String> {
 
 fn server_candidates_from(config: &config::Config, local: Option<&ServerAddress>) -> Vec<String> {
     let mut candidates = Vec::with_capacity(config.servers.len() + 1);
-    let has_local_name = config
-        .servers
-        .keys()
-        .any(|name| clean_one_line(name).eq_ignore_ascii_case("local"));
     let has_local_addr = local.is_some_and(|local_addr| {
         config
             .servers
-            .values()
-            .filter_map(|raw| raw.parse::<ServerAddress>().ok())
+            .iter()
+            .filter(|(name, _)| !config::is_builtin_local(name))
+            .filter_map(|(_, raw)| raw.parse::<ServerAddress>().ok())
             .any(|addr| &addr == local_addr)
     });
-    if local.is_some() && !has_local_name && !has_local_addr {
+    if local.is_some() && !has_local_addr {
         candidates.push("local".to_owned());
     }
-    candidates.extend(config.servers.keys().cloned());
+    candidates.extend(
+        config
+            .servers
+            .keys()
+            .filter(|name| !config::is_builtin_local(name))
+            .cloned(),
+    );
     sanitize_candidates(candidates)
 }
 
@@ -1185,6 +1187,22 @@ mod tests {
             vec!["local", "mac", "office"]
         );
 
+        // An ignored reserved `local` entry in config.toml must neither appear
+        // when local is absent nor hide the built-in `local` candidate when it
+        // points to the running local server address.
+        let mut with_reserved = config.clone();
+        with_reserved
+            .servers
+            .insert("LOCAL".to_owned(), "http://127.0.0.1:7297".to_owned());
+        assert_eq!(
+            server_candidates_from(&with_reserved, None),
+            vec!["mac", "office"]
+        );
+        assert_eq!(
+            server_candidates_from(&with_reserved, Some(&local)),
+            vec!["local", "mac", "office"]
+        );
+
         // Deduplicate local when a saved server already points to it.
         config
             .servers
@@ -1196,6 +1214,10 @@ mod tests {
     }
 
     async fn spawn_mock_ls_server(sessions: Value) -> ServerAddress {
+        spawn_ls_server(sessions, true).await
+    }
+
+    async fn spawn_ls_server(sessions: Value, answer_views: bool) -> ServerAddress {
         use futures_util::{SinkExt, StreamExt};
         use tokio::net::TcpListener;
         use tokio_tungstenite::accept_hdr_async;
@@ -1235,6 +1257,7 @@ mod tests {
                         let id = req["id"].as_str().unwrap();
                         let payload = match req["method"].as_str().unwrap() {
                             "session.attach_all" => json!({"sessions": sessions}),
+                            "session.view" if !answer_views => continue,
                             "session.view" => json!({
                                 "active_window_id": "window:1",
                                 "windows": [{
@@ -1290,7 +1313,7 @@ mod tests {
                     address: office_addr,
                 },
             ],
-            async { Ok(None) },
+            async |_| Ok(None),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1319,7 +1342,7 @@ mod tests {
                 name: "office".to_owned(),
                 address: office_addr,
             }],
-            async move {
+            async move |_| {
                 let (ctrl, _events) = Control::connect(&local_addr, None).await?;
                 Ok(Some((local_addr, ctrl)))
             },
@@ -1342,7 +1365,7 @@ mod tests {
                 name: "saved-local".to_owned(),
                 address: shared_addr,
             }],
-            async move {
+            async move |_| {
                 let (ctrl, _events) = Control::connect(&shared_copy, None).await?;
                 Ok(Some((shared_copy, ctrl)))
             },
@@ -1372,9 +1395,11 @@ mod tests {
                 "foreground": {"pid": 200, "argv0": "-zsh", "name": "zsh"}
             })))
             .unwrap();
-        let titles =
-            finish_window_titles(vec![("window:1".to_owned(), title_rx, Some(proc_rx))], None)
-                .await;
+        let titles = finish_window_titles(
+            vec![("window:1".to_owned(), title_rx, Some(proc_rx))],
+            Instant::now() + DISCOVERY_TIME,
+        )
+        .await;
         assert_eq!(titles.get("window:1").map(String::as_str), Some("zsh"));
     }
 
@@ -1467,6 +1492,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn silent_view_returns_session_summary_by_deadline() {
+        let addr =
+            spawn_ls_server(json!([{"session_id":"session:1", "label":"work"}]), false).await;
+        let (mut ctrl, _events) = Control::connect(&addr, None).await.unwrap();
+        let sessions = session::list_all(&mut ctrl).await.unwrap();
+        let lines = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            format_sessions(
+                &mut ctrl,
+                sessions,
+                Instant::now() + std::time::Duration::from_millis(30),
+            ),
+        )
+        .await
+        .expect("silent view must not stall ls");
+        assert_eq!(lines, ["work  session:1"]);
+    }
+
+    #[tokio::test]
     async fn format_sessions_computes_width_from_sanitized_labels() {
         let addr = spawn_mock_ls_server(json!([
             {"session_id": "session:1", "label": "work\n\t\x07   "},
@@ -1475,7 +1519,7 @@ mod tests {
         .await;
         let (mut ctrl, _events) = Control::connect(&addr, None).await.unwrap();
         let sessions = session::list_all(&mut ctrl).await.unwrap();
-        let lines = format_sessions(&mut ctrl, sessions, None).await;
+        let lines = format_sessions(&mut ctrl, sessions, Instant::now() + DISCOVERY_TIME).await;
         assert_eq!(lines[0], "work  session:1");
         assert_eq!(lines[2], "a     session:2");
     }

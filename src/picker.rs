@@ -61,91 +61,82 @@ pub(super) fn styled_server_row(server_name: &str, columns: usize) -> Vec<Styled
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ManageTarget {
-    Session {
-        server_index: usize,
-        session_id: String,
-    },
-    Window {
-        server_index: usize,
-        session_id: String,
-        window_id: String,
-    },
-    Block {
-        server_index: usize,
-        session_id: String,
-        block_id: String,
-    },
+pub(super) struct ManageTarget {
+    server_index: usize,
+    session_id: String,
+    scope: ManageScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManageScope {
+    Session,
+    Window(String),
+    Block(String),
+}
+
+impl ManageScope {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Session => "Session",
+            Self::Window(_) => "Window",
+            Self::Block(_) => "Block",
+        }
+    }
+
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Window(_) => "window",
+            Self::Block(_) => "block",
+        }
+    }
 }
 
 impl ManageTarget {
-    pub(super) fn server_index(&self) -> usize {
-        match self {
-            Self::Session { server_index, .. }
-            | Self::Window { server_index, .. }
-            | Self::Block { server_index, .. } => *server_index,
-        }
-    }
-
-    pub(super) fn session_id(&self) -> &str {
-        match self {
-            Self::Session { session_id, .. }
-            | Self::Window { session_id, .. }
-            | Self::Block { session_id, .. } => session_id,
-        }
-    }
-
-    pub(super) fn kind_name(&self) -> &'static str {
-        match self {
-            Self::Session { .. } => "session",
-            Self::Window { .. } => "window",
-            Self::Block { .. } => "block",
-        }
+    fn kind_name(&self) -> &'static str {
+        self.scope.kind_name()
     }
 
     fn kill_progress_message(&self) -> String {
-        match self {
-            Self::Session { .. } => "Destroying session…".to_owned(),
-            Self::Window { .. } | Self::Block { .. } => format!("Closing {}…", self.kind_name()),
+        match &self.scope {
+            ManageScope::Session => "Destroying session…".to_owned(),
+            ManageScope::Window(_) | ManageScope::Block(_) => {
+                format!("Closing {}…", self.kind_name())
+            }
         }
     }
 
     fn kill_done_message(&self) -> String {
-        match self {
-            Self::Session { .. } => "Destroyed session".to_owned(),
-            Self::Window { .. } | Self::Block { .. } => format!("Closed {}", self.kind_name()),
+        match &self.scope {
+            ManageScope::Session => "Destroyed session".to_owned(),
+            ManageScope::Window(_) | ManageScope::Block(_) => {
+                format!("Closed {}", self.kind_name())
+            }
         }
     }
 
     async fn rename(&self, ctrl: &mut Control, label: &str) -> Result<()> {
-        match self {
-            Self::Session { session_id, .. } => session::set_label(ctrl, session_id, label).await,
-            Self::Window {
-                session_id,
-                window_id,
-                ..
-            } => session::set_window_label(ctrl, session_id, window_id, label).await,
-            Self::Block {
-                session_id,
-                block_id,
-                ..
-            } => session::set_block_label(ctrl, BlockRef::new(session_id, block_id), label).await,
+        match &self.scope {
+            ManageScope::Session => session::set_label(ctrl, &self.session_id, label).await,
+            ManageScope::Window(window_id) => {
+                session::set_window_label(ctrl, &self.session_id, window_id, label).await
+            }
+            ManageScope::Block(block_id) => {
+                session::set_block_label(ctrl, BlockRef::new(&self.session_id, block_id), label)
+                    .await
+            }
         }
     }
 
     async fn kill(&self, ctrl: &mut Control) -> Result<()> {
-        match self {
-            Self::Session { session_id, .. } => session::destroy(ctrl, session_id).await,
-            Self::Window {
-                session_id,
-                window_id,
-                ..
-            } => session::close_window(ctrl, session_id, window_id).await,
-            Self::Block {
-                session_id,
-                block_id,
-                ..
-            } => session::close_block(ctrl, BlockRef::new(session_id, block_id)).await,
+        match &self.scope {
+            ManageScope::Session => session::destroy(ctrl, &self.session_id).await,
+            ManageScope::Window(window_id) => {
+                session::close_window(ctrl, &self.session_id, window_id).await
+            }
+            ManageScope::Block(block_id) => {
+                session::close_block(ctrl, BlockRef::new(&self.session_id, block_id)).await
+            }
         }
     }
 }
@@ -371,15 +362,10 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
     let loaded = load_servers(server_config).await?;
     let deadline = Instant::now() + DISCOVERY_TIME;
     let local_discovery = loaded.local_discovery;
-    let excluded: Vec<ServerAddress> = loaded
-        .servers
-        .iter()
-        .map(|server| server.address.clone())
-        .collect();
     let mut outcome = discover_all(
         loaded.servers,
         local_discovery,
-        async move { probe_local(local_discovery, &excluded).await },
+        async move |excluded| probe_local(local_discovery, excluded).await,
         deadline,
     )
     .await;
@@ -482,7 +468,7 @@ async fn run_manage_op(
     let busy = op.busy_message();
     let ok_msg = op.ok_message();
     let err_prefix = op.err_prefix();
-    let server_index = op.target().server_index();
+    let server_index = op.target().server_index;
     screen.render_busy(state, &busy)?;
     let applied = apply_manage(
         &outcome.servers[server_index],
@@ -571,7 +557,7 @@ async fn apply_manage(
     };
 
     let result = timeout_at(op_deadline, async {
-        session::attach(&mut ctrl, op.target().session_id()).await?;
+        session::attach(&mut ctrl, &op.target().session_id).await?;
         match op {
             ManageOp::Rename { target, label } => target.rename(&mut ctrl, label).await,
             ManageOp::Kill { target } => target.kill(&mut ctrl).await,
@@ -652,7 +638,7 @@ async fn discover_all<F>(
     deadline: Instant,
 ) -> DiscoveryOutcome
 where
-    F: Future<Output = Result<Option<(ServerAddress, Control)>>>,
+    F: AsyncFnOnce(&[ServerAddress]) -> Result<Option<(ServerAddress, Control)>>,
 {
     let fan = fan_out(
         servers,
@@ -717,14 +703,21 @@ where
 }
 
 async fn load_servers(server_config: &ServerConfig) -> Result<LoadedServers> {
-    if let ServerConfig::Explicit(target) = server_config
-        && (target.is_empty() || target.contains("://"))
-    {
-        return Ok(LoadedServers {
-            servers: vec![config::resolve_server(target).await?.server],
-            local_discovery: LocalDiscovery::None,
-            has_configured_sources: true,
-        });
+    if let ServerConfig::Explicit(target) = server_config {
+        if config::is_builtin_local(target) {
+            return Ok(LoadedServers {
+                servers: Vec::new(),
+                local_discovery: LocalDiscovery::Required,
+                has_configured_sources: true,
+            });
+        }
+        if target.is_empty() || target.contains("://") {
+            return Ok(LoadedServers {
+                servers: vec![config::resolve_server(target).await?.server],
+                local_discovery: LocalDiscovery::None,
+                has_configured_sources: true,
+            });
+        }
     }
 
     let config = config::load_config()?;
@@ -741,7 +734,7 @@ where
     Fut: Future<Output = ServerAddress>,
 {
     if let ServerConfig::Explicit(target) = server_config {
-        if config::is_builtin_local(config, target) {
+        if config::is_builtin_local(target) {
             return Ok(LoadedServers {
                 servers: Vec::new(),
                 local_discovery: LocalDiscovery::Required,
@@ -764,7 +757,7 @@ where
     match server_config {
         ServerConfig::Explicit(_) => unreachable!(),
         ServerConfig::Env(target) => {
-            let local_discovery = if config::is_builtin_local(config, target) {
+            let local_discovery = if config::is_builtin_local(target) {
                 LocalDiscovery::Required
             } else {
                 match config::resolve_server_with(config, target, local).await {
@@ -821,7 +814,7 @@ async fn discover_with_control(
         let reply = session::start_view(ctrl, &id);
         let server_name = server.name.clone();
         views.push(async move {
-            let view = session::optional_reply(reply, Some(deadline)).await?;
+            let view = session::optional_reply(reply, deadline).await?;
             Some((
                 session_index,
                 targets(&server_name, session_index, &session_label, &id, &view),
@@ -875,9 +868,9 @@ fn describe_targets(
         let details: HashMap<_, _> = join_all(requests.into_iter().map(
             |(id, (title, status, process))| async move {
                 let (title, status, process) = tokio::join!(
-                    session::optional_reply(title, Some(deadline)),
-                    session::optional_reply(status, Some(deadline)),
-                    session::optional_reply(process, Some(deadline))
+                    session::optional_reply(title, deadline),
+                    session::optional_reply(status, deadline),
+                    session::optional_reply(process, deadline)
                 );
                 // TargetLabel already renders the foreground process in the
                 // primary label column, so only show an explicit live title.
@@ -1811,7 +1804,7 @@ mod tests {
         let outcome = discover_all(
             servers,
             LocalDiscovery::Optional,
-            async { Ok(None) },
+            async |_| Ok(None),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1885,7 +1878,7 @@ mod tests {
         let outcome = discover_all(
             servers,
             LocalDiscovery::Optional,
-            async { Ok(None) },
+            async |_| Ok(None),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1942,7 +1935,7 @@ mod tests {
         let local_missing = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { Ok(None) },
+            async |_| Ok(None),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -1952,7 +1945,7 @@ mod tests {
             "local: server is not running"
         );
 
-        // An explicit saved `local` entry overrides the built-in local probe for `-S local`.
+        // A conflicting alias cannot redirect -S local.
         let mut custom_local_cfg = config::Config::default();
         custom_local_cfg
             .servers
@@ -1964,14 +1957,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
-        assert_eq!(
-            loaded.servers,
-            vec![Server {
-                name: "local".to_owned(),
-                address: "http://127.0.0.1:9999".parse().unwrap(),
-            }]
-        );
+        assert_eq!(loaded.local_discovery, LocalDiscovery::Required);
+        assert!(loaded.servers.is_empty());
 
         // REX_SERVER set to a saved alias deduplicates against saved servers.
         let loaded = load_servers_with(&ServerConfig::Env("mac".to_owned()), &config, fake_local)
@@ -2028,7 +2015,7 @@ mod tests {
             vec!["mac", "office"]
         );
 
-        // A saved server named `local` overrides the built-in local alias for REX_SERVER=local.
+        // A saved server named `local` cannot override the built-in local alias for REX_SERVER=local.
         let mut with_saved_local = config::Config::default();
         with_saved_local
             .servers
@@ -2046,7 +2033,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(loaded.local_discovery, LocalDiscovery::None);
+        assert_eq!(loaded.local_discovery, LocalDiscovery::Required);
         assert!(loaded.has_configured_sources);
         assert_eq!(
             loaded
@@ -2054,7 +2041,7 @@ mod tests {
                 .iter()
                 .map(|server| server.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["local", "mac", "office"]
+            vec!["mac", "office"]
         );
     }
 
@@ -2074,7 +2061,7 @@ mod tests {
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { Ok(None) },
+            async |_| Ok(None),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2095,7 +2082,7 @@ mod tests {
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { Ok(None) },
+            async |_| Ok(None),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2115,7 +2102,7 @@ mod tests {
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { Ok(None) },
+            async |_| Ok(None),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2125,7 +2112,7 @@ mod tests {
         let outcome = discover_all(
             Vec::new(),
             LocalDiscovery::Optional,
-            async { Err(anyhow!("local: connection refused")) },
+            async |_| Err(anyhow!("local: connection refused")),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2137,7 +2124,7 @@ mod tests {
         let outcome = discover_all(
             Vec::new(),
             LocalDiscovery::Optional,
-            std::future::pending::<Result<Option<(ServerAddress, Control)>>>(),
+            async |_| std::future::pending().await,
             Instant::now() + Duration::from_millis(10),
         )
         .await;
@@ -2158,7 +2145,7 @@ mod tests {
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { Ok(None) },
+            async |_| Ok(None),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2179,7 +2166,7 @@ mod tests {
         let outcome = discover_all(
             loaded.servers,
             loaded.local_discovery,
-            async { Ok(None) },
+            async |_| Ok(None),
             Instant::now() + DISCOVERY_TIME,
         )
         .await;
@@ -2405,9 +2392,10 @@ mod tests {
         let applied = apply_manage(
             &outcome.servers[0],
             ManageOp::Rename {
-                target: &ManageTarget::Session {
+                target: &ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
+                    scope: ManageScope::Session,
                 },
                 label: "core",
             },
@@ -2437,10 +2425,10 @@ mod tests {
         let applied = apply_manage(
             &outcome.servers[0],
             ManageOp::Rename {
-                target: &ManageTarget::Window {
+                target: &ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
-                    window_id: "window:1".to_owned(),
+                    scope: ManageScope::Window("window:1".to_owned()),
                 },
                 label: "api",
             },
@@ -2462,10 +2450,10 @@ mod tests {
         let applied = apply_manage(
             &outcome.servers[0],
             ManageOp::Rename {
-                target: &ManageTarget::Block {
+                target: &ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
-                    block_id: "block:1".to_owned(),
+                    scope: ManageScope::Block("block:1".to_owned()),
                 },
                 label: "tests",
             },
@@ -2488,10 +2476,10 @@ mod tests {
         let applied = apply_manage(
             &outcome.servers[0],
             ManageOp::Kill {
-                target: &ManageTarget::Block {
+                target: &ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
-                    block_id: "block:2".to_owned(),
+                    scope: ManageScope::Block("block:2".to_owned()),
                 },
             },
             Instant::now() + DISCOVERY_TIME,
@@ -2520,10 +2508,10 @@ mod tests {
         let applied = apply_manage(
             &outcome.servers[0],
             ManageOp::Kill {
-                target: &ManageTarget::Window {
+                target: &ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
-                    window_id: "window:1".to_owned(),
+                    scope: ManageScope::Window("window:1".to_owned()),
                 },
             },
             Instant::now() + DISCOVERY_TIME,
@@ -2559,9 +2547,10 @@ mod tests {
         let applied = apply_manage(
             &outcome.servers[0],
             ManageOp::Kill {
-                target: &ManageTarget::Session {
+                target: &ManageTarget {
                     server_index: 0,
                     session_id: "session:1".to_owned(),
+                    scope: ManageScope::Session,
                 },
             },
             Instant::now() + DISCOVERY_TIME,
@@ -2678,7 +2667,7 @@ mod tests {
                 address: saved_url.parse().unwrap(),
             }],
             LocalDiscovery::Required,
-            std::future::pending::<Result<Option<(ServerAddress, Control)>>>(),
+            async |_| std::future::pending().await,
             Instant::now() + Duration::from_millis(50),
         )
         .await;
@@ -2694,7 +2683,7 @@ mod tests {
                 address: saved_url.parse().unwrap(),
             }],
             LocalDiscovery::Required,
-            async move {
+            async move |_| {
                 let (ctrl, _events) = Control::connect(&saved_addr, None).await?;
                 Ok(Some((saved_addr, ctrl)))
             },
@@ -2788,10 +2777,10 @@ mod tests {
             name: "office".to_owned(),
             address: format!("http://{addr}").parse().unwrap(),
         };
-        let target = ManageTarget::Window {
+        let target = ManageTarget {
             server_index: 0,
             session_id: "session:1".to_owned(),
-            window_id: "window:1".to_owned(),
+            scope: ManageScope::Window("window:1".to_owned()),
         };
 
         let applied_404 = apply_manage(

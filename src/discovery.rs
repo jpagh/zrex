@@ -47,7 +47,7 @@ pub async fn fan_out<T, P, F, Fut>(
     query: F,
 ) -> FanOutOutcome<T>
 where
-    P: Future<Output = Result<Option<(ServerAddress, Control)>>>,
+    P: AsyncFnOnce(&[ServerAddress]) -> Result<Option<(ServerAddress, Control)>>,
     F: Fn(Server, Control, Instant) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
@@ -61,7 +61,7 @@ where
         if local_mode == LocalDiscovery::None {
             return Ok(None);
         }
-        let found = timeout_at(deadline, local_probe)
+        let found = timeout_at(deadline, local_probe(&saved_addresses))
             .await
             .map_err(|_| anyhow!("local server detection timed out"))??;
         let Some((address, ctrl)) = found else {

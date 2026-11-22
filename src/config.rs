@@ -14,7 +14,7 @@ use crate::text::clean_one_line;
 
 pub const DISCOVERY_TIME: Duration = Duration::from_secs(3);
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub servers: BTreeMap<String, String>,
@@ -59,13 +59,15 @@ impl ServerConfig {
         match self {
             Self::Explicit(target) | Self::Env(target) => {
                 if !target.is_empty() && !target.contains("://") {
-                    let config = load_config()?;
-                    if is_builtin_local(&config, target) {
+                    if is_builtin_local(target) {
                         return Control::connect_local_if_running(&[])
                             .await
                             .ok_or_else(|| anyhow::anyhow!("local: server is not running"));
                     }
-                    let server = resolve_server_in(&config, target).await?.server.address;
+                    let server = resolve_server_in(&load_config()?, target)
+                        .await?
+                        .server
+                        .address;
                     let (ctrl, events) = Control::connect(&server, None).await?;
                     return Ok((server, ctrl, events));
                 }
@@ -82,12 +84,8 @@ impl ServerConfig {
     }
 }
 
-pub fn is_builtin_local(config: &Config, target: &str) -> bool {
+pub fn is_builtin_local(target: &str) -> bool {
     target.eq_ignore_ascii_case("local")
-        && !config
-            .servers
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case("local"))
 }
 
 pub fn load_config() -> Result<Config> {
@@ -106,6 +104,10 @@ pub fn parse_saved_servers(config: &Config, command: &str) -> SavedServers {
     let configured = config.servers.len();
     let mut servers = Vec::with_capacity(configured);
     for (name, address) in &config.servers {
+        if is_builtin_local(name) {
+            eprintln!("zrex {command}: ignoring reserved server name `local`");
+            continue;
+        }
         match address.parse() {
             Ok(address) => servers.push(Server {
                 name: name.clone(),
@@ -155,18 +157,18 @@ where
     Fut: Future<Output = ServerAddress>,
 {
     if !target.is_empty() && !target.contains("://") {
-        if let Some(server) = lookup_saved_server(config, target)? {
-            return Ok(ResolvedServer {
-                server,
-                named: true,
-            });
-        }
-        if target.eq_ignore_ascii_case("local") {
+        if is_builtin_local(target) {
             return Ok(ResolvedServer {
                 server: Server {
                     name: "local".to_owned(),
                     address: local().await,
                 },
+                named: true,
+            });
+        }
+        if let Some(server) = lookup_saved_server(config, target)? {
+            return Ok(ResolvedServer {
+                server,
                 named: true,
             });
         }
@@ -314,7 +316,7 @@ mod tests {
             }
         );
 
-        // Explicit `local` entry in config.toml overrides the built-in local alias.
+        // A saved alias cannot redirect an explicit local command.
         let custom_local = sample_config(&[("local", "http://127.0.0.1:9999")]);
         assert_eq!(
             resolve_server_with(&custom_local, "local", fake_local)
@@ -323,7 +325,7 @@ mod tests {
             ResolvedServer {
                 server: Server {
                     name: "local".to_owned(),
-                    address: "http://127.0.0.1:9999".parse().unwrap(),
+                    address: fake_local().await,
                 },
                 named: true,
             }
@@ -389,6 +391,8 @@ mod tests {
     #[tokio::test]
     async fn normalizes_saved_server_addresses_and_rejects_malformed_urls() {
         let config = sample_config(&[
+            ("local", "http://127.0.0.1:9999"),
+            ("LOCAL", "https://ignored.example"),
             ("office", "https://OFFICE.EXAMPLE:443/"),
             ("loopback", "http://127.0.0.1:7297/"),
             ("bad_space", "http://bad host"),
@@ -396,7 +400,7 @@ mod tests {
         ]);
 
         let saved = parse_saved_servers(&config, "ls");
-        assert_eq!(saved.configured, 4);
+        assert_eq!(saved.configured, 6);
         assert_eq!(
             saved.servers,
             vec![

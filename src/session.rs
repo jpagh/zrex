@@ -9,12 +9,9 @@ use crate::text::{clean_one_line, clean_truncated, percent_decode, shorten_home}
 
 pub type PendingCall = oneshot::Receiver<Result<Value>>;
 
-pub async fn optional_reply(call: Result<PendingCall>, deadline: Option<Instant>) -> Option<Value> {
+pub async fn optional_reply(call: Result<PendingCall>, deadline: Instant) -> Option<Value> {
     let rx = call.ok()?;
-    match deadline {
-        Some(deadline) => timeout_at(deadline, rx).await.ok()?.ok()?.ok(),
-        None => rx.await.ok()?.ok(),
-    }
+    timeout_at(deadline, rx).await.ok()?.ok()?.ok()
 }
 
 /// Attaches the control connection to `session_id`. Mutating session, window,
