@@ -246,6 +246,60 @@ pub async fn destroy(ctrl: &mut Control, session_id: &str) -> Result<()> {
 }
 
 /// Renames a session. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn set_label(ctrl: &mut Control, session_id: &str, label: &str) -> Result<()> {
+    ctrl.call(
+        "session.set_label",
+        json!({"session_id": session_id, "label": label}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Renames a window. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn set_window_label(
+    ctrl: &mut Control,
+    session_id: &str,
+    window_id: &str,
+    label: &str,
+) -> Result<()> {
+    ctrl.call(
+        "session.set_window_label",
+        json!({"session_id": session_id, "window_id": window_id, "label": label}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Renames a block. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn set_block_label(ctrl: &mut Control, block: BlockRef<'_>, label: &str) -> Result<()> {
+    ctrl.call(
+        "session.set_block_label",
+        json!({"session_id": block.session_id, "block_id": block.block_id, "label": label}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Closes a window. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn close_window(ctrl: &mut Control, session_id: &str, window_id: &str) -> Result<()> {
+    ctrl.call(
+        "session.close_window",
+        json!({"session_id": session_id, "window_id": window_id}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Closes a block. Requires prior `session::attach` (or `session.bootstrap`).
+pub async fn close_block(ctrl: &mut Control, block: BlockRef<'_>) -> Result<()> {
+    ctrl.call(
+        "block.close",
+        json!({"session_id": block.session_id, "block_id": block.block_id}),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn ensure_window(
     ctrl: &mut Control,
     session_id: &str,
@@ -829,6 +883,33 @@ mod tests {
                             json!({"window_id": "window:default"})
                         }
                     }
+                    "session.set_label" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["label"], "renamed-session");
+                        json!({"revision": 2})
+                    }
+                    "session.set_window_label" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["window_id"], "window:1");
+                        assert_eq!(req["payload"]["label"], "renamed-window");
+                        json!({"revision": 3})
+                    }
+                    "session.set_block_label" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["block_id"], "block:1");
+                        assert_eq!(req["payload"]["label"], "");
+                        json!({"revision": 4})
+                    }
+                    "session.close_window" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["window_id"], "window:1");
+                        json!({"revision": 5})
+                    }
+                    "block.close" => {
+                        assert_eq!(req["payload"]["session_id"], "session:1111-aaaa");
+                        assert_eq!(req["payload"]["block_id"], "block:1");
+                        json!({"block_id": "block:1", "revision": 6})
+                    }
                     other => panic!("unexpected method {other}"),
                 };
                 ws.send(Message::text(
@@ -906,6 +987,22 @@ mod tests {
                 .unwrap(),
             ("window:default".to_owned(), None)
         );
+
+        set_label(&mut ctrl, "session:1111-aaaa", "renamed-session")
+            .await
+            .unwrap();
+        set_window_label(&mut ctrl, "session:1111-aaaa", "window:1", "renamed-window")
+            .await
+            .unwrap();
+        set_block_label(&mut ctrl, BlockRef::new("session:1111-aaaa", "block:1"), "")
+            .await
+            .unwrap();
+        close_window(&mut ctrl, "session:1111-aaaa", "window:1")
+            .await
+            .unwrap();
+        close_block(&mut ctrl, BlockRef::new("session:1111-aaaa", "block:1"))
+            .await
+            .unwrap();
     }
 
     #[test]

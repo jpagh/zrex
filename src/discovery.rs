@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::join_all;
 use tokio::time::{Instant, timeout_at};
 
@@ -6,15 +6,33 @@ use crate::config::Server;
 use crate::rex::{ServerAddress, control::Control};
 use crate::text::clean_one_line;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalDiscovery {
+    None,
+    Optional,
+    Required,
+}
+
 pub struct FanOutOutcome<T> {
     pub entries: Vec<(Server, Result<T>)>,
     pub local_error: Option<String>,
+    pub attempted_any: bool,
 }
 
-pub async fn probe_local(excluded: &[ServerAddress]) -> Result<Option<(ServerAddress, Control)>> {
-    Ok(Control::connect_local_if_running(excluded)
-        .await
-        .map(|(address, ctrl, _events)| (address, ctrl)))
+pub async fn probe_local(
+    mode: LocalDiscovery,
+    excluded: &[ServerAddress],
+) -> Result<Option<(ServerAddress, Control)>> {
+    match mode {
+        LocalDiscovery::None => Ok(None),
+        LocalDiscovery::Optional => Ok(Control::connect_local_if_running(excluded)
+            .await
+            .map(|(address, ctrl, _events)| (address, ctrl))),
+        LocalDiscovery::Required => match Control::connect_local_if_running(&[]).await {
+            Some((address, ctrl, _events)) => Ok(Some((address, ctrl))),
+            None => bail!("local: server is not running"),
+        },
+    }
 }
 
 /// Probes the local server in parallel with saved servers, deduplicating by
@@ -22,6 +40,7 @@ pub async fn probe_local(excluded: &[ServerAddress]) -> Result<Option<(ServerAdd
 /// queried only once under its saved name.
 pub async fn fan_out<T, P, F, Fut>(
     servers: Vec<Server>,
+    local_mode: LocalDiscovery,
     local_probe: P,
     deadline: Instant,
     timeout_context: &'static str,
@@ -39,11 +58,18 @@ where
         .collect();
 
     let local_future = async {
+        if local_mode == LocalDiscovery::None {
+            return Ok(None);
+        }
         let found = timeout_at(deadline, local_probe(&saved_addresses))
             .await
             .map_err(|_| anyhow!("local server detection timed out"))??;
         let Some((address, ctrl)) = found else {
-            return Ok(None);
+            return match local_mode {
+                LocalDiscovery::Optional => Ok(None),
+                LocalDiscovery::Required => bail!("local: server is not running"),
+                LocalDiscovery::None => unreachable!(),
+            };
         };
         if saved_addresses.contains(&address) {
             return Ok(None);
@@ -77,9 +103,11 @@ where
         Err(error) => local_error = Some(clean_one_line(&format!("{error:#}"))),
     }
     entries.extend(servers.into_iter().zip(saved_results));
+    let attempted_any = !entries.is_empty() || local_error.is_some();
 
     FanOutOutcome {
         entries,
         local_error,
+        attempted_any,
     }
 }

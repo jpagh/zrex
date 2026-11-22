@@ -7,6 +7,7 @@ A lightweight command-line client for a [Rex](https://www.superlogical.com/rex/d
 ## Features
 
 - **Session management**: List, create, attach to, and destroy sessions by label, full ID, or 4+ character ID suffix.
+- **Attach picker**: Fuzzy-search existing sessions, windows, and splits across saved Rex servers, create new sessions (`Ctrl-N`) and windows (`Ctrl-T`), and rename (`Ctrl-R`) or kill (`Ctrl-K`) sessions, windows, or blocks on the fly.
 - **Window and split selection**: List windows and split panes (`1.1`, `1.2`, ...), attach to any window or split with `--window` (`-w`) and `--block` (`-b`), or create new windows on demand without changing the active window shown in Rex.app.
 - **Direct terminal pass-through**: Runs in your terminal's normal screen buffer so native scrollback, native mouse text selection, clickable URLs, Kitty graphics, and OSC escape sequences work directly without an intermediate renderer (OSC 0/2 window titles are prefixed with `zrex:` while attached and restored on detach).
 - **Full state rehydration**: Restores scrollback history, cursor state, colors, and terminal modes from the server on attach, and resets terminal modes cleanly on detach.
@@ -26,6 +27,9 @@ cargo build --release
 ## Usage
 
 ```sh
+# Fuzzy-pick an existing session, window, or split
+zrex pick
+
 # List sessions, windows, split blocks, and terminal titles
 zrex -S https://server.example ls
 
@@ -54,6 +58,7 @@ The server is read from `--server` (`-S`), then `REX_SERVER`. It may be a saved 
 
 ```sh
 # Use a saved server alias from config.toml with any command
+zrex -S office pick
 zrex -S office ls
 zrex -S office a work
 zrex -S office kill work
@@ -65,6 +70,14 @@ zrex -S local ls
 
 To reach a Rex server on another machine over Tailscale, use the HTTPS address that `rex server status` reports (for example `https://my-mac.tail1234.ts.net`). The Tailscale node serves HTTPS on port 443, so a bare IP with no port falls back to HTTP on port 80 and is refused.
 
+### Attach Picker
+
+Run `zrex pick`, type to filter, and use the arrow keys (or `Tab`/`Shift-Tab`) and Enter to attach in the same terminal. Press `Ctrl-N` to create a new session (optionally choosing a server and name, or pressing Enter for the default), `Ctrl-T` to create a new window in a session (defaulting to the highlighted target's session), `Ctrl-R` to rename the highlighted session, window, or block (clearing with `Ctrl-U` restores the server default), or `Ctrl-K` to kill a session, window, or block (use `Tab`/arrows or `s`/`w`/`b` to choose the scope, and `Enter`/`y` to confirm). Renames and kills update the picker in place so you can keep working without leaving it. `Ctrl-U` clears the current input, `Esc` backs out of a prompt or cancels the picker, and `Ctrl-C` cancels immediately. `Ctrl-\` detaches straight back to your shell.
+
+Use `Alt/Option-←` and `Alt/Option-→` to move by word. `Ctrl-←`/`Ctrl-→` and `Alt-B`/`Alt-F` also work, depending on what your terminal sends. `Home`/`End` or `Ctrl-A`/`Ctrl-E` go to the start or end of the query.
+
+Each row shows the server, session, window/split index, foreground process (and any custom window or split label), plus the terminal title and OSC 7501 program status when Rex has them. You can search the displayed text, for example `blocked`, `zsh`, or `zrex 22`. If a pane reports multiple statuses, the picker shows the one that most needs attention. Metadata is fetched when the picker opens.
+
 To search multiple servers, save their names and addresses in `~/.config/zrex/config.toml` (or `$XDG_CONFIG_HOME/zrex/config.toml`):
 
 ```toml
@@ -73,7 +86,9 @@ office = "https://office.example.com"
 lab = "https://lab.example.com"
 ```
 
-`zrex ls` (without `--server` or `REX_SERVER`) lists sessions from any running local server and saved servers in `config.toml`, silently skipping an absent local server when saved servers are configured and exiting with an error when no local or saved server is available.
+Each choice shows its server name. `zrex pick` searches the saved servers alongside a running local server (or `REX_SERVER`, if set); if no local server is running, it is silently skipped. If no local server, `REX_SERVER`, or saved server is configured, it prints a short getting-started message and exits with status 0. Servers are queried in parallel with a short timeout, so an unreachable server doesn't prevent you from picking from another one. Use `zrex -S SERVER pick` (with a saved server name, `local`, or a URL) to search just one server.
+
+`zrex ls` (without `--server` or `REX_SERVER`) likewise lists sessions from any running local server and saved servers in `config.toml`, silently skipping an absent local server when saved servers are configured and exiting with an error when no local or saved server is available.
 
 ### Selecting Sessions, Windows, and Blocks
 

@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod discovery;
+mod picker;
 mod rex;
 mod session;
 mod text;
@@ -15,7 +16,7 @@ use serde_json::Value;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::config::{DISCOVERY_TIME, Server, ServerConfig};
-use crate::discovery::{fan_out, probe_local};
+use crate::discovery::{LocalDiscovery, fan_out, probe_local};
 use crate::rex::control::Control;
 use crate::rex::{BlockRef, ServerAddress};
 use crate::text::{clean_one_line, clean_truncated};
@@ -24,6 +25,7 @@ const USAGE: &str = "\
 zrex: use a session on a Rex server from a terminal
 
 Usage:
+  zrex [--server SERVER] pick
   zrex [--server SERVER] ls
   zrex [--server SERVER] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
   zrex [--server SERVER] kill SESSION
@@ -52,7 +54,14 @@ saved servers from ~/.config/zrex/config.toml (or $XDG_CONFIG_HOME/zrex/config.t
 skipping an absent local server when saved servers are configured and returning
 an error when neither is available. completion prints a shell completion script
 that completes server names, session labels, window numbers and labels, and
-block numbers and labels.
+block numbers and labels. zrex pick
+fuzzy-searches existing sessions, windows, and splits on the default (when
+running) and saved servers (~/.config/zrex/config.toml, or
+$XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that server.
+Enter attaches, Ctrl-N
+creates a new session, Ctrl-T creates a new window in a session, Ctrl-R renames
+a session, window, or block, Ctrl-K kills a session, window, or block, and Esc,
+Ctrl-C, or Ctrl-backslash cancels.
 
 While attached:
   Ctrl-backslash          detach, and leave the session running
@@ -65,6 +74,7 @@ enum Command {
     Help,
     Version,
     List,
+    Pick,
     Attach {
         target: Option<String>,
         window: Option<String>,
@@ -80,17 +90,19 @@ enum Command {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Subcommand {
     List,
+    Pick,
     Attach,
     Kill,
     Completion,
 }
 
 impl Subcommand {
-    const COMPLETION_NAMES: [&str; 5] = ["a", "attach", "kill", "ls", "completion"];
+    const COMPLETION_NAMES: [&str; 6] = ["a", "attach", "kill", "ls", "pick", "completion"];
 
     fn parse(name: &str) -> Option<Self> {
         match name {
             "ls" => Some(Self::List),
+            "pick" => Some(Self::Pick),
             "a" | "attach" => Some(Self::Attach),
             "kill" => Some(Self::Kill),
             "completion" => Some(Self::Completion),
@@ -211,6 +223,12 @@ fn parse_args(
                 }
                 Command::List
             }
+            Some(Subcommand::Pick) => {
+                if target.is_some() || window.is_some() || block.is_some() {
+                    anyhow::bail!("usage: zrex [--server SERVER] pick");
+                }
+                Command::Pick
+            }
             Some(Subcommand::Attach) => Command::Attach {
                 target,
                 window,
@@ -271,6 +289,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::List => list(&server_config).await,
+        Command::Pick => picker::run(&server_config).await,
         Command::Attach {
             target,
             window,
@@ -332,7 +351,7 @@ async fn list_multi(servers: Vec<Server>) -> Result<()> {
     let deadline = Instant::now() + DISCOVERY_TIME;
     let report = collect_multi_list(
         servers,
-        async |excluded| probe_local(excluded).await,
+        async |excluded| probe_local(LocalDiscovery::Optional, excluded).await,
         deadline,
     )
     .await;
@@ -365,6 +384,7 @@ async fn collect_multi_list(
 ) -> MultiListReport {
     let outcome = fan_out(
         servers,
+        LocalDiscovery::Optional,
         local_probe,
         deadline,
         "listing timed out",
@@ -629,9 +649,9 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
             Completion::Sessions
         }
         Some(Some(Subcommand::Attach)) => Completion::Flags { attach: true },
-        Some(Some(Subcommand::Kill | Subcommand::List | Subcommand::Completion)) => {
-            Completion::Flags { attach: false }
-        }
+        Some(Some(
+            Subcommand::Kill | Subcommand::List | Subcommand::Pick | Subcommand::Completion,
+        )) => Completion::Flags { attach: false },
         Some(None) => Completion::Nothing,
     }
 }
@@ -836,6 +856,26 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn pick_distinguishes_a_server_override_from_the_environment_default() {
+        let env = Some("https://default.example".to_owned());
+        assert_eq!(
+            parse_args(args(&["pick"]), env.clone()).unwrap(),
+            (
+                ServerConfig::Env("https://default.example".to_owned()),
+                Command::Pick
+            )
+        );
+        assert_eq!(
+            parse_args(args(&["pick", "-S", "https://only.example"]), env).unwrap(),
+            (
+                ServerConfig::Explicit("https://only.example".to_owned()),
+                Command::Pick
+            )
+        );
+        assert!(parse_args(args(&["pick", "--window", "1"]), None).is_err());
     }
 
     #[test]
