@@ -1,7 +1,26 @@
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
+use tokio::time::{Instant, timeout_at};
 
+use crate::rex::BlockRef;
 use crate::rex::control::Control;
+use crate::text::{clean_one_line, clean_truncated, percent_decode, shorten_home};
+
+pub type PendingCall = oneshot::Receiver<Result<Value>>;
+
+pub async fn optional_reply(call: Result<PendingCall>, deadline: Instant) -> Option<Value> {
+    let rx = call.ok()?;
+    timeout_at(deadline, rx).await.ok()?.ok()?.ok()
+}
+
+/// Attaches the control connection to `session_id`. Mutating session, window,
+/// or block RPCs require prior `attach` (or `session.bootstrap`).
+pub async fn attach(ctrl: &mut Control, session_id: &str) -> Result<()> {
+    ctrl.call("session.attach", json!({"session_id": session_id}))
+        .await?;
+    Ok(())
+}
 
 pub async fn list(ctrl: &mut Control) -> Result<Vec<Value>> {
     let reply = ctrl.call("session.list", Value::Null).await?;
@@ -30,14 +49,203 @@ pub async fn view(ctrl: &mut Control, session_id: &str) -> Result<Value> {
         .await
 }
 
+pub fn start_view(ctrl: &mut Control, session_id: &str) -> Result<PendingCall> {
+    ctrl.start_call("session.view", json!({"session_id": session_id}))
+}
+
+pub fn start_terminal_title(ctrl: &mut Control, block: BlockRef<'_>) -> Result<PendingCall> {
+    ctrl.start_call(
+        "com.superlogical.terminal.title",
+        json!({"session_id": block.session_id, "block_id": block.block_id}),
+    )
+}
+
+pub fn start_terminal_process(ctrl: &mut Control, block: BlockRef<'_>) -> Result<PendingCall> {
+    ctrl.start_call(
+        "com.superlogical.terminal.process",
+        json!({"session_id": block.session_id, "block_id": block.block_id}),
+    )
+}
+
+pub fn terminal_title_of(reply: &Value) -> Option<&str> {
+    reply
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty())
+}
+
+/// Returns the terminal title unless its `owner` is known to have exited from
+/// the pane's live process tree.
+pub fn live_terminal_title<'a>(
+    title_reply: &'a Value,
+    process_reply: Option<&Value>,
+) -> Option<&'a str> {
+    let title = terminal_title_of(title_reply)?;
+    let Some(owner) = title_reply.get("owner").and_then(process_identity) else {
+        return Some(title);
+    };
+    let Some(process_reply) = process_reply else {
+        return Some(title);
+    };
+
+    let mut saw_live = false;
+    let live = [process_reply.get("foreground"), process_reply.get("child")]
+        .into_iter()
+        .flatten()
+        .chain(
+            process_reply
+                .get("ancestors")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+        .filter_map(process_identity);
+    for identity in live {
+        saw_live = true;
+        if identity == owner {
+            return Some(title);
+        }
+    }
+
+    let exited = process_reply
+        .get("last_exit")
+        .is_some_and(|value| !value.is_null());
+    if saw_live || exited {
+        None
+    } else {
+        Some(title)
+    }
+}
+
+fn process_identity(value: &Value) -> Option<(i64, &str)> {
+    let pid = value.get("pid")?.as_i64()?;
+    let name = value.get("name")?.as_str()?;
+    Some((pid, name))
+}
+
+/// Follows Rex's `com.superlogical.terminal.process` guidance: prefer `script`,
+/// then `argv0`, then `name`, reduced to a short display name.
+pub fn process_name(reply: &Value) -> Option<String> {
+    reply
+        .get("foreground")
+        .and_then(label_for_process)
+        .or_else(|| reply.get("child").and_then(label_for_process))
+}
+
+fn label_for_process(process: &Value) -> Option<String> {
+    if process.is_null() {
+        return None;
+    }
+    for (key, strip_login_dash) in [("script", false), ("argv0", true), ("name", false)] {
+        let Some(raw) = process.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let cleaned = clean_one_line(raw);
+        let candidate = if strip_login_dash {
+            cleaned.strip_prefix('-').unwrap_or(&cleaned)
+        } else {
+            &cleaned
+        };
+        let base = basename(candidate);
+        let base = if strip_login_dash {
+            base.strip_prefix('-').unwrap_or(base)
+        } else {
+            base
+        };
+        let short = clean_truncated(base, 24);
+        if !short.is_empty() {
+            return Some(short);
+        }
+    }
+    None
+}
+
+fn basename(value: &str) -> &str {
+    let trimmed = value.trim_end_matches(['/', '\\']);
+    trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
+}
+
+/// Derives a pane's display title from its live terminal title, falling back
+/// to the foreground process name (and OSC 7 working directory when a VT
+/// snapshot is available).
+pub fn resolved_terminal_title(
+    title_reply: Option<&Value>,
+    process_reply: Option<&Value>,
+    screen: Option<&[u8]>,
+) -> Option<String> {
+    title_reply
+        .and_then(|reply| live_terminal_title(reply, process_reply))
+        .map(clean_one_line)
+        .filter(|title| !title.is_empty())
+        .or_else(|| process_pwd_title(process_reply, screen))
+}
+
+pub fn process_pwd_title(process_reply: Option<&Value>, screen: Option<&[u8]>) -> Option<String> {
+    let process = process_reply.and_then(process_name);
+    let pwd = screen.and_then(extract_osc_pwd);
+    match (process, pwd) {
+        (Some(proc_name), Some(dir)) => Some(format!("{proc_name} {dir}")),
+        (Some(proc_name), None) => Some(proc_name),
+        (None, Some(dir)) => Some(dir),
+        (None, None) => None,
+    }
+}
+
+fn extract_osc_pwd(bytes: &[u8]) -> Option<String> {
+    let start = bytes.windows(4).rposition(|w| w == b"\x1b]7;")?;
+    let rest = &bytes[start + 4..];
+    let end = rest
+        .iter()
+        .position(|&b| b == 0x07)
+        .into_iter()
+        .chain(rest.windows(2).position(|w| w == b"\x1b\\"))
+        .min()?;
+    let raw = std::str::from_utf8(&rest[..end]).ok()?;
+    let path = if let Some(after_scheme) = raw.strip_prefix("file://") {
+        let slash = after_scheme.find('/')?;
+        &after_scheme[slash..]
+    } else if raw.starts_with('/') {
+        raw
+    } else {
+        return None;
+    };
+    let decoded = clean_one_line(&percent_decode(path));
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(shorten_home(&decoded))
+}
+
+pub fn fallback_title_for(bootstrap: &Value, view: &Value, block_id: &str) -> Option<String> {
+    let window_label = windows(view)
+        .into_iter()
+        .find(|window| window.blocks.iter().any(|block| block.id == block_id))
+        .map(|window| clean_one_line(&window.label))
+        .filter(|label| !label.is_empty() && !is_default_window_label(label));
+    if window_label.is_some() {
+        return window_label;
+    }
+    bootstrap
+        .get("selected_session")
+        .map(label_of)
+        .map(clean_one_line)
+        .filter(|label| !label.is_empty())
+}
+
+pub fn is_default_window_label(label: &str) -> bool {
+    label
+        .strip_prefix("Window ")
+        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// Destroys a session. Requires prior `session::attach` (or `session.bootstrap`).
 pub async fn destroy(ctrl: &mut Control, session_id: &str) -> Result<()> {
-    ctrl.call("session.attach", json!({"session_id": session_id}))
-        .await?;
     ctrl.call("session.destroy", json!({"session_id": session_id}))
         .await?;
     Ok(())
 }
 
+/// Renames a session. Requires prior `session::attach` (or `session.bootstrap`).
 pub async fn ensure_window(
     ctrl: &mut Control,
     session_id: &str,
@@ -49,18 +257,14 @@ pub async fn ensure_window(
         return Ok((window_id, block.map(str::to_owned)));
     }
     let view = view(ctrl, session_id).await?;
-    if let Some(window_id) = find_window(&view, selector) {
-        return Ok((window_id, block.map(str::to_owned)));
+    if let Some((window, block)) = resolve_window(&windows(&view), selector, block) {
+        return Ok((window.id.clone(), block.map(str::to_owned)));
     }
     if block.is_none()
-        && let Some((win_sel, blk_sel)) = split_window_block(selector)
+        && let Some((win_sel, _)) = split_window_block(selector)
+        && win_sel.parse::<usize>().is_ok()
     {
-        if let Some(window_id) = find_window(&view, win_sel) {
-            return Ok((window_id, Some(blk_sel.to_owned())));
-        }
-        if win_sel.parse::<usize>().is_ok() {
-            bail!("the session has no window {win_sel}");
-        }
+        bail!("the session has no window {win_sel}");
     }
     if selector.parse::<usize>().is_ok() {
         bail!("the session has no window {selector}");
@@ -91,16 +295,23 @@ pub async fn new_window(
         .ok_or_else(|| anyhow!("session.new_window returned no window"))
 }
 
-fn names(session: &Value, target: &str) -> bool {
+pub fn matches(session: &Value, target: &str) -> bool {
     let id = id_of(session);
     id == target
         || label_of(session).eq_ignore_ascii_case(target)
         || (target.len() >= 4 && id.ends_with(target))
 }
 
+pub fn select_session<'a>(sessions: &'a [Value], target: Option<&str>) -> Option<&'a Value> {
+    match target {
+        Some(target) => sessions.iter().find(|session| matches(session, target)),
+        None => sessions.first(),
+    }
+}
+
 pub async fn find_or_create(ctrl: &mut Control, target: &str) -> Result<String> {
     let sessions = list(ctrl).await?;
-    match sessions.iter().find(|session| names(session, target)) {
+    match select_session(&sessions, Some(target)) {
         Some(session) => Ok(id_of(session)),
         None => create(ctrl, Some(target)).await,
     }
@@ -111,12 +322,10 @@ pub async fn pick(ctrl: &mut Control, target: Option<&str>) -> Result<String> {
     if sessions.is_empty() {
         bail!("the server has no sessions");
     }
-    let Some(target) = target else {
-        return Ok(id_of(&sessions[0]));
-    };
-    if let Some(session) = sessions.iter().find(|session| names(session, target)) {
+    if let Some(session) = select_session(&sessions, target) {
         return Ok(id_of(session));
     }
+    let target = target.expect("a nonempty session list has a default");
     let known = sessions
         .iter()
         .map(|session| format!("  {} ({})", label_of(session), id_of(session)))
@@ -162,8 +371,17 @@ pub fn active_window_id(view: &Value) -> Option<&str> {
 pub struct WindowSummary {
     pub id: String,
     pub label: String,
+    pub focused_block_id: Option<String>,
     pub active_block_id: Option<String>,
     pub blocks: Vec<BlockSummary>,
+}
+
+impl WindowSummary {
+    pub fn active_or_first_block_id(&self) -> Option<&str> {
+        self.active_block_id
+            .as_deref()
+            .or_else(|| self.blocks.first().map(|block| block.id.as_str()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,29 +395,14 @@ pub fn block_of(
     window_selector: Option<&str>,
     block_selector: Option<&str>,
 ) -> Option<String> {
-    let (window_id, block_sel) = match window_selector {
-        Some(selector) => {
-            if let Some(id) = find_window(view, selector) {
-                (id, block_selector)
-            } else if block_selector.is_none()
-                && let Some((win_sel, blk_sel)) = split_window_block(selector)
-                && let Some(id) = find_window(view, win_sel)
-            {
-                (id, Some(blk_sel))
-            } else {
-                return None;
-            }
-        }
-        None => (active_window_id(view)?.to_owned(), block_selector),
+    let windows = windows(view);
+    let (window, block_sel) = match window_selector {
+        Some(selector) => resolve_window(&windows, selector, block_selector)?,
+        None => (select_window(view, &windows, None)?, block_selector),
     };
-    let window = windows(view)
-        .into_iter()
-        .find(|window| window.id == window_id)?;
     match block_sel {
-        Some(selector) => find_block(&window, selector),
-        None => window
-            .active_block_id
-            .or_else(|| window.blocks.into_iter().next().map(|block| block.id)),
+        Some(selector) => find_block(window, selector),
+        None => window.active_or_first_block_id().map(str::to_owned),
     }
 }
 
@@ -216,11 +419,15 @@ pub fn windows(view: &Value) -> Vec<WindowSummary> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            let focused_block_id = window
+                .get("focused_block_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let active_block_id = window
                 .get("zoomed_block_id")
                 .and_then(Value::as_str)
-                .or_else(|| window.get("focused_block_id").and_then(Value::as_str))
-                .map(str::to_owned);
+                .map(str::to_owned)
+                .or_else(|| focused_block_id.clone());
             let mut blocks = Vec::new();
             if let Some(layers) = window.get("layers").and_then(Value::as_array) {
                 for layer in layers {
@@ -251,6 +458,7 @@ pub fn windows(view: &Value) -> Vec<WindowSummary> {
             Some(WindowSummary {
                 id,
                 label,
+                focused_block_id,
                 active_block_id,
                 blocks,
             })
@@ -314,25 +522,53 @@ fn layer_holds(layer: &Value, block_id: &str) -> bool {
     listed || drawn
 }
 
-pub fn find_window(view: &Value, selector: &str) -> Option<String> {
-    let windows = windows(view);
+pub fn select_window<'a>(
+    view: &Value,
+    windows: &'a [WindowSummary],
+    selector: Option<&str>,
+) -> Option<&'a WindowSummary> {
+    match selector {
+        Some("-") => None,
+        Some(selector) => find_window(windows, selector),
+        None => {
+            let id = active_window_id(view)?;
+            windows.iter().find(|window| window.id == id)
+        }
+    }
+}
+
+fn resolve_window<'a, 's>(
+    windows: &'a [WindowSummary],
+    selector: &'s str,
+    block: Option<&'s str>,
+) -> Option<(&'a WindowSummary, Option<&'s str>)> {
+    if let Some(window) = find_window(windows, selector) {
+        return Some((window, block));
+    }
+    if block.is_none() {
+        let (window, block) = split_window_block(selector)?;
+        return Some((find_window(windows, window)?, Some(block)));
+    }
+    None
+}
+
+fn find_window<'a>(windows: &'a [WindowSummary], selector: &str) -> Option<&'a WindowSummary> {
     if let Some(window) = windows.iter().find(|window| window.id == selector) {
-        return Some(window.id.clone());
+        return Some(window);
     }
     if let Ok(number) = selector.parse::<usize>()
         && let Some(window) = number.checked_sub(1).and_then(|idx| windows.get(idx))
     {
-        return Some(window.id.clone());
+        return Some(window);
     }
     if let Some(window) = windows.iter().find(|window| window.label == selector) {
-        return Some(window.id.clone());
+        return Some(window);
     }
     only(
         windows
             .iter()
             .filter(|window| window.label.starts_with(selector)),
     )
-    .map(|window| window.id.clone())
 }
 
 pub fn find_block(window: &WindowSummary, selector: &str) -> Option<String> {
@@ -430,12 +666,12 @@ mod tests {
     #[test]
     fn names_match_a_label_an_id_or_the_tail_of_an_id() {
         let work = session("session:01a1a9ff-0560", "work");
-        assert!(names(&work, "work"));
-        assert!(names(&work, "WORK"));
-        assert!(names(&work, "session:01a1a9ff-0560"));
-        assert!(names(&work, "0560"));
-        assert!(!names(&work, "056"));
-        assert!(!names(&work, "rest"));
+        assert!(matches(&work, "work"));
+        assert!(matches(&work, "WORK"));
+        assert!(matches(&work, "session:01a1a9ff-0560"));
+        assert!(matches(&work, "0560"));
+        assert!(!matches(&work, "056"));
+        assert!(!matches(&work, "rest"));
     }
 
     #[test]
@@ -449,13 +685,15 @@ mod tests {
     #[test]
     fn finds_a_window_by_number_or_label() {
         let view = sample_view(&["build", "logs", "logs-old"], "build");
-        assert_eq!(find_window(&view, "2").as_deref(), Some("window:logs"));
-        assert_eq!(find_window(&view, "0"), None);
-        assert_eq!(find_window(&view, "4"), None);
-        assert_eq!(find_window(&view, "logs").as_deref(), Some("window:logs"));
-        assert_eq!(find_window(&view, "log"), None);
-        assert_eq!(find_window(&view, "build").as_deref(), Some("window:build"));
-        assert_eq!(find_window(&view, "nope"), None);
+        let windows = windows(&view);
+        let id = |selector| select_window(&view, &windows, selector).map(|w| w.id.as_str());
+        assert_eq!(id(Some("2")), Some("window:logs"));
+        assert_eq!(id(Some("0")), None);
+        assert_eq!(id(Some("4")), None);
+        assert_eq!(id(Some("logs")), Some("window:logs"));
+        assert_eq!(id(Some("log")), None);
+        assert_eq!(id(Some("build")), Some("window:build"));
+        assert_eq!(id(Some("nope")), None);
     }
 
     #[test]
@@ -570,12 +808,27 @@ mod tests {
                     "session.list" => json!({
                         "sessions": [{"session_id": "session:1111-aaaa", "label": "work"}]
                     }),
-                    "session.create" => json!({"session_id": "session:2222-bbbb"}),
+                    "session.create" => {
+                        if let Some(label) = req["payload"].get("label").and_then(Value::as_str) {
+                            json!({"session_id": format!("session:2222-{label}")})
+                        } else {
+                            json!({"session_id": "session:2222-default"})
+                        }
+                    }
                     "session.view" => json!({
                         "active_window_id": "window:1",
                         "windows": [{"window_id": "window:1", "label": "editor", "focused_block_id": "block:1"}]
                     }),
-                    "session.new_window" => json!({"window_id": "window:2"}),
+                    "session.new_window" => {
+                        assert_eq!(req["payload"]["focus"], json!(false));
+                        if let Some(label) =
+                            req["payload"].get("window_label").and_then(Value::as_str)
+                        {
+                            json!({"window_id": format!("window:{label}")})
+                        } else {
+                            json!({"window_id": "window:default"})
+                        }
+                    }
                     other => panic!("unexpected method {other}"),
                 };
                 ws.send(Message::text(
@@ -602,7 +855,15 @@ mod tests {
         );
         assert_eq!(
             find_or_create(&mut ctrl, "fresh").await.unwrap(),
-            "session:2222-bbbb"
+            "session:2222-fresh"
+        );
+        assert_eq!(
+            create(&mut ctrl, None).await.unwrap(),
+            "session:2222-default"
+        );
+        assert_eq!(
+            create(&mut ctrl, Some("named")).await.unwrap(),
+            "session:2222-named"
         );
 
         assert_eq!(
@@ -637,13 +898,183 @@ mod tests {
             ensure_window(&mut ctrl, "session:1111-aaaa", "logs", None)
                 .await
                 .unwrap(),
-            ("window:2".to_owned(), None)
+            ("window:logs".to_owned(), None)
         );
         assert_eq!(
             ensure_window(&mut ctrl, "session:1111-aaaa", "-", None)
                 .await
                 .unwrap(),
-            ("window:2".to_owned(), None)
+            ("window:default".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn filters_stale_terminal_titles_using_process_owner() {
+        let pi_title = json!({
+            "title": "π - jack",
+            "owner": {"pid": 420, "name": "node"}
+        });
+        let pi_running = json!({
+            "last_exit": null,
+            "foreground": {"pid": 420, "name": "node"},
+            "child": {"pid": 100, "name": "login"},
+            "ancestors": [{"pid": 200, "name": "zsh"}]
+        });
+        assert_eq!(
+            live_terminal_title(&pi_title, Some(&pi_running)),
+            Some("π - jack")
+        );
+
+        let pi_in_ancestors = json!({
+            "last_exit": null,
+            "foreground": {"pid": 500, "name": "cargo"},
+            "ancestors": [{"pid": 420, "name": "node"}, {"pid": 200, "name": "zsh"}]
+        });
+        assert_eq!(
+            live_terminal_title(&pi_title, Some(&pi_in_ancestors)),
+            Some("π - jack")
+        );
+
+        // Process exited back to zsh -> stale title is dropped.
+        let back_to_zsh = json!({
+            "last_exit": null,
+            "foreground": {"pid": 200, "name": "zsh"},
+            "child": {"pid": 100, "name": "login"}
+        });
+        assert_eq!(live_terminal_title(&pi_title, Some(&back_to_zsh)), None);
+
+        // PID reused by a different executable name -> still stale.
+        let reused_pid = json!({
+            "last_exit": null,
+            "foreground": {"pid": 420, "name": "zsh"}
+        });
+        assert_eq!(live_terminal_title(&pi_title, Some(&reused_pid)), None);
+
+        // Terminal exited completely -> stale.
+        let exited = json!({
+            "last_exit": {"exit_code": 0},
+            "foreground": null,
+            "child": null
+        });
+        assert_eq!(live_terminal_title(&pi_title, Some(&exited)), None);
+
+        // Missing owner or unreadable process list preserves the title.
+        let unowned = json!({"title": "manual title"});
+        assert_eq!(
+            live_terminal_title(&unowned, Some(&back_to_zsh)),
+            Some("manual title")
+        );
+        assert_eq!(live_terminal_title(&pi_title, None), Some("π - jack"));
+        assert_eq!(
+            live_terminal_title(&pi_title, Some(&json!({"last_exit": null}))),
+            Some("π - jack")
+        );
+    }
+
+    #[test]
+    fn process_name_prefers_script_then_argv0_then_name() {
+        assert_eq!(
+            process_name(&json!({
+                "foreground": {
+                    "script": "/opt/homebrew/bin/agy",
+                    "argv0": "node",
+                    "name": "node"
+                }
+            }))
+            .as_deref(),
+            Some("agy")
+        );
+        assert_eq!(
+            process_name(&json!({
+                "foreground": {
+                    "argv0": "-zsh",
+                    "name": "zsh"
+                }
+            }))
+            .as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(
+            process_name(&json!({
+                "foreground": {
+                    "argv0": "/bin/zsh",
+                    "name": "zsh"
+                }
+            }))
+            .as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(
+            process_name(&json!({
+                "foreground": null,
+                "child": {
+                    "argv0": "",
+                    "name": "fish"
+                }
+            }))
+            .as_deref(),
+            Some("fish")
+        );
+        assert_eq!(
+            process_name(&json!({"foreground": null, "child": null})),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_title_prefers_custom_window_label_and_falls_back_to_session_label() {
+        let view = json!({
+            "windows": [
+                {
+                    "window_id": "window:1",
+                    "label": "Antigravity ~/Projects/zrex",
+                    "layers": [{"blocks": [{"block_id": "block:1"}]}]
+                },
+                {
+                    "window_id": "window:2",
+                    "label": "Window 1234abcd",
+                    "layers": [{"blocks": [{"block_id": "block:2"}]}]
+                }
+            ]
+        });
+        let bootstrap = json!({
+            "selected_session": {
+                "label": "work",
+                "view": view
+            }
+        });
+        assert_eq!(
+            fallback_title_for(&bootstrap, &view, "block:1").as_deref(),
+            Some("Antigravity ~/Projects/zrex")
+        );
+        assert_eq!(
+            fallback_title_for(&bootstrap, &view, "block:2").as_deref(),
+            Some("work")
+        );
+    }
+
+    #[test]
+    fn resolved_terminal_title_prefers_live_title_then_process_and_osc7_pwd() {
+        let process = json!({"foreground": {"pid": 200, "argv0": "-zsh", "name": "zsh"}});
+        let screen = b"hello\x1b]7;file://MacBook.local/tmp/my%20dir\x07world";
+        let live = json!({"title": "vim", "owner": {"pid": 200, "name": "zsh"}});
+        let stale = json!({"title": "old", "owner": {"pid": 999, "name": "node"}});
+
+        assert_eq!(
+            resolved_terminal_title(Some(&live), Some(&process), Some(screen)).as_deref(),
+            Some("vim")
+        );
+        assert_eq!(
+            resolved_terminal_title(Some(&stale), Some(&process), Some(screen)).as_deref(),
+            Some("zsh /tmp/my dir")
+        );
+        assert_eq!(
+            resolved_terminal_title(Some(&stale), Some(&process), None).as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(
+            process_pwd_title(Some(&process), Some(b"no osc7")).as_deref(),
+            Some("zsh")
         );
     }
 }
