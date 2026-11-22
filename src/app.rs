@@ -9,20 +9,30 @@ use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-use crate::rex::ServerAddress;
-use crate::rex::control::{Control, Events};
+use crate::config::ServerConfig;
+use crate::rex::control::{CALL_TIME, CallTimeout, Control, Events};
 use crate::rex::data::{self, Data, StreamClosed};
 use crate::rex::proto;
 use crate::rex::stream::{self, Filter};
+use crate::rex::{BlockRef, ServerAddress, format_timeout};
 use crate::session;
 
 const DATA_REF: &str = "terminal";
 const MAX_BLOB_BYTES: usize = 983_040;
+/// Cap total reassembled blob/clipboard size so a misbehaving server cannot
+/// cause unbounded memory growth.
+const MAX_TOTAL_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const BLOB_READ_TIME: Duration = CALL_TIME;
+/// Cap each `com.superlogical.terminal.write` request so huge pastes stay well
+/// within WebSocket frame limits while normal input goes out in one call.
+const MAX_WRITE_BYTES: usize = 64 * 1024;
 const PROBE_EVERY: Duration = Duration::from_secs(10);
 const PROBE_TIME: Duration = Duration::from_secs(5);
+const DETACH_TIME: Duration = Duration::from_secs(1);
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(5);
 const THEME_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+const TITLE_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 /// An unterminated local reply grows no larger than this before zrex stops
 /// holding it and forwards the bytes as input. The longest reply a terminal
 /// sends is a 256-color palette entry at 29 bytes.
@@ -54,6 +64,7 @@ const RESET_MODES: &[u8] = concat!(
     "\x1b[r",
     "\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\",
     "\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07",
+    "\x1b[23;0t",
     "\x1b[?25h",
     "\x1b[0m\r\n",
 )
@@ -101,48 +112,60 @@ impl Theme {
     }
 }
 
+pub fn has_terminal() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
 pub fn ensure_terminal() -> Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if !has_terminal() {
         bail!("zrex needs a terminal to attach to a session");
     }
     Ok(())
 }
 
 pub async fn attach(
-    server: &ServerAddress,
+    server_config: &ServerConfig,
     target: Option<String>,
     window: Option<String>,
     block: Option<String>,
 ) -> Result<()> {
     ensure_terminal()?;
-    let (mut ctrl, mut events) = Control::connect(server, None).await?;
+    let (server, mut ctrl, events) = server_config.connect().await?;
     let session_id = match target.as_deref() {
         Some(target) => session::find_or_create(&mut ctrl, target).await?,
         None => session::pick(&mut ctrl, None).await?,
     };
     let (window, block) = match window.as_deref() {
         Some(selector) => {
-            ctrl.call("session.attach", json!({"session_id": session_id}))
-                .await?;
+            session::attach(&mut ctrl, &session_id).await?;
             let (win_id, blk) =
                 session::ensure_window(&mut ctrl, &session_id, selector, block.as_deref()).await?;
             (Some(win_id), blk)
         }
         None => (None, block),
     };
+    attach_block(
+        &server,
+        ctrl,
+        events,
+        &session_id,
+        (window.as_deref(), block.as_deref()),
+    )
+    .await
+}
+
+async fn attach_block(
+    server: &ServerAddress,
+    mut ctrl: Control,
+    mut events: Events,
+    session_id: &str,
+    selection: (Option<&str>, Option<&str>),
+) -> Result<()> {
     let size = crossterm::terminal::size()?;
     let mut guard = Screen::enter()?;
     let (theme, probe_tail) = guard.probe_theme();
-    let mut attached = Attached::start(
-        &mut ctrl,
-        &session_id,
-        server,
-        window.as_deref(),
-        block.as_deref(),
-        size,
-        theme,
-    )
-    .await?;
+    let mut attached =
+        Attached::start(&mut ctrl, session_id, server, selection, size, theme).await?;
     // Replies the probe deadline cut off arrive after it returns, so the reader
     // that takes over stdin starts out holding the fragment it left.
     attached.replies.hold(probe_tail);
@@ -213,12 +236,31 @@ pub async fn attach(
             Some(bytes) = input.recv() => {
                 match attached.burst(&bytes, &mut input, &mut ctrl).await {
                     Ok(Flow::Detach) => {
-                        detach(&mut ctrl, &attached).await;
+                        detach(&mut ctrl, &mut attached).await;
                         guard.leave()?;
                         println!("detached from {}", attached.session_id);
                         return Ok(());
                     }
                     Ok(Flow::Continue) => {}
+                    Err(error) => lost = Some(error),
+                }
+            }
+            // Rex runs `com.superlogical.terminal.write` calls concurrently, so
+            // wait for each write to be queued on the server before sending the
+            // next coalesced batch.
+            result = finish_write(&mut attached.write_inflight) => {
+                match result {
+                    Ok(_) => {
+                        if let Err(error) = attached.pump_write(&mut ctrl) {
+                            lost = Some(error);
+                        }
+                    }
+                    Err(error) if write_target_gone(&error) => {
+                        // The block or session already closed on the server;
+                        // wait for the close event or data stream end instead
+                        // of failing the attach loop with an error.
+                        attached.write_queue.clear();
+                    }
                     Err(error) => lost = Some(error),
                 }
             }
@@ -244,12 +286,11 @@ pub async fn attach(
             _ = probe.tick() => {
                 // A socket reports a dead network only when something uses
                 // it, so use it.
-                match tokio::time::timeout(PROBE_TIME, ctrl.call("server.version", Value::Null))
+                if let Err(error) = ctrl
+                    .call_with_timeout("server.version", Value::Null, PROBE_TIME)
                     .await
                 {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => lost = Some(error),
-                    Err(_) => lost = Some(anyhow!("the server stopped answering")),
+                    lost = Some(error);
                 }
             }
         }
@@ -261,7 +302,7 @@ pub async fn attach(
             {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Detach) => {
-                    detach(&mut ctrl, &attached).await;
+                    detach(&mut ctrl, &mut attached).await;
                     guard.leave()?;
                     println!("detached from {}", attached.session_id);
                     return Ok(());
@@ -275,7 +316,6 @@ pub async fn attach(
                 return Err(error);
             }
             match recover(
-                server,
                 &mut token,
                 &mut ctrl,
                 &mut events,
@@ -286,7 +326,12 @@ pub async fn attach(
             {
                 Recovered::Live => {}
                 Recovered::Detach => {
-                    detach(&mut ctrl, &attached).await;
+                    detach_session(
+                        &mut ctrl,
+                        &attached.session_id,
+                        tokio::time::Instant::now() + DETACH_TIME,
+                    )
+                    .await;
                     guard.leave()?;
                     println!("detached from {}", attached.session_id);
                     return Ok(());
@@ -323,30 +368,38 @@ impl Ending {
     }
 }
 
-struct Attached {
+struct InflightWrite {
+    rx: tokio::sync::oneshot::Receiver<Result<Value>>,
+    deadline: tokio::time::Instant,
+}
+
+struct Attached<'a> {
+    server: &'a ServerAddress,
     session_id: String,
     block_id: String,
     client_id: String,
     size: (u16, u16),
     theme: Theme,
+    fallback_title: Option<String>,
     data: Data,
     filter: Filter,
     pending: Vec<u8>,
     out: Vec<u8>,
     input_buf: Vec<u8>,
+    write_queue: String,
+    write_inflight: Option<InflightWrite>,
     replies: Replies,
     primed: bool,
     theme_dirty: bool,
     owns: bool,
 }
 
-impl Attached {
+impl<'a> Attached<'a> {
     async fn start(
         ctrl: &mut Control,
         session_id: &str,
-        server: &ServerAddress,
-        window: Option<&str>,
-        block: Option<&str>,
+        server: &'a ServerAddress,
+        selection: (Option<&str>, Option<&str>),
         (cols, rows): (u16, u16),
         theme: Theme,
     ) -> Result<Self> {
@@ -369,38 +422,37 @@ impl Attached {
             .and_then(|selected| selected.get("view"))
             .cloned()
             .ok_or_else(|| anyhow!("bootstrap attached to no session"))?;
+        let (window, block) = selection;
         let block_id =
             session::block_of(&view, window, block).ok_or_else(|| match (window, block) {
                 (_, Some(blk)) => anyhow!("the window has no block {blk}"),
                 (Some(win), None) => anyhow!("the session has no window {win}"),
                 (None, None) => anyhow!("the session's active window shows no block"),
             })?;
+        let fallback_title = session::fallback_title_for(&bootstrap, &view, &block_id);
 
-        finish_call(start_take(ctrl, session_id, &block_id)?).await?;
-        let ticket_rx = start_ticket(ctrl, session_id, &block_id)?;
-        publish(
-            ctrl,
-            session_id,
-            &block_id,
-            (cols, rows),
-            &theme,
-            Push::Both,
-        )
-        .await?;
-        let ticket = parse_ticket(&finish_call(ticket_rx).await?)?;
+        let block = BlockRef::new(session_id, &block_id);
+        start_take(ctrl, block)?.finish().await?;
+        let ticket_call = start_ticket(ctrl, block)?;
+        publish(ctrl, block, (cols, rows), &theme, Push::Both).await?;
+        let ticket = parse_ticket(&ticket_call.finish().await?)?;
         let data = Data::open(server, &ticket).await?;
         let filter = Filter::new(data.nonce);
         let attached = Self {
+            server,
             session_id: session_id.to_owned(),
             block_id,
             client_id,
             size: (cols, rows),
             theme,
+            fallback_title,
             data,
             filter,
             pending: Vec::new(),
             out: Vec::new(),
             input_buf: Vec::new(),
+            write_queue: String::new(),
+            write_inflight: None,
             replies: Replies::default(),
             primed: false,
             theme_dirty: false,
@@ -408,6 +460,10 @@ impl Attached {
         };
         attached.focus(ctrl, "in")?;
         Ok(attached)
+    }
+
+    fn block(&self) -> BlockRef<'_> {
+        BlockRef::new(&self.session_id, &self.block_id)
     }
 
     async fn feed(&mut self, bytes: &[u8], ctrl: &mut Control) -> Result<()> {
@@ -426,9 +482,28 @@ impl Attached {
     }
 
     async fn prime(&mut self, ctrl: &mut Control) -> Result<()> {
-        let screen = format_vt(ctrl, &self.session_id, &self.block_id).await?;
+        let block = self.block();
+        let title_rx = session::start_terminal_title(ctrl, block);
+        let process_rx = session::start_terminal_process(ctrl, block);
+        let screen = format_vt(ctrl, block).await?;
+        let deadline = tokio::time::Instant::now() + TITLE_QUERY_TIMEOUT;
+        let (title_reply, process_reply) = tokio::join!(
+            session::optional_reply(title_rx, deadline),
+            session::optional_reply(process_rx, deadline),
+        );
+        let title = session::resolved_terminal_title(
+            title_reply.as_ref(),
+            process_reply.as_ref(),
+            Some(&screen),
+        )
+        .or_else(|| self.fallback_title.clone());
         self.out.extend_from_slice(b"\x1b[2J\x1b[H");
         self.out.extend_from_slice(&screen);
+        self.out.extend_from_slice(&stream::format_osc_title(
+            b'0',
+            title.as_deref().unwrap_or(""),
+            b"\x07",
+        ));
         self.primed = true;
         Ok(())
     }
@@ -454,21 +529,26 @@ impl Attached {
         self.flush(out)?;
         out.write_all(theme_query().as_bytes())?;
         out.flush()?;
+        self.replies.expect_reply();
         let deadline = Instant::now() + THEME_PROBE_TIMEOUT;
         let mut replies = Vec::new();
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             let Ok(Some(bytes)) = tokio::time::timeout(remaining, input.recv()).await else {
                 break;
             };
-            if is_detach(&bytes) {
-                return Ok(Flow::Detach);
-            }
-            let (found, typed) = self.replies.push(&bytes);
-            replies.extend_from_slice(&found);
-            if self.accept(&found, &typed) == Flow::Detach {
-                return Ok(Flow::Detach);
+            let (before, detach) = split_at_detach(&bytes);
+            if !before.is_empty() {
+                let (found, typed) = self.replies.push(before);
+                replies.extend_from_slice(&found);
+                if self.accept(&found, &typed) == Flow::Detach {
+                    self.flush_input(ctrl)?;
+                    return Ok(Flow::Detach);
+                }
             }
             self.flush_input(ctrl)?;
+            if detach {
+                return Ok(Flow::Detach);
+            }
             if has_da1_reply(&replies) {
                 break;
             }
@@ -508,11 +588,14 @@ impl Attached {
     }
 
     fn queue_input(&mut self, bytes: &[u8]) -> Flow {
-        if is_detach(bytes) {
-            return Flow::Detach;
+        let (before, detach) = split_at_detach(bytes);
+        if !before.is_empty() {
+            let (replies, typed) = self.replies.push(before);
+            if self.accept(&replies, &typed) == Flow::Detach {
+                return Flow::Detach;
+            }
         }
-        let (replies, typed) = self.replies.push(bytes);
-        self.accept(&replies, &typed)
+        if detach { Flow::Detach } else { Flow::Continue }
     }
 
     /// Keeps what `Replies::push` classified without parsing the bytes twice.
@@ -520,14 +603,12 @@ impl Attached {
         if reports_scheme(replies) {
             self.theme_dirty = true;
         }
-        // The detach key can share a read with the reply the host just sent.
-        if is_detach(typed) {
-            return Flow::Detach;
+        // The detach key can share a read with a host reply or preceding keys.
+        let (before, detach) = split_at_detach(typed);
+        if !before.is_empty() {
+            self.input_buf.extend_from_slice(before);
         }
-        if !typed.is_empty() {
-            self.input_buf.extend_from_slice(typed);
-        }
-        Flow::Continue
+        if detach { Flow::Detach } else { Flow::Continue }
     }
 
     /// Forwards a fragment the host stopped sending partway through.
@@ -548,7 +629,43 @@ impl Attached {
     fn flush_input(&mut self, ctrl: &mut Control) -> Result<()> {
         let text = take_utf8(&mut self.input_buf);
         if !text.is_empty() {
-            ctrl.post_write(&self.session_id, &self.block_id, &text)?;
+            self.write_queue.push_str(&text);
+        }
+        self.pump_write(ctrl)
+    }
+
+    fn pump_write(&mut self, ctrl: &mut Control) -> Result<()> {
+        if self.write_inflight.is_some() || self.write_queue.is_empty() {
+            return Ok(());
+        }
+        let chunk = take_write_chunk(&mut self.write_queue, MAX_WRITE_BYTES);
+        self.write_inflight = Some(InflightWrite {
+            rx: ctrl.start_write(self.block(), &chunk)?,
+            deadline: tokio::time::Instant::now() + CALL_TIME,
+        });
+        Ok(())
+    }
+
+    async fn drain_writes(
+        &mut self,
+        ctrl: &mut Control,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        self.input_buf.extend(self.replies.give_up_typed());
+        self.flush_input(ctrl)?;
+        loop {
+            if self.write_inflight.is_some() {
+                match tokio::time::timeout_at(deadline, finish_write(&mut self.write_inflight))
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) | Err(_) => break,
+                }
+            }
+            if self.write_queue.is_empty() {
+                break;
+            }
+            self.pump_write(ctrl)?;
         }
         Ok(())
     }
@@ -562,7 +679,7 @@ impl Attached {
     }
 
     async fn claim(&mut self, ctrl: &mut Control) -> Result<()> {
-        finish_call(start_take(ctrl, &self.session_id, &self.block_id)?).await?;
+        start_take(ctrl, self.block())?.finish().await?;
         self.owns = true;
         self.sync(ctrl, Push::Both).await
     }
@@ -574,21 +691,12 @@ impl Attached {
         if !self.owns {
             return Ok(());
         }
-        publish(
-            ctrl,
-            &self.session_id,
-            &self.block_id,
-            self.size,
-            &self.theme,
-            push,
-        )
-        .await
+        publish(ctrl, self.block(), self.size, &self.theme, push).await
     }
 
     fn focus(&self, ctrl: &mut Control, action: &str) -> Result<()> {
         ctrl.post_event(
-            &self.session_id,
-            &self.block_id,
+            self.block(),
             json!({"type": "focus", "payload": {"action": action}}),
         )
     }
@@ -653,7 +761,7 @@ impl Attached {
                     Some(text) => text.to_owned(),
                     None => {
                         let id = payload.get("id").and_then(Value::as_i64).unwrap_or(0);
-                        clipboard(ctrl, &self.session_id, &self.block_id, id).await?
+                        clipboard(ctrl, self.block(), id).await?
                     }
                 };
                 if !text.is_empty() {
@@ -681,11 +789,7 @@ impl Attached {
         Ok(())
     }
 
-    async fn reconnect(
-        &mut self,
-        ctrl: &mut Control,
-        server: &ServerAddress,
-    ) -> Result<Option<Ending>> {
+    async fn reconnect(&mut self, ctrl: &mut Control) -> Result<Option<Ending>> {
         let bootstrap = ctrl
             .call(
                 "session.bootstrap",
@@ -704,6 +808,7 @@ impl Attached {
         if let Some(client_id) = bootstrap.get("client_id").and_then(Value::as_str) {
             self.client_id = client_id.to_owned();
         }
+        self.fallback_title = session::fallback_title_for(&bootstrap, view, &self.block_id);
         if let Ok(size) = crossterm::terminal::size() {
             self.size = size;
         }
@@ -713,10 +818,10 @@ impl Attached {
         let owner = session::owner_of(view, &self.block_id);
         if owner.is_some_and(|owner| owner != self.client_id) {
             self.owns = false;
-            self.reconnect_data(ctrl, server).await?;
+            self.reconnect_data(ctrl).await?;
             return Ok(None);
         }
-        if let Err(error) = finish_call(start_take(ctrl, &self.session_id, &self.block_id)?).await {
+        if let Err(error) = start_take(ctrl, self.block())?.finish().await {
             // A refusal while the block is still in the view is worth another
             // try. A missing block is not.
             if session::has_block(view, &self.block_id) {
@@ -726,20 +831,20 @@ impl Attached {
         }
         self.owns = true;
         self.sync(ctrl, Push::Both).await?;
-        self.reconnect_data(ctrl, server).await?;
+        self.reconnect_data(ctrl).await?;
         Ok(None)
     }
 
-    async fn reconnect_data(&mut self, ctrl: &mut Control, server: &ServerAddress) -> Result<()> {
-        match Data::resume(server, self.data.token, self.data.received).await {
+    async fn reconnect_data(&mut self, ctrl: &mut Control) -> Result<()> {
+        match Data::resume(self.server, self.data.token, self.data.received).await {
             Ok(data) => {
                 self.filter = Filter::new(data.nonce);
                 self.data = data;
                 Ok(())
             }
             Err(_) => {
-                let ticket = ticket(ctrl, &self.session_id, &self.block_id).await?;
-                self.data = Data::open(server, &ticket).await?;
+                let ticket = ticket(ctrl, self.block()).await?;
+                self.data = Data::open(self.server, &ticket).await?;
                 self.filter = Filter::new(self.data.nonce);
                 self.pending.clear();
                 self.primed = false;
@@ -749,18 +854,32 @@ impl Attached {
     }
 }
 
-fn is_detach(bytes: &[u8]) -> bool {
-    matches!(
-        bytes,
-        b"\x1c"
-            | b"\x1b[92;5u"
-            | b"\x1b[92;5:1u"
-            | b"\x1b[92;5:2u"
-            | b"\x1b[92:124;5u"
-            | b"\x1b[92:124;5:1u"
-            | b"\x1b[92:124;5:2u"
-            | b"\x1b[27;5;92~"
-    )
+const DETACH_SEQUENCES: [&[u8]; 8] = [
+    b"\x1c",
+    b"\x1b[92;5u",
+    b"\x1b[92;5:1u",
+    b"\x1b[92;5:2u",
+    b"\x1b[92:124;5u",
+    b"\x1b[92:124;5:1u",
+    b"\x1b[92:124;5:2u",
+    b"\x1b[27;5;92~",
+];
+
+/// Splits `bytes` before the earliest detach sequence, returning
+/// `(prefix_before_detach, saw_detach)`.
+fn split_at_detach(bytes: &[u8]) -> (&[u8], bool) {
+    let earliest = DETACH_SEQUENCES
+        .iter()
+        .filter_map(|seq| bytes.windows(seq.len()).position(|window| window == *seq))
+        .min();
+    match earliest {
+        Some(pos) => (&bytes[..pos], true),
+        None => (bytes, false),
+    }
+}
+
+fn contains_detach(bytes: &[u8]) -> bool {
+    split_at_detach(bytes).1
 }
 
 /// Asks the host terminal for its default colors and its whole 256-color
@@ -811,9 +930,14 @@ fn split_replies(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
 #[derive(Default)]
 struct Replies {
     held: Vec<u8>,
+    /// True when `held` came from a startup probe tail or an active reply burst
+    /// rather than standalone typing, so detaching drops it instead of writing
+    /// a truncated host reply into the remote PTY.
+    held_from_reply: bool,
     /// When the host has been silent long enough for `held` to be typing.
     until: Option<Instant>,
-    /// When the last read carried a reply, so the host may still be sending one.
+    /// When the last read carried (or a query just solicited) a reply, so the
+    /// host may still be sending one.
     answered: Option<Instant>,
 }
 
@@ -821,6 +945,7 @@ impl Replies {
     fn push(&mut self, bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let now = Instant::now();
         let resumed = !self.held.is_empty();
+        let was_from_reply = self.held_from_reply;
         let answering = self.answered.is_some_and(|at| now < at + REPLY_HOLD);
         let mut pending = std::mem::take(&mut self.held);
         pending.extend_from_slice(bytes);
@@ -834,19 +959,27 @@ impl Replies {
             typed.extend_from_slice(&fragment);
             fragment.clear();
         }
-        self.hold_at(fragment, now);
+        let from_reply = !replies.is_empty() || answering || (resumed && was_from_reply);
+        self.hold_at(fragment, from_reply, now);
         self.answered = (!replies.is_empty()).then_some(now);
         (replies, typed)
     }
 
-    /// Keeps a fragment back for the read that finishes it, and starts the clock
-    /// that gives up on it.
+    /// Keeps a probe-tail fragment back for the read that finishes it, and
+    /// starts the clock that gives up on it.
     fn hold(&mut self, fragment: Vec<u8>) {
-        self.hold_at(fragment, Instant::now());
+        self.hold_at(fragment, true, Instant::now());
     }
 
-    fn hold_at(&mut self, fragment: Vec<u8>, now: Instant) {
+    /// Marks that a host query was just sent so a split first chunk is treated
+    /// as a reply fragment rather than typed input.
+    fn expect_reply(&mut self) {
+        self.answered = Some(Instant::now());
+    }
+
+    fn hold_at(&mut self, fragment: Vec<u8>, from_reply: bool, now: Instant) {
         self.until = (!fragment.is_empty()).then(|| now + REPLY_HOLD);
+        self.held_from_reply = !fragment.is_empty() && from_reply;
         self.held = fragment;
     }
 
@@ -866,7 +999,16 @@ impl Replies {
     fn give_up(&mut self) -> Vec<u8> {
         self.until = None;
         self.answered = None;
+        self.held_from_reply = false;
         std::mem::take(&mut self.held)
+    }
+
+    /// Like `give_up`, but drops fragments that originated from a host reply
+    /// stream so detaching mid-reply does not inject escape garbage into the PTY.
+    fn give_up_typed(&mut self) -> Vec<u8> {
+        let from_reply = self.held_from_reply;
+        let held = self.give_up();
+        if from_reply { Vec::new() } else { held }
     }
 }
 
@@ -1068,37 +1210,81 @@ fn take_utf8(buf: &mut Vec<u8>) -> String {
     }
 }
 
-async fn finish_call(rx: tokio::sync::oneshot::Receiver<Result<Value>>) -> Result<Value> {
-    rx.await
-        .map_err(|_| anyhow!("the control connection ended"))?
+fn take_write_chunk(queue: &mut String, max_bytes: usize) -> String {
+    if queue.len() <= max_bytes {
+        return std::mem::take(queue);
+    }
+    let mut split = max_bytes;
+    while split > 0 && !queue.is_char_boundary(split) {
+        split -= 1;
+    }
+    if split == 0 {
+        // Never stall if max_bytes is smaller than the leading UTF-8 char.
+        split = queue.chars().next().map_or(0, char::len_utf8);
+    }
+    let rest = queue.split_off(split);
+    std::mem::replace(queue, rest)
 }
 
-fn start_take(
-    ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
-) -> Result<tokio::sync::oneshot::Receiver<Result<Value>>> {
-    ctrl.start_call(
+async fn finish_write(inflight: &mut Option<InflightWrite>) -> Result<Value> {
+    let Some(write) = inflight.as_mut() else {
+        return std::future::pending().await;
+    };
+    let outcome = tokio::time::timeout_at(write.deadline, &mut write.rx).await;
+    *inflight = None;
+    match outcome {
+        Ok(received) => received.map_err(|_| anyhow!("the control connection ended"))?,
+        Err(_) => Err(anyhow::Error::new(CallTimeout(format!(
+            "the server did not answer com.superlogical.terminal.write within {}",
+            format_timeout(CALL_TIME)
+        )))),
+    }
+}
+
+struct PendingRpc {
+    method: &'static str,
+    rx: tokio::sync::oneshot::Receiver<Result<Value>>,
+}
+
+impl PendingRpc {
+    fn start(ctrl: &mut Control, method: &'static str, payload: Value) -> Result<Self> {
+        Ok(Self {
+            method,
+            rx: ctrl.start_call(method, payload)?,
+        })
+    }
+
+    async fn finish(self) -> Result<Value> {
+        match tokio::time::timeout(CALL_TIME, self.rx).await {
+            Ok(received) => received.map_err(|_| anyhow!("the control connection ended"))?,
+            Err(_) => Err(anyhow::Error::new(CallTimeout(format!(
+                "the server did not answer {} within {}",
+                self.method,
+                format_timeout(CALL_TIME)
+            )))),
+        }
+    }
+}
+
+fn start_take(ctrl: &mut Control, block: BlockRef<'_>) -> Result<PendingRpc> {
+    PendingRpc::start(
+        ctrl,
         "session.own_block",
         json!({
-            "session_id": session_id,
-            "block_ids": [block_id],
+            "session_id": block.session_id,
+            "block_ids": [block.block_id],
             "mode": "take",
         }),
     )
 }
 
-fn start_set_theme(
-    ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
-    theme: &Theme,
-) -> Result<tokio::sync::oneshot::Receiver<Result<Value>>> {
-    ctrl.start_call(
+fn start_set_theme(ctrl: &mut Control, block: BlockRef<'_>, theme: &Theme) -> Result<PendingRpc> {
+    PendingRpc::start(
+        ctrl,
         "com.superlogical.terminal.set_theme",
         json!({
-            "session_id": session_id,
-            "block_id": block_id,
+            "session_id": block.session_id,
+            "block_id": block.block_id,
             "args": theme.to_json(),
         }),
     )
@@ -1106,16 +1292,16 @@ fn start_set_theme(
 
 fn start_resize(
     ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
+    block: BlockRef<'_>,
     cols: u16,
     rows: u16,
-) -> Result<tokio::sync::oneshot::Receiver<Result<Value>>> {
-    ctrl.start_call(
+) -> Result<PendingRpc> {
+    PendingRpc::start(
+        ctrl,
         "com.superlogical.terminal.resize",
         json!({
-            "session_id": session_id,
-            "block_id": block_id,
+            "session_id": block.session_id,
+            "block_id": block.block_id,
             "args": {"columns": cols, "rows": rows},
         }),
     )
@@ -1142,37 +1328,36 @@ impl Push {
 
 async fn publish(
     ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
+    block: BlockRef<'_>,
     size: (u16, u16),
     theme: &Theme,
     push: Push,
 ) -> Result<()> {
-    let theme_rx = (push.theme() && !theme.is_empty())
-        .then(|| start_set_theme(ctrl, session_id, block_id, theme))
+    let theme_call = (push.theme() && !theme.is_empty())
+        .then(|| start_set_theme(ctrl, block, theme))
         .transpose()?;
-    let size_rx = push
+    let size_call = push
         .size()
-        .then(|| start_resize(ctrl, session_id, block_id, size.0, size.1))
+        .then(|| start_resize(ctrl, block, size.0, size.1))
         .transpose()?;
-    if let Some(rx) = theme_rx {
-        finish_call(rx).await?;
+    if let Some(call) = theme_call {
+        call.finish().await?;
     }
-    if let Some(rx) = size_rx {
-        finish_call(rx).await?;
+    if let Some(call) = size_call {
+        call.finish().await?;
     }
     Ok(())
 }
 
 /// `extra_palette` is omitted so the server's 256-color table does not
 /// overwrite the host terminal's color theme via OSC 4.
-async fn format_vt(ctrl: &mut Control, session_id: &str, block_id: &str) -> Result<Vec<u8>> {
+async fn format_vt(ctrl: &mut Control, block: BlockRef<'_>) -> Result<Vec<u8>> {
     let reply = ctrl
         .call(
             "com.superlogical.terminal.format",
             json!({
-                "session_id": session_id,
-                "block_id": block_id,
+                "session_id": block.session_id,
+                "block_id": block.block_id,
                 "args": {
                     "format": "vt",
                     "trim": false,
@@ -1202,8 +1387,7 @@ async fn format_vt(ctrl: &mut Control, session_id: &str, block_id: &str) -> Resu
     };
     let full = read_chunks(
         ctrl,
-        session_id,
-        block_id,
+        block,
         "com.superlogical.terminal.blob_read",
         id,
         content,
@@ -1212,16 +1396,10 @@ async fn format_vt(ctrl: &mut Control, session_id: &str, block_id: &str) -> Resu
     Ok(full.into_bytes())
 }
 
-async fn clipboard(
-    ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
-    id: i64,
-) -> Result<String> {
+async fn clipboard(ctrl: &mut Control, block: BlockRef<'_>, id: i64) -> Result<String> {
     read_chunks(
         ctrl,
-        session_id,
-        block_id,
+        block,
         "com.superlogical.terminal.clipboard_read",
         id,
         String::new(),
@@ -1231,26 +1409,66 @@ async fn clipboard(
 
 async fn read_chunks(
     ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
+    block: BlockRef<'_>,
+    method: &str,
+    id: i64,
+    out: String,
+) -> Result<String> {
+    read_chunks_with_limits(
+        ctrl,
+        block,
+        method,
+        id,
+        out,
+        tokio::time::Instant::now() + BLOB_READ_TIME,
+        MAX_TOTAL_BLOB_BYTES,
+    )
+    .await
+}
+
+async fn read_chunks_with_limits(
+    ctrl: &mut Control,
+    block: BlockRef<'_>,
     method: &str,
     id: i64,
     mut out: String,
+    deadline: tokio::time::Instant,
+    max_total_bytes: usize,
 ) -> Result<String> {
+    if out.len() > max_total_bytes {
+        bail!("{method} exceeded maximum size of {max_total_bytes} bytes");
+    }
     loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .ok_or_else(|| {
+                anyhow::Error::new(CallTimeout(format!(
+                    "the server did not finish {method} within {}",
+                    format_timeout(BLOB_READ_TIME)
+                )))
+            })?;
         let part = ctrl
-            .call(
+            .call_with_timeout(
                 method,
                 json!({
-                    "session_id": session_id,
-                    "block_id": block_id,
+                    "session_id": block.session_id,
+                    "block_id": block.block_id,
                     "args": {"id": id, "offset": out.len(), "max_bytes": MAX_BLOB_BYTES},
                 }),
+                remaining,
             )
             .await?;
-        out.push_str(part.get("data").and_then(Value::as_str).unwrap_or_default());
-        if part.get("eof").and_then(Value::as_bool).unwrap_or(true) {
+        let data = part.get("data").and_then(Value::as_str).unwrap_or_default();
+        let eof = part.get("eof").and_then(Value::as_bool).unwrap_or(true);
+        if out.len().saturating_add(data.len()) > max_total_bytes {
+            bail!("{method} exceeded maximum size of {max_total_bytes} bytes");
+        }
+        out.push_str(data);
+        if eof {
             break;
+        }
+        if data.is_empty() {
+            bail!("{method} returned empty chunk before eof");
         }
     }
     Ok(out)
@@ -1270,9 +1488,16 @@ fn spawn_input() -> mpsc::UnboundedReceiver<Vec<u8>> {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
-        while let Ok(n) = stdin.read(&mut buf) {
-            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
-                return;
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return,
             }
         }
     });
@@ -1286,21 +1511,23 @@ enum Recovered {
 }
 
 async fn recover(
-    server: &ServerAddress,
     token: &mut Option<String>,
     ctrl: &mut Control,
     events: &mut Events,
-    attached: &mut Attached,
+    attached: &mut Attached<'_>,
     input: &mut mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> Result<Recovered> {
     let mut delay = RETRY_FIRST;
     loop {
-        match attempt(server, token, ctrl, events, attached).await {
+        match attempt(token, ctrl, events, attached).await {
             Ok(None) => {
                 // Keys pressed while the link was down have nowhere to go,
                 // and the reply a held fragment belonged to is gone with them.
                 while input.try_recv().is_ok() {}
                 attached.replies = Replies::default();
+                attached.input_buf.clear();
+                attached.write_queue.clear();
+                attached.write_inflight = None;
                 return Ok(Recovered::Live);
             }
             Ok(Some(ending)) => return Ok(Recovered::Ended(ending)),
@@ -1308,7 +1535,7 @@ async fn recover(
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     Some(bytes) = input.recv() => {
-                        if is_detach(&bytes) {
+                        if contains_detach(&bytes) {
                             return Ok(Recovered::Detach);
                         }
                     }
@@ -1320,19 +1547,22 @@ async fn recover(
 }
 
 async fn attempt(
-    server: &ServerAddress,
     token: &mut Option<String>,
     ctrl: &mut Control,
     events: &mut Events,
-    attached: &mut Attached,
+    attached: &mut Attached<'_>,
 ) -> Result<Option<Ending>> {
-    if ctrl.call("server.version", Value::Null).await.is_err() {
-        let (new_ctrl, new_events) = Control::connect(server, token.as_deref()).await?;
+    if ctrl
+        .call_with_timeout("server.version", Value::Null, PROBE_TIME)
+        .await
+        .is_err()
+    {
+        let (new_ctrl, new_events) = Control::connect(attached.server, token.as_deref()).await?;
         *token = new_ctrl.reconnect_token.clone();
         *ctrl = new_ctrl;
         *events = new_events;
     }
-    attached.reconnect(ctrl, server).await
+    attached.reconnect(ctrl).await
 }
 
 fn backoff(delay: Duration) -> Duration {
@@ -1340,13 +1570,26 @@ fn backoff(delay: Duration) -> Duration {
 }
 
 fn transient(ctrl: &Control, error: &anyhow::Error) -> bool {
-    if ctrl.is_lost() || error.downcast_ref::<StreamClosed>().is_some() {
+    if ctrl.is_lost()
+        || error.downcast_ref::<StreamClosed>().is_some()
+        || error.downcast_ref::<CallTimeout>().is_some()
+    {
         return true;
     }
     match error.downcast_ref::<proto::ApiError>() {
         Some(error) => error.status == 409,
         None => false,
     }
+}
+
+fn write_target_gone(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<proto::ApiError>().is_some_and(|api| {
+        api.status == 404
+            || matches!(
+                api.code.as_str(),
+                "not_found" | "block_not_found" | "session_not_found" | "block_closed"
+            )
+    })
 }
 
 fn data_ended() -> anyhow::Error {
@@ -1366,22 +1609,33 @@ fn stream_lost(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-async fn detach(ctrl: &mut Control, attached: &Attached) {
+async fn detach(ctrl: &mut Control, attached: &mut Attached<'_>) {
+    let deadline = tokio::time::Instant::now() + DETACH_TIME;
+    if !ctrl.is_lost() {
+        let _ = attached.drain_writes(ctrl, deadline).await;
+    }
+    detach_session(ctrl, &attached.session_id, deadline).await;
+}
+
+async fn detach_session(ctrl: &mut Control, session_id: &str, deadline: tokio::time::Instant) {
+    if ctrl.is_lost() {
+        return;
+    }
+    let timeout = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .unwrap_or(Duration::from_millis(200));
     let _ = ctrl
-        .call("session.detach", json!({"session_id": attached.session_id}))
+        .call_with_timeout("session.detach", json!({"session_id": session_id}), timeout)
         .await;
 }
 
-fn start_ticket(
-    ctrl: &mut Control,
-    session_id: &str,
-    block_id: &str,
-) -> Result<tokio::sync::oneshot::Receiver<Result<Value>>> {
-    ctrl.start_call(
+fn start_ticket(ctrl: &mut Control, block: BlockRef<'_>) -> Result<PendingRpc> {
+    PendingRpc::start(
+        ctrl,
         "data.connect",
         json!({
-            "session_id": session_id,
-            "block_id": block_id,
+            "session_id": block.session_id,
+            "block_id": block.block_id,
             "data_ref_id": DATA_REF,
             "subprotocol": data::SUBPROTOCOL,
         }),
@@ -1396,8 +1650,8 @@ fn parse_ticket(reply: &Value) -> Result<String> {
         .ok_or_else(|| anyhow!("data.connect returned no ticket"))
 }
 
-async fn ticket(ctrl: &mut Control, session_id: &str, block_id: &str) -> Result<String> {
-    parse_ticket(&finish_call(start_ticket(ctrl, session_id, block_id)?).await?)
+async fn ticket(ctrl: &mut Control, block: BlockRef<'_>) -> Result<String> {
+    parse_ticket(&start_ticket(ctrl, block)?.finish().await?)
 }
 
 fn closed_block(error: &anyhow::Error) -> bool {
@@ -1416,8 +1670,9 @@ impl Screen {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
         // Clear any leftover OSC 4/10/11/12 overrides before probing the host
-        // terminal's theme.
+        // terminal's theme, and save the host title so RESET_MODES can restore it.
         stdout.write_all(RESET_COLORS)?;
+        stdout.write_all(b"\x1b[22;0t")?;
         stdout.flush()?;
         Ok(Self {
             stdout,
@@ -1522,12 +1777,15 @@ fn has_da1_reply(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attached, Ending, Flow, RETRY_FIRST, RETRY_MAX, Replies, Theme, backoff, closed_block,
-        detach, has_da1_reply, is_detach, parse_theme_reply, reports_scheme, split_replies,
-        take_utf8, theme_query,
+        Attached, Ending, Flow, InflightWrite, RETRY_FIRST, RETRY_MAX, Replies, Theme, backoff,
+        closed_block, contains_detach, detach, finish_write, has_da1_reply, parse_theme_reply,
+        read_chunks_with_limits, reports_scheme, split_at_detach, split_replies, take_utf8,
+        take_write_chunk, theme_query, transient, write_target_gone,
     };
-    use crate::rex::control::Control;
+    use crate::rex::BlockRef;
+    use crate::rex::control::{CallTimeout, Control};
     use crate::rex::data::StreamClosed;
+    use crate::rex::proto::ApiError;
     use base64::Engine as _;
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
@@ -1546,18 +1804,34 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_detach_key_in_legacy_kitty_and_xterm_modes() {
-        assert!(is_detach(b"\x1c"));
-        assert!(is_detach(b"\x1b[92;5u"));
-        assert!(is_detach(b"\x1b[92;5:1u"));
-        assert!(is_detach(b"\x1b[92;5:2u"));
-        assert!(is_detach(b"\x1b[92:124;5u"));
-        assert!(is_detach(b"\x1b[92:124;5:1u"));
-        assert!(is_detach(b"\x1b[27;5;92~"));
+    fn recognizes_detach_key_in_legacy_kitty_and_xterm_modes_including_batched_reads() {
+        for seq in [
+            b"\x1c".as_slice(),
+            b"\x1b[92;5u".as_slice(),
+            b"\x1b[92;5:1u".as_slice(),
+            b"\x1b[92;5:2u".as_slice(),
+            b"\x1b[92:124;5u".as_slice(),
+            b"\x1b[92:124;5:1u".as_slice(),
+            b"\x1b[27;5;92~".as_slice(),
+        ] {
+            assert_eq!(split_at_detach(seq), (b"".as_slice(), true));
+            assert!(contains_detach(seq));
+        }
 
-        assert!(!is_detach(b"\\"));
-        assert!(!is_detach(b"\x1b[92;1u"));
-        assert!(!is_detach(b"hello"));
+        assert_eq!(split_at_detach(b"abc\x1c"), (b"abc".as_slice(), true));
+        assert_eq!(split_at_detach(b"abc\x1b[92;5u"), (b"abc".as_slice(), true));
+        assert_eq!(
+            split_at_detach(b"a\x1b[27;5;92~tail"),
+            (b"a".as_slice(), true)
+        );
+        assert_eq!(split_at_detach(b"\x1ctail"), (b"".as_slice(), true));
+
+        assert_eq!(split_at_detach(b"\\"), (b"\\".as_slice(), false));
+        assert_eq!(
+            split_at_detach(b"\x1b[92;1u"),
+            (b"\x1b[92;1u".as_slice(), false)
+        );
+        assert_eq!(split_at_detach(b"hello"), (b"hello".as_slice(), false));
     }
 
     #[test]
@@ -1728,6 +2002,32 @@ mod tests {
     }
 
     #[test]
+    fn give_up_typed_flushes_standalone_typing_but_drops_host_reply_fragments() {
+        // Standalone ambiguous input is flushed on detach.
+        let mut replies = Replies::default();
+        assert_eq!(replies.push(b"abc\x1b[?").1, b"abc");
+        assert_eq!(replies.give_up_typed(), b"\x1b[?");
+
+        // A startup probe tail is dropped on detach instead of entering the PTY.
+        let mut replies = Replies::default();
+        replies.hold(b"\x1b]4;12;rgb:ffff/".to_vec());
+        assert!(replies.give_up_typed().is_empty());
+
+        // A partial reply trailing a host reply burst is dropped on detach.
+        let mut replies = Replies::default();
+        let (found, typed) = replies.push(b"\x1b]10;rgb:1111/2222/3333\x07\x1b]4;12;rgb:ffff/");
+        assert_eq!(found, b"\x1b]10;rgb:1111/2222/3333\x07");
+        assert!(typed.is_empty());
+        assert!(replies.give_up_typed().is_empty());
+
+        // A split first chunk after `expect_reply` (e.g. `refresh_theme`) is dropped.
+        let mut replies = Replies::default();
+        replies.expect_reply();
+        assert!(replies.push(b"\x1b]10;rgb:ffff/").1.is_empty());
+        assert!(replies.give_up_typed().is_empty());
+    }
+
+    #[test]
     fn spots_color_scheme_reports_from_the_host() {
         let (replies, typed) = split_replies(b"\x1b[?997;2n");
         assert!(reports_scheme(&replies));
@@ -1800,6 +2100,10 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (ctrl_tcp, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
             let mut ctrl_ws = tokio_tungstenite::accept_hdr_async(
                 ctrl_tcp,
                 |req: &Request, mut res: Response| {
@@ -1829,6 +2133,10 @@ mod tests {
 
             let data_task = tokio::spawn(async move {
                 let (data_tcp, _) = listener.accept().await.unwrap();
+                #[allow(
+                    clippy::result_large_err,
+                    reason = "tungstenite fixes the callback error type"
+                )]
                 let mut data_ws = tokio_tungstenite::accept_hdr_async(
                     data_tcp,
                     |req: &Request, mut res: Response| {
@@ -1859,7 +2167,20 @@ mod tests {
                 let id = req["id"].as_str().unwrap_or("");
                 let method = req["method"].as_str().unwrap();
                 if method == "com.superlogical.terminal.write" {
-                    wrote.push_str(req["payload"]["args"]["data"].as_str().unwrap_or(""));
+                    let data = req["payload"]["args"]["data"].as_str().unwrap_or("");
+                    wrote.push_str(data);
+                    ctrl_ws
+                        .send(Message::Text(
+                            json!({
+                                "type": "response",
+                                "id": id,
+                                "payload": {"bytes_written": data.len()}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
                     continue;
                 }
                 if method == "block.event" {
@@ -1906,6 +2227,9 @@ mod tests {
                     "com.superlogical.terminal.blob_read" => {
                         json!({"data": "screen ", "eof": true})
                     }
+                    "com.superlogical.terminal.title" => {
+                        json!({"title": "vim"})
+                    }
                     _ => json!({}),
                 };
                 ctrl_ws
@@ -1942,8 +2266,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            None,
-            None,
+            (None, None),
             (40, 10),
             theme,
         )
@@ -1957,12 +2280,15 @@ mod tests {
         attached.feed(&stream_bytes, &mut ctrl).await.unwrap();
         assert!(attached.primed);
 
-        let live = b"live!\x1b_rex1;42;{\"type\":\"resize\",\"cols\":50,\"rows\":12}\x1b\\";
+        let live = b"live!\x1b]2;running\x07\x1b_rex1;42;{\"type\":\"resize\",\"cols\":50,\"rows\":12}\x1b\\";
         attached.feed(live, &mut ctrl).await.unwrap();
 
         let mut out = Vec::new();
         attached.flush(&mut out).unwrap();
-        assert_eq!(out, b"\x1b[2J\x1b[Hprimed-screen live!");
+        assert_eq!(
+            out,
+            b"\x1b[2J\x1b[Hprimed-screen \x1b]0;zrex: vim\x07live!\x1b]2;zrex: running\x07"
+        );
 
         let other = attached
             .event(
@@ -2052,6 +2378,9 @@ mod tests {
         let flow = attached.burst(b"ls", &mut in_rx, &mut ctrl).await.unwrap();
         assert!(matches!(flow, Flow::Continue));
         assert!(attached.owns);
+        finish_write(&mut attached.write_inflight).await.unwrap();
+        attached.pump_write(&mut ctrl).unwrap();
+        assert!(attached.write_inflight.is_none());
 
         // The other client gives the block up, so the server hands it to the
         // client in line: this one. It takes this terminal's size and colors
@@ -2109,7 +2438,7 @@ mod tests {
             .unwrap();
         assert!(matches!(session_end, Some(Ending::Session)));
 
-        detach(&mut ctrl, &attached).await;
+        detach(&mut ctrl, &mut attached).await;
         let (wrote, theme_calls, take_calls) = server.await.unwrap();
         assert_eq!(wrote, "ls -la\n");
         // Attach, a scheme change while owning, the claim on typing, and the
@@ -2118,5 +2447,732 @@ mod tests {
         // Attach and the claim on typing; the other client's claim does not
         // make zrex claim back.
         assert_eq!(take_calls, 2);
+    }
+
+    #[test]
+    fn chunks_writes_on_utf8_boundaries() {
+        let mut queue = "hi🦀ok".to_owned();
+        assert_eq!(take_write_chunk(&mut queue, 4), "hi");
+        assert_eq!(queue, "🦀ok");
+        assert_eq!(take_write_chunk(&mut queue, 2), "🦀");
+        assert_eq!(queue, "ok");
+        assert_eq!(take_write_chunk(&mut queue, 10), "ok");
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serializes_terminal_writes_and_coalesces_split_bracketed_paste() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel::<()>();
+        let (saw_first_tx, saw_first_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (ctrl_tcp, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ctrl_ws = tokio_tungstenite::accept_hdr_async(
+                ctrl_tcp,
+                |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                },
+            )
+            .await
+            .unwrap();
+
+            let _hello = ctrl_ws.next().await.unwrap().unwrap();
+            ctrl_ws
+                .send(Message::Text(
+                    json!({
+                        "type": "welcome",
+                        "api_revision": 8,
+                        "client": {"reconnect_token": "tok-1"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let data_task = tokio::spawn(async move {
+                let (data_tcp, _) = listener.accept().await.unwrap();
+                #[allow(
+                    clippy::result_large_err,
+                    reason = "tungstenite fixes the callback error type"
+                )]
+                let mut data_ws = tokio_tungstenite::accept_hdr_async(
+                    data_tcp,
+                    |req: &Request, mut res: Response| {
+                        if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                            res.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", proto.clone());
+                        }
+                        Ok(res)
+                    },
+                )
+                .await
+                .unwrap();
+                let _hello = data_ws.next().await.unwrap().unwrap();
+                let mut welcome = vec![0u8; 32];
+                welcome[0] = 0x81;
+                welcome[1..17].copy_from_slice(&[9u8; 16]);
+                welcome[24..32].copy_from_slice(&42u64.to_le_bytes());
+                data_ws.send(Message::Binary(welcome.into())).await.unwrap();
+                data_ws
+            });
+
+            let mut writes = Vec::new();
+            let mut saw_first_tx = Some(saw_first_tx);
+            let mut release_first_rx = Some(release_first_rx);
+            while let Some(Ok(Message::Text(text))) = ctrl_ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_str().unwrap_or("");
+                let method = req["method"].as_str().unwrap();
+                if method == "block.event" {
+                    continue;
+                }
+                if method == "com.superlogical.terminal.write" {
+                    let data = req["payload"]["args"]["data"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned();
+                    writes.push(data.clone());
+                    if writes.len() == 1 {
+                        if let Some(tx) = saw_first_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = release_first_rx.take() {
+                            let _ = rx.await;
+                        }
+                    }
+                    ctrl_ws
+                        .send(Message::Text(
+                            json!({
+                                "type": "response",
+                                "id": id,
+                                "payload": {"bytes_written": data.len()}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                let result = match method {
+                    "session.bootstrap" => json!({
+                        "client_id": "client:1",
+                        "selected_session": {
+                            "view": {
+                                "label": "work",
+                                "active_window_id": "window:1",
+                                "windows": [{
+                                    "window_id": "window:1",
+                                    "focused_block_id": "block:1",
+                                    "active_layer_id": "layer:1",
+                                    "layers": [{
+                                        "id": "layer:1",
+                                        "focused_block_id": "block:1",
+                                        "root": {"type": "block", "block_id": "block:1"}
+                                    }]
+                                }]
+                            }
+                        }
+                    }),
+                    "data.connect" => json!({
+                        "ticket": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16])
+                    }),
+                    _ => json!({}),
+                };
+                ctrl_ws
+                    .send(Message::Text(
+                        json!({"type": "response", "id": id, "payload": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if method == "session.detach" {
+                    break;
+                }
+            }
+            let _data_ws = data_task.await.unwrap();
+            writes
+        });
+
+        let address = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, _events) = Control::connect(&address, None).await.unwrap();
+        let mut attached = Attached::start(
+            &mut ctrl,
+            "session:1",
+            &address,
+            (None, None),
+            (80, 24),
+            Theme::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Simulate a terminal like foot emitting bracketed paste across
+        // separate reads: ESC[200~, body, ESC[201~.
+        attached
+            .burst(b"\x1b[200~", &mut in_rx, &mut ctrl)
+            .await
+            .unwrap();
+        saw_first_rx.await.unwrap();
+        assert!(attached.write_inflight.is_some());
+
+        // While the first write is still in flight, later chunks must queue
+        // locally instead of racing concurrently on the server.
+        attached
+            .burst(b"pasted text", &mut in_rx, &mut ctrl)
+            .await
+            .unwrap();
+        attached
+            .burst(b"\x1b[201~", &mut in_rx, &mut ctrl)
+            .await
+            .unwrap();
+        assert_eq!(attached.write_queue, "pasted text\x1b[201~");
+
+        // Completing the first write flushes the coalesced remainder in order.
+        release_first_tx.send(()).unwrap();
+        finish_write(&mut attached.write_inflight).await.unwrap();
+        attached.pump_write(&mut ctrl).unwrap();
+        assert!(attached.write_queue.is_empty());
+        assert!(attached.write_inflight.is_some());
+
+        finish_write(&mut attached.write_inflight).await.unwrap();
+        attached.pump_write(&mut ctrl).unwrap();
+        assert!(attached.write_inflight.is_none());
+
+        detach(&mut ctrl, &mut attached).await;
+        let writes = server.await.unwrap();
+        assert_eq!(writes, vec!["\x1b[200~", "pasted text\x1b[201~"]);
+    }
+
+    #[tokio::test]
+    async fn detach_drains_inflight_coalesced_writes_and_batched_prefix_before_detaching() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel::<()>();
+        let (saw_first_tx, saw_first_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (ctrl_tcp, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ctrl_ws = tokio_tungstenite::accept_hdr_async(
+                ctrl_tcp,
+                |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                },
+            )
+            .await
+            .unwrap();
+
+            let _hello = ctrl_ws.next().await.unwrap().unwrap();
+            ctrl_ws
+                .send(Message::Text(
+                    json!({
+                        "type": "welcome",
+                        "api_revision": 8,
+                        "client": {"reconnect_token": "tok-1"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let data_task = tokio::spawn(async move {
+                let (data_tcp, _) = listener.accept().await.unwrap();
+                #[allow(
+                    clippy::result_large_err,
+                    reason = "tungstenite fixes the callback error type"
+                )]
+                let mut data_ws = tokio_tungstenite::accept_hdr_async(
+                    data_tcp,
+                    |req: &Request, mut res: Response| {
+                        if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                            res.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", proto.clone());
+                        }
+                        Ok(res)
+                    },
+                )
+                .await
+                .unwrap();
+                let _hello = data_ws.next().await.unwrap().unwrap();
+                let mut welcome = vec![0u8; 32];
+                welcome[0] = 0x81;
+                welcome[1..17].copy_from_slice(&[9u8; 16]);
+                welcome[24..32].copy_from_slice(&42u64.to_le_bytes());
+                data_ws.send(Message::Binary(welcome.into())).await.unwrap();
+                data_ws
+            });
+
+            let mut order = Vec::new();
+            let mut saw_first_tx = Some(saw_first_tx);
+            let mut release_first_rx = Some(release_first_rx);
+            while let Some(Ok(Message::Text(text))) = ctrl_ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_str().unwrap_or("");
+                let method = req["method"].as_str().unwrap();
+                if method == "block.event" {
+                    continue;
+                }
+                if method == "com.superlogical.terminal.write" {
+                    let data = req["payload"]["args"]["data"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned();
+                    order.push(format!("write:{data}"));
+                    if order.len() == 1 {
+                        if let Some(tx) = saw_first_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = release_first_rx.take() {
+                            let _ = rx.await;
+                        }
+                    }
+                    ctrl_ws
+                        .send(Message::Text(
+                            json!({
+                                "type": "response",
+                                "id": id,
+                                "payload": {"bytes_written": data.len()}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                if method == "session.detach" {
+                    order.push("detach".to_owned());
+                }
+                let result = match method {
+                    "session.bootstrap" => json!({
+                        "client_id": "client:1",
+                        "selected_session": {
+                            "view": {
+                                "label": "work",
+                                "active_window_id": "window:1",
+                                "windows": [{
+                                    "window_id": "window:1",
+                                    "focused_block_id": "block:1",
+                                    "active_layer_id": "layer:1",
+                                    "layers": [{
+                                        "id": "layer:1",
+                                        "focused_block_id": "block:1",
+                                        "root": {"type": "block", "block_id": "block:1"}
+                                    }]
+                                }]
+                            }
+                        }
+                    }),
+                    "data.connect" => json!({
+                        "ticket": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16])
+                    }),
+                    _ => json!({}),
+                };
+                ctrl_ws
+                    .send(Message::Text(
+                        json!({"type": "response", "id": id, "payload": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if method == "session.detach" {
+                    break;
+                }
+            }
+            let _data_ws = data_task.await.unwrap();
+            order
+        });
+
+        let address = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, _events) = Control::connect(&address, None).await.unwrap();
+        let mut attached = Attached::start(
+            &mut ctrl,
+            "session:1",
+            &address,
+            (None, None),
+            (80, 24),
+            Theme::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        attached
+            .burst(b"first-", &mut in_rx, &mut ctrl)
+            .await
+            .unwrap();
+        saw_first_rx.await.unwrap();
+
+        // While the first write is in flight, the user types more text batched
+        // with Ctrl-\ in the same read.
+        let flow = attached
+            .burst(b"second\x1b[?\x1cignored", &mut in_rx, &mut ctrl)
+            .await
+            .unwrap();
+        assert!(matches!(flow, Flow::Detach));
+
+        release_first_tx.send(()).unwrap();
+        detach(&mut ctrl, &mut attached).await;
+        let order = server.await.unwrap();
+        assert_eq!(order, vec!["write:first-", "write:second\x1b[?", "detach"]);
+    }
+
+    #[tokio::test]
+    async fn read_chunks_enforces_deadline_size_cap_and_progress() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    #[allow(
+                        clippy::result_large_err,
+                        reason = "tungstenite fixes the callback error type"
+                    )]
+                    let mut ws = tokio_tungstenite::accept_hdr_async(
+                        stream,
+                        |req: &Request, mut res: Response| {
+                            if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                                res.headers_mut()
+                                    .insert("Sec-WebSocket-Protocol", proto.clone());
+                            }
+                            Ok(res)
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let _ = ws.next().await;
+                    ws.send(Message::Text(
+                        json!({"type": "welcome", "api_revision": 8})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let req: Value = serde_json::from_str(&text).unwrap();
+                        let id = req["id"].as_str().unwrap();
+                        let blob_id = req["payload"]["args"]["id"].as_i64().unwrap();
+                        let payload = match blob_id {
+                            1 => json!({"data": "123456", "eof": false}),
+                            2 => json!({"data": "", "eof": false}),
+                            3 => {
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                json!({"data": "late", "eof": true})
+                            }
+                            _ => json!({"data": "ok", "eof": true}),
+                        };
+                        let _ = ws
+                            .send(Message::Text(
+                                json!({"type": "response", "id": id, "payload": payload})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let address = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, _events) = Control::connect(&address, None).await.unwrap();
+        let block = BlockRef::new("session:1", "block:1");
+
+        // 1. Size cap exceeded.
+        let err = read_chunks_with_limits(
+            &mut ctrl,
+            block,
+            "com.superlogical.terminal.blob_read",
+            1,
+            String::new(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("maximum size"));
+
+        // 2. Empty non-EOF chunk fails instead of looping forever.
+        let err = read_chunks_with_limits(
+            &mut ctrl,
+            block,
+            "com.superlogical.terminal.blob_read",
+            2,
+            String::new(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("empty chunk"));
+
+        // 3. Wedged server hits deadline with CallTimeout, which transient() recognizes.
+        let err = read_chunks_with_limits(
+            &mut ctrl,
+            block,
+            "com.superlogical.terminal.blob_read",
+            3,
+            String::new(),
+            tokio::time::Instant::now() + Duration::from_millis(40),
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<CallTimeout>().is_some());
+        assert!(transient(&ctrl, &err));
+    }
+
+    #[test]
+    fn detects_write_target_gone_errors() {
+        for (code, status) in [
+            ("unknown", 404),
+            ("not_found", 404),
+            ("not_found", 400),
+            ("block_not_found", 400),
+            ("session_not_found", 400),
+            ("block_closed", 410),
+        ] {
+            let err = anyhow::Error::new(ApiError {
+                code: code.to_owned(),
+                message: "gone".to_owned(),
+                status,
+            });
+            assert!(write_target_gone(&err), "expected gone for {code} {status}");
+        }
+
+        for (code, status) in [("conflict", 409), ("internal", 500), ("forbidden", 403)] {
+            let err = anyhow::Error::new(ApiError {
+                code: code.to_owned(),
+                message: "other".to_owned(),
+                status,
+            });
+            assert!(
+                !write_target_gone(&err),
+                "expected not gone for {code} {status}"
+            );
+        }
+
+        assert!(!write_target_gone(&anyhow::anyhow!(
+            "the control connection ended"
+        )));
+        assert!(!write_target_gone(&anyhow::Error::new(StreamClosed {
+            code: Some(4000),
+            reason: String::new(),
+        })));
+    }
+
+    #[tokio::test]
+    async fn ignores_write_target_gone_until_block_closed_arrives() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (ctrl_tcp, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ctrl_ws = tokio_tungstenite::accept_hdr_async(
+                ctrl_tcp,
+                |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                },
+            )
+            .await
+            .unwrap();
+
+            let _hello = ctrl_ws.next().await.unwrap().unwrap();
+            ctrl_ws
+                .send(Message::Text(
+                    json!({
+                        "type": "welcome",
+                        "api_revision": 8,
+                        "client": {"reconnect_token": "tok-1"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let data_task = tokio::spawn(async move {
+                let (data_tcp, _) = listener.accept().await.unwrap();
+                #[allow(
+                    clippy::result_large_err,
+                    reason = "tungstenite fixes the callback error type"
+                )]
+                let mut data_ws = tokio_tungstenite::accept_hdr_async(
+                    data_tcp,
+                    |req: &Request, mut res: Response| {
+                        if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                            res.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", proto.clone());
+                        }
+                        Ok(res)
+                    },
+                )
+                .await
+                .unwrap();
+                let _hello = data_ws.next().await.unwrap().unwrap();
+                let mut welcome = vec![0u8; 32];
+                welcome[0] = 0x81;
+                welcome[1..17].copy_from_slice(&[9u8; 16]);
+                welcome[24..32].copy_from_slice(&42u64.to_le_bytes());
+                data_ws.send(Message::Binary(welcome.into())).await.unwrap();
+                data_ws
+            });
+
+            while let Some(Ok(Message::Text(text))) = ctrl_ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_str().unwrap_or("");
+                let method = req["method"].as_str().unwrap();
+                if method == "block.event" {
+                    continue;
+                }
+                if method == "com.superlogical.terminal.write" {
+                    ctrl_ws
+                        .send(Message::Text(
+                            json!({
+                                "type": "response",
+                                "id": id,
+                                "error": {
+                                    "code": "block_not_found",
+                                    "message": "block already closed",
+                                    "status": 404
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    ctrl_ws
+                        .send(Message::Text(
+                            json!({
+                                "type": "event",
+                                "payload": {
+                                    "type": "session_event",
+                                    "payload": {
+                                        "session_id": "session:1",
+                                        "event": {
+                                            "type": "block_closed",
+                                            "payload": {"block_id": "block:1"}
+                                        }
+                                    }
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    break;
+                }
+                let result = match method {
+                    "session.bootstrap" => json!({
+                        "client_id": "client:1",
+                        "selected_session": {
+                            "view": {
+                                "label": "work",
+                                "active_window_id": "window:1",
+                                "windows": [{
+                                    "window_id": "window:1",
+                                    "focused_block_id": "block:1",
+                                    "active_layer_id": "layer:1",
+                                    "layers": [{
+                                        "id": "layer:1",
+                                        "focused_block_id": "block:1",
+                                        "root": {"type": "block", "block_id": "block:1"}
+                                    }]
+                                }]
+                            }
+                        }
+                    }),
+                    "data.connect" => json!({
+                        "ticket": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 16])
+                    }),
+                    _ => json!({}),
+                };
+                ctrl_ws
+                    .send(Message::Text(
+                        json!({"type": "response", "id": id, "payload": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let _data_ws = data_task.await.unwrap();
+        });
+
+        let address = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, mut events) = Control::connect(&address, None).await.unwrap();
+        let mut attached = Attached::start(
+            &mut ctrl,
+            "session:1",
+            &address,
+            (None, None),
+            (80, 24),
+            Theme::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        attached.burst(b"a", &mut in_rx, &mut ctrl).await.unwrap();
+        attached.write_queue.push_str("queued");
+
+        let err = finish_write(&mut attached.write_inflight)
+            .await
+            .unwrap_err();
+        assert!(write_target_gone(&err));
+        attached.write_queue.clear();
+        assert!(attached.write_queue.is_empty());
+
+        let (name, payload) = events.recv().await.unwrap();
+        let ending = attached.event(&name, &payload, &mut ctrl).await.unwrap();
+        assert!(matches!(ending, Some(Ending::Block)));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finish_write_times_out_with_call_timeout_and_clears_inflight() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<Value>>();
+        let mut inflight = Some(InflightWrite {
+            rx,
+            deadline: tokio::time::Instant::now() + Duration::from_millis(30),
+        });
+        let err = finish_write(&mut inflight).await.unwrap_err();
+        assert!(inflight.is_none());
+        assert!(err.downcast_ref::<CallTimeout>().is_some());
     }
 }

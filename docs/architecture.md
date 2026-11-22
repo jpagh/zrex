@@ -6,14 +6,17 @@
 
 | File | Role |
 | --- | --- |
-| `src/main.rs` | CLI parsing (`ls`, `a`/`attach`, `kill`) and session/window/split listing |
+| `src/main.rs` | CLI parsing (`ls`, `a`/`attach`, `kill`, `completion`), single- and multi-server session/window/split listing with terminal titles, and shell completion |
+| `src/config.rs` | Saved-server config (`config.toml`) loading and server alias resolution for CLI commands |
+| `src/discovery.rs` | Parallel local + saved server discovery fan-out, address deduplication, and deadline handling for `zrex ls` |
+| `src/text.rs` | One-line control-character sanitization, percent-decoding, and home-path shortening helpers shared across CLI, config, session, and app |
 | `src/app.rs` | Attach lifecycle: bootstrap, block ownership, sizing, VT stream priming, raw I/O pass-through, events, and reconnection |
-| `src/session.rs` | Session lookup/creation and `session.view` queries for windows and split blocks |
-| `src/rex/mod.rs` | Server address parsing, local socket discovery, WebSocket connection setup, and frame helpers |
+| `src/session.rs` | Session lookup/creation, `session.view` queries, terminal title/process derivation, |
+| `src/rex/mod.rs` | Server address parsing, `BlockRef` addressing, local socket discovery, WebSocket connection setup, and frame helpers |
 | `src/rex/proto.rs` | Control connection JSON messages, responses, and event envelope unwrapping |
-| `src/rex/control.rs` | Multiplexed `/api/control` client with background reader and writer tasks |
+| `src/rex/control.rs` | Multiplexed `/api/control` client with background reader/writer tasks and bounded RPC timeouts |
 | `src/rex/data.rs` | `/api/data` stream client, binary handshake (`HELLO`/`WELCOME`), and `RESUME` support |
-| `src/rex/stream.rs` | `GHOSTSNP` snapshot framing and in-band Rex APC message extraction |
+| `src/rex/stream.rs` | `GHOSTSNP` snapshot framing, in-band Rex APC message extraction, and `zrex:` OSC 0/2 window-title prefixing |
 
 ## Protocol Overview
 
@@ -40,11 +43,11 @@ Rather than entering the alternate screen or re-rendering cells through a second
 1. **Initial VT Rehydration (`Attached::prime`)**:
    Every new `/api/data` stream begins with a binary `GHOSTSNP` (version 1) snapshot header. `rex::stream::snapshot_len` scans chunk headers until tag `6` (`FINISH`) marks the end of the binary snapshot, then `Attached::prime` calls `com.superlogical.terminal.format` (`format: "vt"`, `trim: false`, and all `extra_*` state flags) to fetch the block's scrollback, screen, cursor state, and modes as standard VT escape sequences and writes them to `stdout`.
 2. **Live Output Pass-Through (`Attached::feed`)**:
-   Subsequent `/api/data` chunks pass through `rex::stream::Filter` to strip in-band Rex APC control sequences (`ESC _ rex1;<NONCE>;<JSON> ESC \`) and are written directly to `stdout`. Only APC sequences whose `<NONCE>` matches the 64-bit channel nonce from the data connection's `WELCOME` frame are stripped; foreign APC sequences pass through untouched.
+   Subsequent `/api/data` chunks pass through `rex::stream::Filter` and are written directly to `stdout`. `Filter` performs two targeted transforms: (a) it strips in-band Rex APC control sequences (`ESC _ rex1;<NONCE>;<JSON> ESC \`) whose `<NONCE>` matches the 64-bit channel nonce from the data connection's `WELCOME` frame (passing foreign APC sequences through untouched), and (b) it prefixes OSC 0 and OSC 2 window-title sequences with `zrex: ` (or `zrex` when empty) via `format_osc_title` so the host terminal identifies the attached pane (passing all other OSC sequences—such as OSC 52 clipboard and OSC 8 hyperlinks—through untouched).
 3. **Raw Input Forwarding (`Attached::burst`)**:
-   `stdin` bytes are read directly and checked for `Ctrl-\` (`0x1c`, Kitty CSI-u `\x1b[92;5u`, or xterm `modifyOtherKeys` `\x1b[27;5;92~`). All other input bytes—including UTF-8 text, escape sequences, bracketed paste, Kitty keyboard reports, and mouse reports requested by programs running inside the block—are forwarded without waiting via `com.superlogical.terminal.write`.
-4. **Mode Cleanup on Detach (`Screen::leave`)**:
-   When detaching or exiting, `Screen::leave` resets terminal modes that a remote program may have enabled while attached (synchronized output, Kitty keyboard stack, `modifyOtherKeys`, mouse tracking, focus reporting, bracketed paste, cursor keys, alternate screen `?1049l`, scroll region, cursor visibility, and SGR attributes) before disabling raw mode.
+   `stdin` bytes are read directly and scanned for `Ctrl-\` (`0x1c`, Kitty CSI-u `\x1b[92;5u`, or xterm `modifyOtherKeys` `\x1b[27;5;92~`), even when batched with preceding input bytes in the same read. Two categories of `stdin` bytes are intercepted locally instead of forwarded: (a) `Ctrl-\` detach sequences, and (b) host terminal query replies (`split_replies` / `Replies`), specifically `OSC 4/10/11/12` color replies, DA1/DA2 (`CSI ?/> ... c`), and DECSET 2031 color-scheme reports (`CSI ? 997 ; ... n`), which are held briefly if split across reads so they update the host theme bridge rather than being injected into the remote PTY. All other input bytes—including UTF-8 text, escape sequences, bracketed paste, Kitty keyboard reports, and mouse reports requested by programs running inside the block—are forwarded via `com.superlogical.terminal.write`. Because Rex runs block methods concurrently rather than in arrival order, `zrex` keeps at most one `com.superlogical.terminal.write` request in flight at a time (bounded by `CALL_TIME` so a stalled server triggers recovery) and coalesces any input arriving while it is in flight into the next write, ensuring escape sequences and bracketed-paste delimiters (`\x1b[200~` … `\x1b[201~`) always reach the remote PTY in strict order without blocking output; on detach, any in-flight or queued writes (including bytes typed before a batched `Ctrl-\`) are drained under a short deadline before `session.detach`.
+4. **Mode Cleanup on Detach (`Screen::enter` / `Screen::leave`)**:
+   On attach, `Screen::enter` clears leftover host color overrides (`OSC 104/110/111/112`) and pushes the host window title onto the terminal title stack (`CSI 22 ; 0 t`) before probing theme colors. When detaching or exiting, `Screen::leave` resets terminal modes that a remote program may have enabled while attached (synchronized output, Kitty keyboard stack, `modifyOtherKeys`, mouse tracking, focus reporting, bracketed paste, color-scheme reporting, cursor keys, alternate screen `?1049l`, scroll region, custom palette/default colors `OSC 104/110/111/112`, saved window title pop `CSI 23 ; 0 t`, cursor visibility, and SGR attributes) before disabling raw mode.
 
 ## Host Theme Bridge
 
