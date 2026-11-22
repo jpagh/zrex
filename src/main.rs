@@ -25,7 +25,7 @@ const USAGE: &str = "\
 zrex: use a session on a Rex server from a terminal
 
 Usage:
-  zrex [--server SERVER] pick
+  zrex [--server SERVER] [pick]
   zrex [--server SERVER] ls
   zrex [--server SERVER] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
   zrex [--server SERVER] kill SESSION
@@ -54,11 +54,11 @@ saved servers from ~/.config/zrex/config.toml (or $XDG_CONFIG_HOME/zrex/config.t
 skipping an absent local server when saved servers are configured and returning
 an error when neither is available. completion prints a shell completion script
 that completes server names, session labels, window numbers and labels, and
-block numbers and labels. zrex pick
+block numbers and labels. Running zrex with no command (or zrex pick)
 fuzzy-searches existing sessions, windows, and splits on the default (when
 running) and saved servers (~/.config/zrex/config.toml, or
 $XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that server.
-Enter attaches, Ctrl-N
+When run without a terminal, bare zrex prints this help. Enter attaches, Ctrl-N
 creates a new session, Ctrl-T creates a new window in a session, Ctrl-R renames
 a session, window, or block, Ctrl-K kills a session, window, or block, and Esc,
 Ctrl-C, or Ctrl-backslash cancels.
@@ -74,7 +74,9 @@ enum Command {
     Help,
     Version,
     List,
-    Pick,
+    Pick {
+        explicit: bool,
+    },
     Attach {
         target: Option<String>,
         window: Option<String>,
@@ -225,9 +227,9 @@ fn parse_args(
             }
             Some(Subcommand::Pick) => {
                 if target.is_some() || window.is_some() || block.is_some() {
-                    anyhow::bail!("usage: zrex [--server SERVER] pick");
+                    anyhow::bail!("usage: zrex [--server SERVER] [pick]");
                 }
-                Command::Pick
+                Command::Pick { explicit: true }
             }
             Some(Subcommand::Attach) => Command::Attach {
                 target,
@@ -261,9 +263,21 @@ fn parse_args(
             }
             None => Command::Unknown(name.to_owned()),
         },
-        None => Command::Help,
+        None => {
+            if target.is_some() || window.is_some() || block.is_some() {
+                anyhow::bail!("usage: zrex [--server SERVER] [pick]");
+            }
+            Command::Pick { explicit: false }
+        }
     };
     Ok((server, cmd))
+}
+
+fn resolve_command(command: Command, is_terminal: bool) -> Command {
+    match command {
+        Command::Pick { explicit: false } if !is_terminal => Command::Help,
+        other => other,
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -279,7 +293,7 @@ async fn main() -> Result<()> {
     let (server_config, command) =
         parse_args(first.into_iter().chain(args), env::var("REX_SERVER").ok())?;
 
-    match command {
+    match resolve_command(command, app::has_terminal()) {
         Command::Help => {
             println!("{USAGE}");
             Ok(())
@@ -289,7 +303,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::List => list(&server_config).await,
-        Command::Pick => picker::run(&server_config).await,
+        Command::Pick { .. } => picker::run(&server_config).await,
         Command::Attach {
             target,
             window,
@@ -865,22 +879,65 @@ mod tests {
             parse_args(args(&["pick"]), env.clone()).unwrap(),
             (
                 ServerConfig::Env("https://default.example".to_owned()),
-                Command::Pick
+                Command::Pick { explicit: true }
             )
         );
         assert_eq!(
             parse_args(args(&["pick", "-S", "https://only.example"]), env).unwrap(),
             (
                 ServerConfig::Explicit("https://only.example".to_owned()),
-                Command::Pick
+                Command::Pick { explicit: true }
             )
         );
         assert!(parse_args(args(&["pick", "--window", "1"]), None).is_err());
     }
 
     #[test]
-    fn bare_command_shows_help() {
-        assert_eq!(parse_args(args(&[]), None).unwrap().1, Command::Help);
+    fn bare_command_defaults_to_picker_and_falls_back_to_usage_without_a_terminal() {
+        assert_eq!(
+            parse_args(args(&[]), None).unwrap(),
+            (ServerConfig::Default, Command::Pick { explicit: false })
+        );
+        assert_eq!(
+            parse_args(args(&["-S", "office"]), None).unwrap(),
+            (
+                ServerConfig::Explicit("office".to_owned()),
+                Command::Pick { explicit: false }
+            )
+        );
+        assert!(parse_args(args(&["--window", "1"]), None).is_err());
+        assert!(parse_args(args(&["--block", "2"]), None).is_err());
+
+        assert_eq!(parse_args(args(&["-h"]), None).unwrap().1, Command::Help);
+        assert_eq!(
+            parse_args(args(&["--help"]), None).unwrap().1,
+            Command::Help
+        );
+        assert_eq!(
+            parse_args(args(&["--version"]), None).unwrap().1,
+            Command::Version
+        );
+        assert_eq!(
+            parse_args(args(&["bogus"]), None).unwrap().1,
+            Command::Unknown("bogus".to_owned())
+        );
+
+        assert_eq!(
+            resolve_command(Command::Pick { explicit: false }, true),
+            Command::Pick { explicit: false }
+        );
+        assert_eq!(
+            resolve_command(Command::Pick { explicit: false }, false),
+            Command::Help
+        );
+        assert_eq!(
+            resolve_command(Command::Pick { explicit: true }, false),
+            Command::Pick { explicit: true }
+        );
+        assert_eq!(
+            resolve_command(Command::Unknown("bogus".to_owned()), false),
+            Command::Unknown("bogus".to_owned())
+        );
     }
 
     #[test]
