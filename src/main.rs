@@ -61,10 +61,12 @@ $XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that server.
 When run without a terminal, bare zrex prints this help. Enter attaches, Ctrl-N
 creates a new session, Ctrl-T creates a new window in a session, Ctrl-R renames
 a session, window, or block, Ctrl-K kills a session, window, or block, and Esc,
-Ctrl-C, or Ctrl-backslash cancels.
+Ctrl-C, or Ctrl-backslash quits. Detaching from a session attached via the picker
+returns to the picker, so pressing Ctrl-backslash twice detaches all the way back
+to your shell.
 
 While attached:
-  Ctrl-backslash          detach, and leave the session running
+  Ctrl-backslash          detach, and leave the session running (returns to picker if launched from it)
 
 Terminal output streams directly to your terminal, so your terminal's own
 scrollback, mouse selection, and clipboard work as they always do.";

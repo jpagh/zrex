@@ -72,7 +72,7 @@ To reach a Rex server on another machine over Tailscale, use the HTTPS address t
 
 ### Attach Picker
 
-Run `zrex` (or `zrex pick`), type to filter, and use the arrow keys (or `Tab`/`Shift-Tab`) and Enter to attach in the same terminal. Press `Ctrl-N` to create a new session (optionally choosing a server and name, or pressing Enter for the default), `Ctrl-T` to create a new window in a session (defaulting to the highlighted target's session), `Ctrl-R` to rename the highlighted session, window, or block (clearing with `Ctrl-U` restores the server default), or `Ctrl-K` to kill a session, window, or block (use `Tab`/arrows or `s`/`w`/`b` to choose the scope, and `Enter`/`y` to confirm). Renames and kills update the picker in place so you can keep working without leaving it. `Ctrl-U` clears the current input, `Esc` backs out of a prompt or cancels the picker, and `Ctrl-C` cancels immediately. `Ctrl-\` detaches straight back to your shell. When run without a terminal, bare `zrex` prints usage instead of launching the picker.
+Run `zrex` (or `zrex pick`), type to filter, and use the arrow keys (or `Tab`/`Shift-Tab`) and Enter to attach in the same terminal. Detaching (`Ctrl-\`) from a session attached via the picker returns you to the picker with a refreshed view, and pressing `Ctrl-\` in the picker quits back to your shell—so a double `Ctrl-\` detaches all the way out. Press `Ctrl-N` to create a new session (optionally choosing a server and name, or pressing Enter for the default), `Ctrl-T` to create a new window in a session (defaulting to the highlighted target's session), `Ctrl-R` to rename the highlighted session, window, or block (clearing with `Ctrl-U` restores the server default), or `Ctrl-K` to kill a session, window, or block (use `Tab`/arrows or `s`/`w`/`b` to choose the scope, and `Enter`/`y` to confirm). Renames and kills update the picker in place so you can keep working without leaving it. `Ctrl-U` clears the current input, `Esc` backs out of a prompt or quits the picker, and `Ctrl-C` or `Ctrl-\` quits immediately from any prompt. When run without a terminal, bare `zrex` prints usage instead of launching the picker.
 
 Use `Alt/Option-←` and `Alt/Option-→` to move by word. `Ctrl-←`/`Ctrl-→` and `Alt-B`/`Alt-F` also work, depending on what your terminal sends. `Home`/`End` or `Ctrl-A`/`Ctrl-E` go to the start or end of the query.
 
@@ -117,11 +117,11 @@ zrex completion fish | source
 
 | Input | Action |
 | --- | --- |
-| `Ctrl-\` | Detach and leave the session running |
+| `Ctrl-\` | Detach and leave the session running (returns to the picker if launched from it; press `Ctrl-\` again to quit to your shell) |
 
 All other input—including keys, bracketed paste, Kitty keyboard sequences, and mouse events when requested by a running program—is passed directly to the remote block. Scrollback, search, and text selection are handled natively by your host terminal.
 
-To switch to another window or split block, detach with `Ctrl-\` and attach again with `--window` or `--block`.
+To switch to another window or split block, detach with `Ctrl-\` to pick another target (or re-attach directly with `--window` or `--block`).
 
 ## Documentation
 

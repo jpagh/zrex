@@ -1,7 +1,10 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::env;
+use std::future::Future;
 use std::io::{self, Write};
+use std::pin::Pin;
+use std::time::Duration;
 
 use crossterm::{
     cursor::MoveTo,
@@ -25,6 +28,19 @@ const MIN_INPUT_WIDTH: usize = 12;
 pub(super) struct Feedback {
     pub(super) text: String,
     pub(super) is_error: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FocusTarget {
+    pub(super) server_name: String,
+    pub(super) session_id: String,
+    pub(super) block_id: String,
+}
+
+pub(super) enum StepEvent {
+    Cancel,
+    Selected(Selection),
+    Refreshed(super::DiscoveryOutcome),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -214,6 +230,8 @@ pub(super) struct PickerState {
     attach_first: usize,
     mode: Mode,
     feedback: Option<Feedback>,
+    pending_focus: Option<FocusTarget>,
+    refreshing: bool,
 }
 
 impl PickerState {
@@ -235,13 +253,71 @@ impl PickerState {
             attach_first: 0,
             mode: Mode::Attach,
             feedback: None,
+            pending_focus: None,
+            refreshing: false,
         };
         state.recompute_matches();
         state
     }
 
+    pub(super) fn is_attach_mode(&self) -> bool {
+        matches!(self.mode, Mode::Attach)
+    }
+
+    pub(super) fn clear_refreshing(&mut self) {
+        self.refreshing = false;
+    }
+
     pub(super) fn set_feedback(&mut self, feedback: Feedback) {
         self.feedback = Some(feedback);
+    }
+
+    /// Resets the picker after returning from an attached block: clears any
+    /// prior filter query, returns to attach mode, focuses `focus` if it is
+    /// already present (and remembers it until the user interacts so a
+    /// background refresh can focus a newly created session or window), and
+    /// optionally shows a status banner while refreshing.
+    pub(super) fn reset_after_attach(
+        &mut self,
+        focus: Option<FocusTarget>,
+        feedback: Option<Feedback>,
+        refreshing: bool,
+    ) {
+        self.attach_input = TextInput::default();
+        self.mode = Mode::Attach;
+        self.recompute_matches();
+        if let Some(target) = &focus
+            && let Some(pos) = self.find_focus_target(target)
+        {
+            self.attach_selected = pos;
+        }
+        self.pending_focus = focus;
+        self.feedback = feedback;
+        self.refreshing = refreshing;
+    }
+
+    /// Applies a full server-discovery refresh while preserving the user's
+    /// active filter query and selection (or focusing `pending_focus` if the
+    /// user has not navigated since returning from attach).
+    pub(super) fn apply_discovery(
+        &mut self,
+        targets: Vec<Target>,
+        sessions: Vec<SessionChoice>,
+        servers: Vec<String>,
+        warning: Option<Feedback>,
+    ) {
+        self.update_entries(targets, sessions, Some(servers));
+        if self.feedback.is_none() {
+            self.feedback = warning;
+        }
+    }
+
+    pub(super) fn finish_refresh_error(&mut self, feedback: Feedback) {
+        self.pending_focus = None;
+        self.refreshing = false;
+        if self.feedback.is_none() {
+            self.feedback = Some(feedback);
+        }
     }
 
     pub(super) fn refresh(
@@ -250,29 +326,44 @@ impl PickerState {
         sessions: Vec<SessionChoice>,
         feedback: Feedback,
     ) {
-        let prev_key = self
-            .matches
-            .get(self.attach_selected)
-            .map(|&(index, _)| self.targets[index].key());
+        self.pending_focus = None;
+        self.mode = Mode::Attach;
+        self.update_entries(targets, sessions, None);
+        self.feedback = Some(feedback);
+    }
+
+    fn update_entries(
+        &mut self,
+        targets: Vec<Target>,
+        sessions: Vec<SessionChoice>,
+        servers: Option<Vec<String>>,
+    ) {
+        let prev = self.selected_identity();
         let prev_selected = self.attach_selected;
+        let pending_focus = self.pending_focus.take();
 
         self.targets = targets;
         self.sessions = sessions;
+        if let Some(servers) = servers {
+            self.servers = servers;
+        }
         self.labels = self.targets.iter().map(Target::search_text).collect();
         self.recompute_matches();
 
-        if let Some(prev_key) = prev_key {
-            if let Some(pos) = self
-                .matches
-                .iter()
-                .position(|&(index, _)| prev_key.matches_target(&self.targets[index]))
-            {
+        if let Some(focus) = pending_focus
+            && let Some(pos) = self.find_focus_target(&focus)
+        {
+            self.attach_selected = pos;
+        } else if let Some((prev_server, prev_key)) = prev {
+            if let Some(pos) = self.matches.iter().position(|&(index, _)| {
+                let target = &self.targets[index];
+                self.is_on_server(target, &prev_server) && prev_key.matches_block(target)
+            }) {
                 self.attach_selected = pos;
-            } else if let Some(pos) = self
-                .matches
-                .iter()
-                .position(|&(index, _)| prev_key.matches_window(&self.targets[index]))
-            {
+            } else if let Some(pos) = self.matches.iter().position(|&(index, _)| {
+                let target = &self.targets[index];
+                self.is_on_server(target, &prev_server) && prev_key.matches_window(target)
+            }) {
                 self.attach_selected = pos;
             } else if !self.matches.is_empty() {
                 self.attach_selected = prev_selected.min(self.matches.len() - 1);
@@ -281,8 +372,29 @@ impl PickerState {
             self.attach_selected = prev_selected.min(self.matches.len() - 1);
         }
 
-        self.mode = Mode::Attach;
-        self.feedback = Some(feedback);
+        self.refreshing = false;
+    }
+
+    fn is_on_server(&self, target: &Target, server_name: &str) -> bool {
+        self.servers
+            .get(target.server_index)
+            .is_some_and(|name| name == server_name)
+    }
+
+    fn selected_identity(&self) -> Option<(String, super::TargetKey)> {
+        let &(index, _) = self.matches.get(self.attach_selected)?;
+        let target = &self.targets[index];
+        let server = self.servers.get(target.server_index)?.clone();
+        Some((server, target.key()))
+    }
+
+    fn find_focus_target(&self, focus: &FocusTarget) -> Option<usize> {
+        self.matches.iter().position(|&(index, _)| {
+            let target = &self.targets[index];
+            self.is_on_server(target, &focus.server_name)
+                && target.session_id == focus.session_id
+                && target.block_id == focus.block_id
+        })
     }
 
     fn recompute_matches(&mut self) {
@@ -463,12 +575,8 @@ impl PickerState {
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<Outcome> {
         self.feedback = None;
-        // In raw Unix mode crossterm decodes ASCII 0x1c (Ctrl-\) as Ctrl-4,
-        // while Kitty / modifyOtherKeys sends Ctrl-\ directly.
-        if matches!(
-            (code, modifiers),
-            (KeyCode::Char('c' | '\\' | '4'), KeyModifiers::CONTROL)
-        ) {
+        self.pending_focus = None;
+        if is_quit_key(code, modifiers) {
             return Some(Outcome::Cancel);
         }
         match &mut self.mode {
@@ -737,7 +845,12 @@ impl PickerState {
         rows: u16,
         use_color: bool,
     ) -> io::Result<()> {
-        let banner = self.feedback.clone();
+        let banner = self.feedback.clone().or_else(|| {
+            self.refreshing.then(|| Feedback {
+                text: "Refreshing…".to_owned(),
+                is_error: false,
+            })
+        });
         self.render_with_banner(out, columns, rows, use_color, banner.as_ref())
     }
 
@@ -1067,13 +1180,53 @@ fn choose_prompt_with_tail<'a>(width: usize, min_tail: usize, candidates: &[&'a 
     if width > 2 { "> " } else { "" }
 }
 
+fn is_quit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    // In raw Unix mode crossterm decodes ASCII 0x1c (Ctrl-\) as Ctrl-4,
+    // while Kitty / modifyOtherKeys sends Ctrl-\ directly.
+    matches!(
+        (code, modifiers),
+        (KeyCode::Char('c' | '\\' | '4'), KeyModifiers::CONTROL)
+    )
+}
+
+/// Drains any input already queued in the terminal buffer (while raw mode is
+/// active) and returns true if a quit key (`Ctrl-\` or `Ctrl-C`) was queued,
+/// enabling instant double-detach without re-entering the alternate screen.
+pub(super) fn take_queued_quit_key() -> io::Result<bool> {
+    while event::poll(Duration::ZERO)? {
+        if let Event::Key(key) = event::read()?
+            && key.kind != KeyEventKind::Release
+            && is_quit_key(key.code, key.modifiers)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Keeps raw mode continuously enabled across picker <-> attach transitions so
+/// pressing `Ctrl-\` during detach never hits cooked-mode `SIGQUIT`.
+pub(super) struct RawModeGuard;
+
+impl RawModeGuard {
+    pub(super) fn enter() -> io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
 pub(super) struct Screen {
     use_color: bool,
 }
 
 impl Screen {
-    pub(super) fn enter() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
+    pub(super) fn enter(_raw: &RawModeGuard) -> io::Result<Self> {
         let screen = Self {
             use_color: color_enabled(),
         };
@@ -1101,6 +1254,48 @@ impl Screen {
         }
     }
 
+    pub(super) async fn step_until(
+        &mut self,
+        state: &mut PickerState,
+        refresh: &mut Pin<Box<dyn Future<Output = super::DiscoveryOutcome>>>,
+    ) -> io::Result<StepEvent> {
+        let mut out = io::stdout();
+        let (columns, rows) = terminal::size()?;
+        state.render(&mut out, columns, rows, self.use_color)?;
+
+        let mut tick = tokio::time::interval(Duration::from_millis(16));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                refreshed = refresh.as_mut() => return Ok(StepEvent::Refreshed(refreshed)),
+                _ = tick.tick() => {
+                    let mut dirty = false;
+                    while event::poll(Duration::ZERO)? {
+                        match event::read()? {
+                            Event::Resize(_, _) => dirty = true,
+                            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                                dirty = true;
+                                match state.handle_key(key.code, key.modifiers) {
+                                    Some(Outcome::Cancel) => return Ok(StepEvent::Cancel),
+                                    Some(Outcome::Selected(selection)) => {
+                                        return Ok(StepEvent::Selected(selection));
+                                    }
+                                    None => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if dirty {
+                        let (columns, rows) = terminal::size()?;
+                        state.render(&mut out, columns, rows, self.use_color)?;
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn render_busy(&mut self, state: &mut PickerState, message: &str) -> io::Result<()> {
         let mut out = io::stdout();
         let (columns, rows) = terminal::size()?;
@@ -1112,7 +1307,7 @@ impl Screen {
     }
 
     pub(super) fn drain_input(&mut self) -> io::Result<()> {
-        while event::poll(std::time::Duration::ZERO)? {
+        while event::poll(Duration::ZERO)? {
             let _ = event::read()?;
         }
         Ok(())
@@ -1126,7 +1321,6 @@ impl Drop for Screen {
             SetAttribute(Attribute::Reset),
             LeaveAlternateScreen
         );
-        let _ = terminal::disable_raw_mode();
     }
 }
 
@@ -1995,7 +2189,11 @@ mod tests {
         // Select second match (block:3).
         assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
 
-        // Simulate renaming block:3 and refreshing.
+        // Simulate renaming block:3 and refreshing (overwriting any prior banner).
+        state.set_feedback(Feedback {
+            text: "Old warning".to_owned(),
+            is_error: true,
+        });
         let mut updated = targets;
         updated[2].block_label = Some("logs".to_owned());
         state.refresh(
@@ -2007,6 +2205,13 @@ mod tests {
             },
         );
         assert_eq!(state.attach_input.text(), "dev");
+        assert_eq!(
+            state.feedback,
+            Some(Feedback {
+                text: "Renamed block to logs".to_owned(),
+                is_error: false,
+            })
+        );
         // Previously selected block:3 stays selected after refresh.
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
@@ -2087,5 +2292,153 @@ mod tests {
         state.render(&mut buf, 80, 10, false).unwrap();
         let screen = String::from_utf8(buf).unwrap();
         assert!(!screen.contains("office: connection refused"));
+    }
+
+    #[test]
+    fn reset_after_attach_clears_query_and_focuses_detached_or_newly_created_block() {
+        let (targets, sessions, servers) = sample_fixture();
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers.clone());
+
+        // User filtered before attaching.
+        type_text(&mut state, "api");
+        assert_eq!(state.matches.len(), 1);
+
+        // Detaching from [office] api clears the filter, focuses [office] api immediately,
+        // and renders a refreshing banner until discovery finishes.
+        state.reset_after_attach(
+            Some(FocusTarget {
+                server_name: "office".to_owned(),
+                session_id: "session:2".to_owned(),
+                block_id: "block:2".to_owned(),
+            }),
+            None,
+            true,
+        );
+        assert_eq!(state.attach_input.text(), "");
+        assert_eq!(state.matches.len(), 2);
+        let mut buf = Vec::new();
+        state.render(&mut buf, 80, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("Refreshing…"));
+
+        // When discovery finishes with a new server order (office moved to index 0),
+        // the detached block stays highlighted and the refreshing banner clears.
+        let reordered_servers = vec!["office".to_owned(), "local".to_owned()];
+        let reordered_sessions = vec![
+            SessionChoice {
+                server_index: 0,
+                server_name: "office".to_owned(),
+                session_id: "session:2".to_owned(),
+                label: "api".to_owned(),
+            },
+            SessionChoice {
+                server_index: 1,
+                server_name: "local".to_owned(),
+                session_id: "session:1".to_owned(),
+                label: "work".to_owned(),
+            },
+        ];
+        let reordered_targets = vec![
+            test_target(0, 0, "[office] api / 1 nvim", "session:2", "block:2"),
+            test_target(1, 1, "[local] work / 1 zsh", "session:1", "block:1"),
+        ];
+        state.apply_discovery(
+            reordered_targets,
+            reordered_sessions,
+            reordered_servers,
+            None,
+        );
+        let mut buf = Vec::new();
+        state.render(&mut buf, 80, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(!screen.contains("Refreshing…"));
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Attach(0)))
+        );
+
+        // Detaching from a brand-new session that was not yet in the pre-attach list
+        // focuses it as soon as discovery brings it in.
+        state.reset_after_attach(
+            Some(FocusTarget {
+                server_name: "local".to_owned(),
+                session_id: "session:new".to_owned(),
+                block_id: "block:new".to_owned(),
+            }),
+            None,
+            true,
+        );
+        let mut new_sessions = sessions;
+        new_sessions.push(SessionChoice {
+            server_index: 0,
+            server_name: "local".to_owned(),
+            session_id: "session:new".to_owned(),
+            label: "scratch".to_owned(),
+        });
+        let mut new_targets = targets;
+        new_targets.push(test_target(
+            0,
+            2,
+            "[local] scratch / 1 zsh",
+            "session:new",
+            "block:new",
+        ));
+        state.apply_discovery(new_targets, new_sessions, servers, None);
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Attach(2)))
+        );
+    }
+
+    #[test]
+    fn user_navigation_during_refresh_overrides_pending_detach_focus() {
+        let (targets, sessions, servers) = sample_fixture();
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers.clone());
+
+        state.reset_after_attach(
+            Some(FocusTarget {
+                server_name: "office".to_owned(),
+                session_id: "session:2".to_owned(),
+                block_id: "block:2".to_owned(),
+            }),
+            None,
+            true,
+        );
+        // User moves up to [local] work before refresh completes.
+        assert_eq!(state.handle_key(KeyCode::Up, KeyModifiers::NONE), None);
+
+        state.apply_discovery(targets, sessions, servers, None);
+        // Selection stays on [local] work (index 0) instead of snapping back to [office] api.
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Attach(0)))
+        );
+    }
+
+    #[test]
+    fn explicit_post_attach_feedback_takes_precedence_over_refreshing_banner() {
+        let (targets, sessions, servers) = sample_fixture();
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers.clone());
+
+        state.reset_after_attach(
+            None,
+            Some(Feedback {
+                text: "The block closed".to_owned(),
+                is_error: false,
+            }),
+            true,
+        );
+        let mut buf = Vec::new();
+        state.render(&mut buf, 80, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("The block closed"));
+        assert!(!screen.contains("Refreshing…"));
+
+        // Completing discovery preserves the explicit message until the next key.
+        state.apply_discovery(targets, sessions, servers, None);
+        let mut buf = Vec::new();
+        state.render(&mut buf, 80, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("The block closed"));
     }
 }

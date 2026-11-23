@@ -123,6 +123,47 @@ pub fn ensure_terminal() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachExit {
+    Detached {
+        session_id: String,
+        block_id: String,
+        /// True when a second detach sequence was already read right behind the
+        /// first detach sequence (fast double-detach).
+        double_detach: bool,
+    },
+    BlockClosed {
+        session_id: String,
+        block_id: String,
+    },
+    SessionClosed {
+        session_id: String,
+    },
+}
+
+impl AttachExit {
+    pub fn closed_message(&self) -> Option<&'static str> {
+        match self {
+            Self::BlockClosed { .. } => Some("the block closed"),
+            Self::SessionClosed { .. } => Some("the session closed"),
+            Self::Detached { .. } => None,
+        }
+    }
+
+    fn cli_message(&self) -> String {
+        match self {
+            Self::Detached { session_id, .. } => format!("detached from {session_id}"),
+            other => other.closed_message().unwrap_or_default().to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalMode {
+    RestoreOnLeave,
+    KeepRawOnLeave,
+}
+
 pub async fn attach(
     server_config: &ServerConfig,
     target: Option<String>,
@@ -144,14 +185,17 @@ pub async fn attach(
         }
         None => (None, block),
     };
-    attach_block(
+    let exit = attach_block(
         &server,
         ctrl,
         events,
         &session_id,
         BlockSelection::Selectors(window.as_deref(), block.as_deref()),
+        TerminalMode::RestoreOnLeave,
     )
-    .await
+    .await?;
+    println!("{}", exit.cli_message());
+    Ok(())
 }
 
 /// Picker targets are a snapshot of existing IDs, never creation selectors.
@@ -159,7 +203,7 @@ pub async fn attach_existing(
     server: &ServerAddress,
     session_id: &str,
     block_id: &str,
-) -> Result<()> {
+) -> Result<AttachExit> {
     ensure_terminal()?;
     let (mut ctrl, events) = Control::connect(server, None).await?;
     session::attach(&mut ctrl, session_id).await?;
@@ -169,11 +213,12 @@ pub async fn attach_existing(
         events,
         session_id,
         BlockSelection::Exact(block_id),
+        TerminalMode::KeepRawOnLeave,
     )
     .await
 }
 
-pub async fn attach_new_session(server: &ServerAddress, label: Option<&str>) -> Result<()> {
+pub async fn attach_new_session(server: &ServerAddress, label: Option<&str>) -> Result<AttachExit> {
     ensure_terminal()?;
     let (mut ctrl, events) = Control::connect(server, None).await?;
     let session_id = session::create(&mut ctrl, label).await?;
@@ -183,6 +228,7 @@ pub async fn attach_new_session(server: &ServerAddress, label: Option<&str>) -> 
         events,
         &session_id,
         BlockSelection::Selectors(None, None),
+        TerminalMode::KeepRawOnLeave,
     )
     .await
 }
@@ -191,7 +237,7 @@ pub async fn attach_new_window(
     server: &ServerAddress,
     session_id: &str,
     label: Option<&str>,
-) -> Result<()> {
+) -> Result<AttachExit> {
     ensure_terminal()?;
     let (mut ctrl, events) = Control::connect(server, None).await?;
     session::attach(&mut ctrl, session_id).await?;
@@ -202,6 +248,7 @@ pub async fn attach_new_window(
         events,
         session_id,
         BlockSelection::Selectors(Some(&window_id), None),
+        TerminalMode::KeepRawOnLeave,
     )
     .await
 }
@@ -218,9 +265,10 @@ async fn attach_block(
     mut events: Events,
     session_id: &str,
     selection: BlockSelection<'_>,
-) -> Result<()> {
+    terminal_mode: TerminalMode,
+) -> Result<AttachExit> {
     let size = crossterm::terminal::size()?;
-    let mut guard = Screen::enter()?;
+    let mut guard = Screen::enter(terminal_mode)?;
     let (theme, probe_tail) = guard.probe_theme();
     let mut attached =
         Attached::start(&mut ctrl, session_id, server, selection, size, theme).await?;
@@ -228,7 +276,7 @@ async fn attach_block(
     // that takes over stdin starts out holding the fragment it left.
     attached.replies.hold(probe_tail);
 
-    let mut input = spawn_input();
+    let mut input = InputReader::spawn()?;
     let mut winch = signal(SignalKind::window_change())?;
     let mut probe = tokio::time::interval(PROBE_EVERY);
     probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -254,9 +302,12 @@ async fn attach_block(
                                     }
                                     Err(error) if closed_block(&error) => {
                                         attached.flush(guard.out())?;
-                                        guard.leave()?;
-                                        println!("the block closed");
-                                        return Ok(());
+                                        return finish_ending(
+                                            &mut input,
+                                            &mut guard,
+                                            attached,
+                                            Ending::Block,
+                                        );
                                     }
                                     Err(error) => {
                                         lost = Some(stream_lost(error));
@@ -267,9 +318,7 @@ async fn attach_block(
                         }
                     }
                     Some(Err(error)) if closed_block(&error) => {
-                        guard.leave()?;
-                        println!("the block closed");
-                        return Ok(());
+                        return finish_ending(&mut input, &mut guard, attached, Ending::Block);
                     }
                     Some(Err(error)) => lost = Some(stream_lost(error)),
                     None => lost = Some(data_ended()),
@@ -280,9 +329,7 @@ async fn attach_block(
                     Some((name, payload)) => {
                         match attached.event(&name, &payload, &mut ctrl).await {
                             Ok(Some(ending)) => {
-                                guard.leave()?;
-                                println!("{}", ending.message());
-                                return Ok(());
+                                return finish_ending(&mut input, &mut guard, attached, ending);
                             }
                             Ok(None) => {}
                             Err(error) => lost = Some(error),
@@ -293,11 +340,16 @@ async fn attach_block(
             }
             Some(bytes) = input.recv() => {
                 match attached.burst(&bytes, &mut input, &mut ctrl).await {
-                    Ok(Flow::Detach) => {
-                        detach(&mut ctrl, &mut attached).await;
-                        guard.leave()?;
-                        println!("detached from {}", attached.session_id);
-                        return Ok(());
+                    Ok(Flow::Detach { double }) => {
+                        return finish_detach(
+                            &mut ctrl,
+                            &mut input,
+                            &mut guard,
+                            attached,
+                            double,
+                            DetachMode::Graceful,
+                        )
+                        .await;
                     }
                     Ok(Flow::Continue) => {}
                     Err(error) => lost = Some(error),
@@ -359,11 +411,16 @@ async fn attach_block(
                 .await
             {
                 Ok(Flow::Continue) => {}
-                Ok(Flow::Detach) => {
-                    detach(&mut ctrl, &mut attached).await;
-                    guard.leave()?;
-                    println!("detached from {}", attached.session_id);
-                    return Ok(());
+                Ok(Flow::Detach { double }) => {
+                    return finish_detach(
+                        &mut ctrl,
+                        &mut input,
+                        &mut guard,
+                        attached,
+                        double,
+                        DetachMode::Graceful,
+                    )
+                    .await;
                 }
                 Err(error) => lost = Some(error),
             }
@@ -383,21 +440,19 @@ async fn attach_block(
             .await?
             {
                 Recovered::Live => {}
-                Recovered::Detach => {
-                    detach_session(
+                Recovered::Detach { double } => {
+                    return finish_detach(
                         &mut ctrl,
-                        &attached.session_id,
-                        tokio::time::Instant::now() + DETACH_TIME,
+                        &mut input,
+                        &mut guard,
+                        attached,
+                        double,
+                        DetachMode::Immediate,
                     )
                     .await;
-                    guard.leave()?;
-                    println!("detached from {}", attached.session_id);
-                    return Ok(());
                 }
                 Recovered::Ended(ending) => {
-                    guard.leave()?;
-                    println!("{}", ending.message());
-                    return Ok(());
+                    return finish_ending(&mut input, &mut guard, attached, ending);
                 }
             }
         }
@@ -406,10 +461,65 @@ async fn attach_block(
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetachMode {
+    /// Connected: drain queued and in-flight keystrokes before `session.detach`.
+    Graceful,
+    /// Interrupted during reconnect: skip draining writes and just send `session.detach`.
+    Immediate,
+}
+
+fn finish_ending(
+    input: &mut InputReader,
+    guard: &mut Screen,
+    attached: Attached<'_>,
+    ending: Ending,
+) -> Result<AttachExit> {
+    input.stop();
+    guard.leave()?;
+    Ok(ending.into_exit(attached.session_id, attached.block_id))
+}
+
+async fn finish_detach(
+    ctrl: &mut Control,
+    input: &mut InputReader,
+    guard: &mut Screen,
+    mut attached: Attached<'_>,
+    mut double_detach: bool,
+    mode: DetachMode,
+) -> Result<AttachExit> {
+    double_detach |= input.stop_and_drain_detach();
+    match mode {
+        DetachMode::Graceful => detach(ctrl, &mut attached).await,
+        DetachMode::Immediate => {
+            detach_session(
+                ctrl,
+                &attached.session_id,
+                tokio::time::Instant::now() + DETACH_TIME,
+            )
+            .await;
+        }
+    }
+    guard.leave()?;
+    Ok(AttachExit::Detached {
+        session_id: attached.session_id,
+        block_id: attached.block_id,
+        double_detach,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Flow {
     Continue,
-    Detach,
+    Detach { double: bool },
+}
+
+impl Flow {
+    fn detach_after(tail: &[u8]) -> Self {
+        Self::Detach {
+            double: contains_detach(tail),
+        }
+    }
 }
 
 enum Ending {
@@ -418,10 +528,13 @@ enum Ending {
 }
 
 impl Ending {
-    fn message(&self) -> &'static str {
+    fn into_exit(self, session_id: String, block_id: String) -> AttachExit {
         match self {
-            Ending::Block => "the block closed",
-            Ending::Session => "the session closed",
+            Ending::Block => AttachExit::BlockClosed {
+                session_id,
+                block_id,
+            },
+            Ending::Session => AttachExit::SessionClosed { session_id },
         }
     }
 }
@@ -584,7 +697,7 @@ impl<'a> Attached<'a> {
     async fn refresh_theme(
         &mut self,
         out: &mut impl Write,
-        input: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        input: &mut InputReader,
         ctrl: &mut Control,
     ) -> Result<Flow> {
         self.flush(out)?;
@@ -597,18 +710,20 @@ impl<'a> Attached<'a> {
             let Ok(Some(bytes)) = tokio::time::timeout(remaining, input.recv()).await else {
                 break;
             };
-            let (before, detach) = split_at_detach(&bytes);
+            let (before, after_detach) = split_at_detach(&bytes);
             if !before.is_empty() {
                 let (found, typed) = self.replies.push(before);
                 replies.extend_from_slice(&found);
-                if self.accept(&found, &typed) == Flow::Detach {
+                if let Flow::Detach { double } = self.accept(&found, &typed) {
                     self.flush_input(ctrl)?;
-                    return Ok(Flow::Detach);
+                    return Ok(Flow::Detach {
+                        double: double || after_detach.is_some(),
+                    });
                 }
             }
             self.flush_input(ctrl)?;
-            if detach {
-                return Ok(Flow::Detach);
+            if let Some(tail) = after_detach {
+                return Ok(Flow::detach_after(tail));
             }
             if has_da1_reply(&replies) {
                 break;
@@ -627,17 +742,19 @@ impl<'a> Attached<'a> {
     async fn burst(
         &mut self,
         first: &[u8],
-        input: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        input: &mut InputReader,
         ctrl: &mut Control,
     ) -> Result<Flow> {
-        if self.queue_input(first) == Flow::Detach {
+        if let Flow::Detach { mut double } = self.queue_input(first) {
+            double |= input.drain_detach();
             self.flush_input(ctrl)?;
-            return Ok(Flow::Detach);
+            return Ok(Flow::Detach { double });
         }
-        while let Ok(bytes) = input.try_recv() {
-            if self.queue_input(&bytes) == Flow::Detach {
+        while let Some(bytes) = input.try_recv() {
+            if let Flow::Detach { mut double } = self.queue_input(&bytes) {
+                double |= input.drain_detach();
                 self.flush_input(ctrl)?;
-                return Ok(Flow::Detach);
+                return Ok(Flow::Detach { double });
             }
         }
         let typed = !self.input_buf.is_empty();
@@ -649,14 +766,19 @@ impl<'a> Attached<'a> {
     }
 
     fn queue_input(&mut self, bytes: &[u8]) -> Flow {
-        let (before, detach) = split_at_detach(bytes);
+        let (before, after_detach) = split_at_detach(bytes);
         if !before.is_empty() {
             let (replies, typed) = self.replies.push(before);
-            if self.accept(&replies, &typed) == Flow::Detach {
-                return Flow::Detach;
+            if let Flow::Detach { double } = self.accept(&replies, &typed) {
+                return Flow::Detach {
+                    double: double || after_detach.is_some(),
+                };
             }
         }
-        if detach { Flow::Detach } else { Flow::Continue }
+        match after_detach {
+            Some(tail) => Flow::detach_after(tail),
+            None => Flow::Continue,
+        }
     }
 
     /// Keeps what `Replies::push` classified without parsing the bytes twice.
@@ -665,11 +787,14 @@ impl<'a> Attached<'a> {
             self.theme_dirty = true;
         }
         // The detach key can share a read with a host reply or preceding keys.
-        let (before, detach) = split_at_detach(typed);
+        let (before, after_detach) = split_at_detach(typed);
         if !before.is_empty() {
             self.input_buf.extend_from_slice(before);
         }
-        if detach { Flow::Detach } else { Flow::Continue }
+        match after_detach {
+            Some(tail) => Flow::detach_after(tail),
+            None => Flow::Continue,
+        }
     }
 
     /// Forwards a fragment the host stopped sending partway through.
@@ -927,20 +1052,26 @@ const DETACH_SEQUENCES: [&[u8]; 8] = [
 ];
 
 /// Splits `bytes` before the earliest detach sequence, returning
-/// `(prefix_before_detach, saw_detach)`.
-fn split_at_detach(bytes: &[u8]) -> (&[u8], bool) {
+/// `(prefix_before_detach, Some(tail_after_detach))` when found or
+/// `(bytes, None)` otherwise.
+fn split_at_detach(bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
     let earliest = DETACH_SEQUENCES
         .iter()
-        .filter_map(|seq| bytes.windows(seq.len()).position(|window| window == *seq))
-        .min();
+        .filter_map(|seq| {
+            bytes
+                .windows(seq.len())
+                .position(|window| window == *seq)
+                .map(|pos| (pos, seq.len()))
+        })
+        .min_by_key(|&(pos, _)| pos);
     match earliest {
-        Some(pos) => (&bytes[..pos], true),
-        None => (bytes, false),
+        Some((pos, len)) => (&bytes[..pos], Some(&bytes[pos + len..])),
+        None => (bytes, None),
     }
 }
 
 fn contains_detach(bytes: &[u8]) -> bool {
-    split_at_detach(bytes).1
+    split_at_detach(bytes).1.is_some()
 }
 
 /// Asks the host terminal for its default colors and its whole 256-color
@@ -1544,13 +1675,118 @@ async fn stalled(at: Option<Instant>) {
     }
 }
 
-fn spawn_input() -> mpsc::UnboundedReceiver<Vec<u8>> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
+struct InputReader {
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    wake: Option<std::io::PipeWriter>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl InputReader {
+    fn spawn() -> Result<Self> {
+        Self::spawn_reader(std::io::stdin())
+    }
+
+    fn spawn_reader(input: impl Read + AsRawFd + Send + 'static) -> Result<Self> {
+        let (wake_rd, wake_wr) = std::io::pipe()?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let thread = std::thread::spawn(move || {
+            read_until_wake(input, wake_rd, tx);
+        });
+        Ok(Self {
+            rx,
+            wake: Some(wake_wr),
+            thread: Some(thread),
+        })
+    }
+
+    #[cfg(test)]
+    fn from_channel(rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+        Self {
+            rx,
+            wake: None,
+            thread: None,
+        }
+    }
+
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.rx.recv().await
+    }
+
+    fn try_recv(&mut self) -> Option<Vec<u8>> {
+        self.rx.try_recv().ok()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rx.is_empty()
+    }
+
+    fn drain_detach(&mut self) -> bool {
+        let mut saw_detach = false;
+        while let Some(bytes) = self.try_recv() {
+            if contains_detach(&bytes) {
+                saw_detach = true;
+            }
+        }
+        saw_detach
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut wake) = self.wake.take() {
+            let _ = wake.write_all(&[1]);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+
+    /// Stops the background reader thread so it cannot steal subsequent keys
+    /// from the picker, and reports whether any already-queued chunks carried a
+    /// second detach key.
+    fn stop_and_drain_detach(&mut self) -> bool {
+        self.stop();
+        self.drain_detach()
+    }
+}
+
+impl Drop for InputReader {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn read_until_wake(
+    mut input: impl Read + AsRawFd,
+    wake_rd: std::io::PipeReader,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+) {
+    let input_fd = input.as_raw_fd();
+    let wake_fd = wake_rd.as_raw_fd();
+    let mut buf = [0u8; 4096];
+    loop {
+        let mut fds = [
+            libc_pollfd {
+                fd: input_fd,
+                events: POLLIN,
+                revents: 0,
+            },
+            libc_pollfd {
+                fd: wake_fd,
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { poll(fds.as_mut_ptr(), 2, -1) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if fds[1].revents != 0 {
+            return;
+        }
+        if fds[0].revents != 0 {
+            match input.read(&mut buf) {
                 Ok(0) => return,
                 Ok(n) => {
                     if tx.send(buf[..n].to_vec()).is_err() {
@@ -1561,13 +1797,12 @@ fn spawn_input() -> mpsc::UnboundedReceiver<Vec<u8>> {
                 Err(_) => return,
             }
         }
-    });
-    rx
+    }
 }
 
 enum Recovered {
     Live,
-    Detach,
+    Detach { double: bool },
     Ended(Ending),
 }
 
@@ -1576,7 +1811,7 @@ async fn recover(
     ctrl: &mut Control,
     events: &mut Events,
     attached: &mut Attached<'_>,
-    input: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    input: &mut InputReader,
 ) -> Result<Recovered> {
     let mut delay = RETRY_FIRST;
     loop {
@@ -1584,7 +1819,7 @@ async fn recover(
             Ok(None) => {
                 // Keys pressed while the link was down have nowhere to go,
                 // and the reply a held fragment belonged to is gone with them.
-                while input.try_recv().is_ok() {}
+                while input.try_recv().is_some() {}
                 attached.replies = Replies::default();
                 attached.input_buf.clear();
                 attached.write_queue.clear();
@@ -1596,8 +1831,10 @@ async fn recover(
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     Some(bytes) = input.recv() => {
-                        if contains_detach(&bytes) {
-                            return Ok(Recovered::Detach);
+                        if let Some(tail) = split_at_detach(&bytes).1 {
+                            return Ok(Recovered::Detach {
+                                double: contains_detach(tail),
+                            });
                         }
                     }
                 }
@@ -1724,10 +1961,11 @@ fn closed_block(error: &anyhow::Error) -> bool {
 struct Screen {
     stdout: std::io::Stdout,
     entered: bool,
+    terminal_mode: TerminalMode,
 }
 
 impl Screen {
-    fn enter() -> Result<Self> {
+    fn enter(terminal_mode: TerminalMode) -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
         // Clear any leftover OSC 4/10/11/12 overrides before probing the host
@@ -1738,6 +1976,7 @@ impl Screen {
         Ok(Self {
             stdout,
             entered: true,
+            terminal_mode,
         })
     }
 
@@ -1795,7 +2034,9 @@ impl Screen {
         self.entered = false;
         self.stdout.write_all(RESET_MODES)?;
         self.stdout.flush()?;
-        disable_raw_mode()?;
+        if self.terminal_mode == TerminalMode::RestoreOnLeave {
+            disable_raw_mode()?;
+        }
         Ok(())
     }
 }
@@ -1838,10 +2079,10 @@ fn has_da1_reply(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attached, BlockSelection, Ending, Flow, InflightWrite, RETRY_FIRST, RETRY_MAX, Replies,
-        Theme, backoff, closed_block, contains_detach, detach, finish_write, has_da1_reply,
-        parse_theme_reply, read_chunks_with_limits, reports_scheme, split_at_detach, split_replies,
-        take_utf8, take_write_chunk, theme_query, transient, write_target_gone,
+        Attached, BlockSelection, Ending, Flow, InflightWrite, InputReader, RETRY_FIRST, RETRY_MAX,
+        Replies, Theme, backoff, closed_block, contains_detach, detach, finish_write,
+        has_da1_reply, parse_theme_reply, read_chunks_with_limits, reports_scheme, split_at_detach,
+        split_replies, take_utf8, take_write_chunk, theme_query, transient, write_target_gone,
     };
     use crate::rex::BlockRef;
     use crate::rex::control::{CallTimeout, Control};
@@ -1875,24 +2116,80 @@ mod tests {
             b"\x1b[92:124;5:1u".as_slice(),
             b"\x1b[27;5;92~".as_slice(),
         ] {
-            assert_eq!(split_at_detach(seq), (b"".as_slice(), true));
+            assert_eq!(split_at_detach(seq), (b"".as_slice(), Some(b"".as_slice())));
             assert!(contains_detach(seq));
         }
 
-        assert_eq!(split_at_detach(b"abc\x1c"), (b"abc".as_slice(), true));
-        assert_eq!(split_at_detach(b"abc\x1b[92;5u"), (b"abc".as_slice(), true));
+        assert_eq!(
+            split_at_detach(b"abc\x1c"),
+            (b"abc".as_slice(), Some(b"".as_slice()))
+        );
+        assert_eq!(
+            split_at_detach(b"abc\x1b[92;5u"),
+            (b"abc".as_slice(), Some(b"".as_slice()))
+        );
         assert_eq!(
             split_at_detach(b"a\x1b[27;5;92~tail"),
-            (b"a".as_slice(), true)
+            (b"a".as_slice(), Some(b"tail".as_slice()))
         );
-        assert_eq!(split_at_detach(b"\x1ctail"), (b"".as_slice(), true));
+        assert_eq!(
+            split_at_detach(b"\x1ctail"),
+            (b"".as_slice(), Some(b"tail".as_slice()))
+        );
 
-        assert_eq!(split_at_detach(b"\\"), (b"\\".as_slice(), false));
+        // Double detach in a single read exposes the second sequence in the tail.
+        for pair in [
+            b"\x1c\x1c".as_slice(),
+            b"abc\x1c\x1c".as_slice(),
+            b"\x1b[92;5u\x1b[92;5u".as_slice(),
+            b"\x1c\x1b[92;5u".as_slice(),
+            b"\x1b[27;5;92~\x1c".as_slice(),
+        ] {
+            let (_, tail) = split_at_detach(pair);
+            assert!(
+                tail.is_some_and(contains_detach),
+                "expected second detach in tail of {pair:?}"
+            );
+        }
+
+        assert_eq!(split_at_detach(b"\\"), (b"\\".as_slice(), None));
         assert_eq!(
             split_at_detach(b"\x1b[92;1u"),
-            (b"\x1b[92;1u".as_slice(), false)
+            (b"\x1b[92;1u".as_slice(), None)
         );
-        assert_eq!(split_at_detach(b"hello"), (b"hello".as_slice(), false));
+        assert_eq!(split_at_detach(b"hello"), (b"hello".as_slice(), None));
+    }
+
+    #[tokio::test]
+    async fn input_reader_stops_without_consuming_subsequent_bytes_and_drains_queued_detach() {
+        use std::io::{Read, Write};
+
+        let (input_rd, mut input_wr) = std::io::pipe().unwrap();
+        // Keep a duplicate read handle on the same pipe so we can verify bytes
+        // written after stop() are not stolen by the background thread.
+        let mut reader_after = input_rd.try_clone().unwrap();
+        let mut reader = InputReader::spawn_reader(input_rd).unwrap();
+
+        input_wr.write_all(b"hello").unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(1), reader.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, b"hello");
+
+        // Queue a detach byte and wait until the reader thread has placed it in the channel.
+        input_wr.write_all(b"\x1c").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while reader.is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(reader.stop_and_drain_detach());
+
+        // Bytes written after stop() stay in the pipe for the next reader (e.g. picker).
+        input_wr.write_all(b"\x1cnext").unwrap();
+        let mut remaining = [0u8; 16];
+        let n = reader_after.read(&mut remaining).unwrap();
+        assert_eq!(&remaining[..n], b"\x1cnext");
     }
 
     #[test]
@@ -2380,7 +2677,8 @@ mod tests {
 
         // The host reported a scheme change: zrex asks it for the colors again
         // and hands the new theme to the block.
-        let (host_tx, mut host_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (host_tx, host_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut host_input = InputReader::from_channel(host_rx);
         host_tx
             .send(
                 b"\x1b]10;rgb:1111/1111/1111\x07\x1b]11;rgb:eeee/eeee/eeee\x07\x1b[?62;22c"
@@ -2389,7 +2687,7 @@ mod tests {
             .unwrap();
         let mut host_out = Vec::new();
         let flow = attached
-            .refresh_theme(&mut host_out, &mut host_rx, &mut ctrl)
+            .refresh_theme(&mut host_out, &mut host_input, &mut ctrl)
             .await
             .unwrap();
         assert!(matches!(flow, Flow::Continue));
@@ -2416,7 +2714,8 @@ mod tests {
 
         // A scheme change while another client owns the block updates the
         // colors zrex holds, but not the block's.
-        let (other_tx, mut other_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (other_tx, other_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut other_input = InputReader::from_channel(other_rx);
         other_tx
             .send(
                 b"\x1b]10;rgb:2222/2222/2222\x07\x1b]11;rgb:dddd/dddd/dddd\x07\x1b[?62;22c"
@@ -2425,7 +2724,7 @@ mod tests {
             .unwrap();
         let mut other_out = Vec::new();
         let flow = attached
-            .refresh_theme(&mut other_out, &mut other_rx, &mut ctrl)
+            .refresh_theme(&mut other_out, &mut other_input, &mut ctrl)
             .await
             .unwrap();
         assert!(matches!(flow, Flow::Continue));
@@ -2433,10 +2732,11 @@ mod tests {
 
         // Typing in the terminal claims the block back, with this terminal's
         // size and colors.
-        let (in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut input = InputReader::from_channel(in_rx);
         in_tx.send(b" -l".to_vec()).unwrap();
         in_tx.send(b"a\n".to_vec()).unwrap();
-        let flow = attached.burst(b"ls", &mut in_rx, &mut ctrl).await.unwrap();
+        let flow = attached.burst(b"ls", &mut input, &mut ctrl).await.unwrap();
         assert!(matches!(flow, Flow::Continue));
         assert!(attached.owns);
         finish_write(&mut attached.write_inflight).await.unwrap();
@@ -2474,10 +2774,26 @@ mod tests {
         assert!(attached.owns);
 
         let detach_flow = attached
-            .burst(b"\x1c", &mut in_rx, &mut ctrl)
+            .burst(b"\x1c", &mut input, &mut ctrl)
             .await
             .unwrap();
-        assert!(matches!(detach_flow, Flow::Detach));
+        assert_eq!(detach_flow, Flow::Detach { double: false });
+
+        let double_same_read = attached
+            .burst(b"\x1c\x1c", &mut input, &mut ctrl)
+            .await
+            .unwrap();
+        assert_eq!(double_same_read, Flow::Detach { double: true });
+
+        let (queued_tx, queued_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut queued_input = InputReader::from_channel(queued_rx);
+        queued_tx.send(b"\x1b[92;5u".to_vec()).unwrap();
+        let double_queued = attached
+            .burst(b"\x1c", &mut queued_input, &mut ctrl)
+            .await
+            .unwrap();
+        assert_eq!(double_queued, Flow::Detach { double: true });
+        assert!(queued_input.is_empty());
 
         let block_end = attached
             .event(
@@ -2680,11 +2996,12 @@ mod tests {
         .await
         .unwrap();
 
-        let (_in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut input = InputReader::from_channel(in_rx);
         // Simulate a terminal like foot emitting bracketed paste across
         // separate reads: ESC[200~, body, ESC[201~.
         attached
-            .burst(b"\x1b[200~", &mut in_rx, &mut ctrl)
+            .burst(b"\x1b[200~", &mut input, &mut ctrl)
             .await
             .unwrap();
         saw_first_rx.await.unwrap();
@@ -2693,11 +3010,11 @@ mod tests {
         // While the first write is still in flight, later chunks must queue
         // locally instead of racing concurrently on the server.
         attached
-            .burst(b"pasted text", &mut in_rx, &mut ctrl)
+            .burst(b"pasted text", &mut input, &mut ctrl)
             .await
             .unwrap();
         attached
-            .burst(b"\x1b[201~", &mut in_rx, &mut ctrl)
+            .burst(b"\x1b[201~", &mut input, &mut ctrl)
             .await
             .unwrap();
         assert_eq!(attached.write_queue, "pasted text\x1b[201~");
@@ -2880,9 +3197,10 @@ mod tests {
         .await
         .unwrap();
 
-        let (_in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut input = InputReader::from_channel(in_rx);
         attached
-            .burst(b"first-", &mut in_rx, &mut ctrl)
+            .burst(b"first-", &mut input, &mut ctrl)
             .await
             .unwrap();
         saw_first_rx.await.unwrap();
@@ -2890,10 +3208,10 @@ mod tests {
         // While the first write is in flight, the user types more text batched
         // with Ctrl-\ in the same read.
         let flow = attached
-            .burst(b"second\x1b[?\x1cignored", &mut in_rx, &mut ctrl)
+            .burst(b"second\x1b[?\x1cignored", &mut input, &mut ctrl)
             .await
             .unwrap();
-        assert!(matches!(flow, Flow::Detach));
+        assert_eq!(flow, Flow::Detach { double: false });
 
         release_first_tx.send(()).unwrap();
         detach(&mut ctrl, &mut attached).await;
@@ -3207,8 +3525,9 @@ mod tests {
         .await
         .unwrap();
 
-        let (_in_tx, mut in_rx) = tokio::sync::mpsc::unbounded_channel();
-        attached.burst(b"a", &mut in_rx, &mut ctrl).await.unwrap();
+        let (_in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut input = InputReader::from_channel(in_rx);
+        attached.burst(b"a", &mut input, &mut ctrl).await.unwrap();
         attached.write_queue.push_str("queued");
 
         let err = finish_write(&mut attached.write_inflight)
