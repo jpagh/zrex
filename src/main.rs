@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod discovery;
+mod picker;
 mod rex;
 mod session;
 mod text;
@@ -15,7 +16,7 @@ use serde_json::Value;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::config::{DISCOVERY_TIME, DetachKey, Server, ServerConfig};
-use crate::discovery::{fan_out, probe_local};
+use crate::discovery::{LocalDiscovery, NO_SERVER_FOUND, fan_out, probe_local};
 use crate::rex::control::Control;
 use crate::rex::{BlockRef, ServerAddress};
 use crate::text::{clean_one_line, clean_truncated};
@@ -25,6 +26,7 @@ zrex: use a session on a Rex server from a terminal
 
 Usage:
   zrex [--server SERVER] ls
+  zrex [--server SERVER] [--detach-key KEY] p|pick
   zrex [--server SERVER] [--detach-key KEY] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
   zrex [--server SERVER] kill SESSION
   zrex completion zsh|bash|fish
@@ -35,27 +37,36 @@ server name from ~/.config/zrex/config.toml (or $XDG_CONFIG_HOME/zrex/config.tom
 local, an HTTP(S) URL, or a Unix socket URL such as
 unix:///Users/you/Library/Application%20Support/rex/server.sock. Without either,
 zrex uses a local Rex server's Unix socket when one is running, and otherwise
-http://127.0.0.1:7297. a is short for attach. SESSION is a label, a full ID, or
-the last four or more characters of an ID. When no session matches, attach makes
-one with that label, so the same command opens a session and returns to it later.
-Without SESSION, attach uses the first session. --window, or -w, picks the
-window: its number from one, its label, window.block (such as 1.2), or - for a
-new window with the label Rex picks. A label that no window has makes a window
-with that label, with one shell in it. --block, or -b, picks a block inside the
-window by its number from one, its label, or its ID. Without --window the client
-shows the window the session already has, and never changes it, leaving what
-Rex.app shows alone. ls lists every session, its windows, and any splits (1.1,
-1.2, ...) with a star on the active window and block, and the terminal title
-(or foreground process) a window's focused block reports beside the window's
-label. Without --server or REX_SERVER, ls lists any running local server and
-saved servers from ~/.config/zrex/config.toml (or $XDG_CONFIG_HOME/zrex/config.toml),
-skipping an absent local server when saved servers are configured and returning
-an error when neither is available. completion prints a shell completion script
-that completes server names, session labels, window numbers and labels, and
-block numbers and labels.
+http://127.0.0.1:7297. p is short for pick, and a is short for attach. SESSION
+is a label, a full ID, or the last four or more characters of an ID. When no
+session matches, attach makes one with that label, so the same command opens a
+session and returns to it later. Without SESSION, attach uses the first session.
+--window, or -w, picks the window: its number from one, its label, window.block
+(such as 1.2), or - for a new window with the label Rex picks. A label that no
+window has makes a window with that label, with one shell in it. --block, or -b,
+picks a block inside the window by its number from one, its label, or its ID.
+Without --window the client shows the window the session already has, and never
+changes it, leaving what Rex.app shows alone. ls lists every session, its
+windows, and any splits (1.1, 1.2, ...) with a star on the active window and
+block, and the terminal title (or foreground process) a window's focused block
+reports beside the window's label. Without --server or REX_SERVER, ls lists any
+running local server and saved servers from ~/.config/zrex/config.toml (or
+$XDG_CONFIG_HOME/zrex/config.toml), skipping an absent local server when saved
+servers are configured and returning an error when neither is available.
+completion prints a shell completion script that completes server names, session
+labels, window numbers and labels, and block numbers and labels. pick (or p)
+fuzzy-searches existing sessions, windows, and splits on the default (when
+running) and saved servers (~/.config/zrex/config.toml, or
+$XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that server.
+Enter attaches, Ctrl-G toggles the agents view, Ctrl-N creates a new session,
+Ctrl-T creates a new window in a session, Ctrl-R renames a session, window, or
+block, Ctrl-K kills a session, window, or block, and Esc, Ctrl-C, or
+Ctrl-backslash quits. Detaching from a session attached via the picker returns
+to the picker (staying on the agents view if you attached from it), so pressing
+Ctrl-backslash twice detaches all the way back to your shell.
 
 While attached:
-  Ctrl-backslash          detach, and leave the session running
+  Ctrl-backslash          detach, and leave the session running (returns to picker if launched from it)
   Alt-Ctrl-backslash      send a literal Ctrl-backslash to the remote block (for nested zrex)
 
 Use --detach-key (-d), ZREX_DETACH_KEY, or detach_key in config.toml to change
@@ -70,6 +81,9 @@ enum Command {
     Help,
     Version,
     List,
+    Pick {
+        detach_key: Option<String>,
+    },
     Attach {
         target: Option<String>,
         window: Option<String>,
@@ -86,17 +100,19 @@ enum Command {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Subcommand {
     List,
+    Pick,
     Attach,
     Kill,
     Completion,
 }
 
 impl Subcommand {
-    const COMPLETION_NAMES: [&str; 5] = ["a", "attach", "kill", "ls", "completion"];
+    const COMPLETION_NAMES: [&str; 7] = ["a", "attach", "kill", "ls", "p", "pick", "completion"];
 
     fn parse(name: &str) -> Option<Self> {
         match name {
             "ls" => Some(Self::List),
+            "p" | "pick" => Some(Self::Pick),
             "a" | "attach" => Some(Self::Attach),
             "kill" => Some(Self::Kill),
             "completion" => Some(Self::Completion),
@@ -225,6 +241,12 @@ fn parse_args(
                 }
                 Command::List
             }
+            Some(Subcommand::Pick) => {
+                if target.is_some() || window.is_some() || block.is_some() {
+                    anyhow::bail!("usage: zrex [--server SERVER] [--detach-key KEY] p|pick");
+                }
+                Command::Pick { detach_key }
+            }
             Some(Subcommand::Attach) => Command::Attach {
                 target,
                 window,
@@ -286,6 +308,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::List => list(&server_config).await,
+        Command::Pick { detach_key } => {
+            let detach_key = config::resolve_detach_key(
+                detach_key.as_deref(),
+                env::var("ZREX_DETACH_KEY").ok().as_deref(),
+            )?;
+            picker::run(&server_config, detach_key).await
+        }
         Command::Attach {
             target,
             window,
@@ -327,9 +356,7 @@ async fn list(server_config: &ServerConfig) -> Result<()> {
             if saved.configured == 0 {
                 let Some((_addr, ctrl, _events)) = Control::connect_local_if_running(&[]).await
                 else {
-                    anyhow::bail!(
-                        "no Rex server found; start a local Rex server, pass --server / set REX_SERVER, or configure ~/.config/zrex/config.toml"
-                    );
+                    anyhow::bail!("{NO_SERVER_FOUND}");
                 };
                 return list_single_with_control(ctrl).await;
             }
@@ -354,7 +381,7 @@ async fn list_multi(servers: Vec<Server>) -> Result<()> {
     let deadline = Instant::now() + DISCOVERY_TIME;
     let report = collect_multi_list(
         servers,
-        async |excluded| probe_local(excluded).await,
+        async |excluded| probe_local(LocalDiscovery::Optional, excluded).await,
         deadline,
     )
     .await;
@@ -387,6 +414,7 @@ async fn collect_multi_list(
 ) -> MultiListReport {
     let outcome = fan_out(
         servers,
+        LocalDiscovery::Optional,
         local_probe,
         deadline,
         "listing timed out",
@@ -644,7 +672,10 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
     }
     let subcommand = parsed.command.as_deref().map(Subcommand::parse);
     let attach = matches!(subcommand, Some(Some(Subcommand::Attach)));
-    let detach_key = matches!(subcommand, None | Some(Some(Subcommand::Attach)));
+    let detach_key = matches!(
+        subcommand,
+        None | Some(Some(Subcommand::Attach | Subcommand::Pick))
+    );
     if current.starts_with('-') {
         return Completion::Flags { attach, detach_key };
     }
@@ -656,6 +687,10 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
         }
         Some(Some(Subcommand::Attach)) => Completion::Flags {
             attach: true,
+            detach_key: true,
+        },
+        Some(Some(Subcommand::Pick)) => Completion::Flags {
+            attach: false,
             detach_key: true,
         },
         Some(Some(Subcommand::Kill | Subcommand::List | Subcommand::Completion)) => {
@@ -878,8 +913,58 @@ mod tests {
     }
 
     #[test]
+    fn pick_distinguishes_a_server_override_from_the_environment_default() {
+        let env = Some("https://default.example".to_owned());
+        for subcommand in ["pick", "p"] {
+            assert_eq!(
+                parse_args(args(&[subcommand]), env.clone()).unwrap(),
+                (
+                    ServerConfig::Env("https://default.example".to_owned()),
+                    Command::Pick { detach_key: None }
+                )
+            );
+            assert_eq!(
+                parse_args(
+                    args(&[subcommand, "-S", "https://only.example", "-d", "ctrl-]"]),
+                    env.clone()
+                )
+                .unwrap(),
+                (
+                    ServerConfig::Explicit("https://only.example".to_owned()),
+                    Command::Pick {
+                        detach_key: Some("ctrl-]".to_owned())
+                    }
+                )
+            );
+            assert!(parse_args(args(&[subcommand, "--window", "1"]), None).is_err());
+            assert!(parse_args(args(&[subcommand, "extra"]), None).is_err());
+        }
+    }
+
+    #[test]
     fn bare_command_shows_help() {
-        assert_eq!(parse_args(args(&[]), None).unwrap().1, Command::Help);
+        assert_eq!(
+            parse_args(args(&[]), None).unwrap(),
+            (ServerConfig::Default, Command::Help)
+        );
+        assert_eq!(
+            parse_args(args(&["-S", "office"]), None).unwrap(),
+            (ServerConfig::Explicit("office".to_owned()), Command::Help)
+        );
+
+        assert_eq!(parse_args(args(&["-h"]), None).unwrap().1, Command::Help);
+        assert_eq!(
+            parse_args(args(&["--help"]), None).unwrap().1,
+            Command::Help
+        );
+        assert_eq!(
+            parse_args(args(&["--version"]), None).unwrap().1,
+            Command::Version
+        );
+        assert_eq!(
+            parse_args(args(&["bogus"]), None).unwrap().1,
+            Command::Unknown("bogus".to_owned())
+        );
     }
 
     #[test]
@@ -912,7 +997,16 @@ mod tests {
         );
 
         let (_, cmd) = parse_args(
-            args(&["attach", "work", "--window", "1", "--block", "2"]),
+            args(&[
+                "attach",
+                "work",
+                "--window",
+                "1",
+                "--block",
+                "2",
+                "--detach-key",
+                "none",
+            ]),
             None,
         )
         .unwrap();
@@ -922,7 +1016,7 @@ mod tests {
                 target: Some("work".to_owned()),
                 window: Some("1".to_owned()),
                 block: Some("2".to_owned()),
-                detach_key: None,
+                detach_key: Some("none".to_owned()),
             }
         );
 
@@ -1113,14 +1207,6 @@ mod tests {
             }
         );
         assert_eq!(
-            completion_context("", &args(&["--detach-key"])),
-            Completion::DetachKeys
-        );
-        assert_eq!(
-            completion_context("", &args(&["a", "-d"])),
-            Completion::DetachKeys
-        );
-        assert_eq!(
             completion_context("", &args(&["--server", "http://example.com"])),
             Completion::Commands
         );
@@ -1137,6 +1223,30 @@ mod tests {
             completion_context("", &args(&["ls", "-S"])),
             Completion::Servers
         );
+        assert_eq!(
+            completion_context("", &args(&["--detach-key"])),
+            Completion::DetachKeys
+        );
+        assert_eq!(
+            completion_context("", &args(&["a", "-d"])),
+            Completion::DetachKeys
+        );
+        assert_eq!(
+            completion_context("", &args(&["p"])),
+            Completion::Flags {
+                attach: false,
+                detach_key: true
+            }
+        );
+        assert_eq!(
+            completion_context("", &args(&["pick"])),
+            Completion::Flags {
+                attach: false,
+                detach_key: true
+            }
+        );
+        assert!(Subcommand::COMPLETION_NAMES.contains(&"p"));
+        assert!(Subcommand::COMPLETION_NAMES.contains(&"pick"));
     }
 
     #[test]

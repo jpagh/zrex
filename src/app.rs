@@ -174,6 +174,12 @@ impl AttachExit {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalMode {
+    RestoreOnLeave,
+    KeepRawOnLeave,
+}
+
 pub async fn attach(
     server_config: &ServerConfig,
     target: Option<String>,
@@ -201,7 +207,8 @@ pub async fn attach(
         ctrl,
         events,
         &session_id,
-        (window.as_deref(), block.as_deref()),
+        BlockSelection::Selectors(window.as_deref(), block.as_deref()),
+        TerminalMode::RestoreOnLeave,
         detach_key,
     )
     .await?;
@@ -209,16 +216,87 @@ pub async fn attach(
     Ok(())
 }
 
+/// Picker targets are a snapshot of existing IDs, never creation selectors.
+pub async fn attach_existing(
+    server: &ServerAddress,
+    session_id: &str,
+    block_id: &str,
+    detach_key: DetachKey,
+) -> Result<AttachExit> {
+    ensure_terminal()?;
+    let (mut ctrl, events) = Control::connect(server, None).await?;
+    session::attach(&mut ctrl, session_id).await?;
+    attach_block(
+        server,
+        ctrl,
+        events,
+        session_id,
+        BlockSelection::Exact(block_id),
+        TerminalMode::KeepRawOnLeave,
+        detach_key,
+    )
+    .await
+}
+
+pub async fn attach_new_session(
+    server: &ServerAddress,
+    label: Option<&str>,
+    detach_key: DetachKey,
+) -> Result<AttachExit> {
+    ensure_terminal()?;
+    let (mut ctrl, events) = Control::connect(server, None).await?;
+    let session_id = session::create(&mut ctrl, label).await?;
+    attach_block(
+        server,
+        ctrl,
+        events,
+        &session_id,
+        BlockSelection::Selectors(None, None),
+        TerminalMode::KeepRawOnLeave,
+        detach_key,
+    )
+    .await
+}
+
+pub async fn attach_new_window(
+    server: &ServerAddress,
+    session_id: &str,
+    label: Option<&str>,
+    detach_key: DetachKey,
+) -> Result<AttachExit> {
+    ensure_terminal()?;
+    let (mut ctrl, events) = Control::connect(server, None).await?;
+    session::attach(&mut ctrl, session_id).await?;
+    let window_id = session::new_window(&mut ctrl, session_id, label).await?;
+    attach_block(
+        server,
+        ctrl,
+        events,
+        session_id,
+        BlockSelection::Selectors(Some(&window_id), None),
+        TerminalMode::KeepRawOnLeave,
+        detach_key,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum BlockSelection<'a> {
+    Selectors(Option<&'a str>, Option<&'a str>),
+    Exact(&'a str),
+}
+
 async fn attach_block(
     server: &ServerAddress,
     mut ctrl: Control,
     mut events: Events,
     session_id: &str,
-    selection: (Option<&str>, Option<&str>),
+    selection: BlockSelection<'_>,
+    terminal_mode: TerminalMode,
     detach_key: DetachKey,
 ) -> Result<AttachExit> {
     let size = crossterm::terminal::size()?;
-    let mut guard = Screen::enter()?;
+    let mut guard = Screen::enter(terminal_mode)?;
     let probed = guard.probe_theme();
     let mut attached =
         match Attached::start(&mut ctrl, session_id, server, selection, size, probed.theme).await {
@@ -550,7 +628,7 @@ impl<'a> Attached<'a> {
         ctrl: &mut Control,
         session_id: &str,
         server: &'a ServerAddress,
-        selection: (Option<&str>, Option<&str>),
+        selection: BlockSelection<'_>,
         (cols, rows): (u16, u16),
         theme: Theme,
     ) -> Result<Self> {
@@ -573,13 +651,16 @@ impl<'a> Attached<'a> {
             .and_then(|selected| selected.get("view"))
             .cloned()
             .ok_or_else(|| anyhow!("bootstrap attached to no session"))?;
-        let (window, block) = selection;
-        let block_id =
-            session::block_of(&view, window, block).ok_or_else(|| match (window, block) {
-                (_, Some(blk)) => anyhow!("the window has no block {blk}"),
-                (Some(win), None) => anyhow!("the session has no window {win}"),
-                (None, None) => anyhow!("the session's active window shows no block"),
-            })?;
+        let block_id = match selection {
+            BlockSelection::Exact(id) if session::has_block(&view, id) => id.to_owned(),
+            BlockSelection::Exact(id) => bail!("the selected block {id} is no longer available"),
+            BlockSelection::Selectors(window, block) => session::block_of(&view, window, block)
+                .ok_or_else(|| match (window, block) {
+                    (_, Some(blk)) => anyhow!("the window has no block {blk}"),
+                    (Some(win), None) => anyhow!("the session has no window {win}"),
+                    (None, None) => anyhow!("the session's active window shows no block"),
+                })?,
+        };
         let fallback_title = session::fallback_title_for(&bootstrap, &view, &block_id);
 
         let block = BlockRef::new(session_id, &block_id);
@@ -2426,10 +2507,11 @@ struct Screen {
     stdout: std::io::Stdout,
     entered: bool,
     host_replied: bool,
+    terminal_mode: TerminalMode,
 }
 
 impl Screen {
-    fn enter() -> Result<Self> {
+    fn enter(terminal_mode: TerminalMode) -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
         // Clear any leftover OSC 4/10/11/12 overrides before probing the host
@@ -2441,6 +2523,7 @@ impl Screen {
             stdout,
             entered: true,
             host_replied: false,
+            terminal_mode,
         })
     }
 
@@ -2476,7 +2559,9 @@ impl Screen {
             DETACH_DRAIN_IDLE,
             DETACH_DRAIN_MAX,
         )?;
-        disable_raw_mode()?;
+        if self.terminal_mode == TerminalMode::RestoreOnLeave {
+            disable_raw_mode()?;
+        }
         Ok(saw_detach)
     }
 
@@ -2487,7 +2572,9 @@ impl Screen {
         self.entered = false;
         self.stdout.write_all(RESET_MODES)?;
         self.stdout.flush()?;
-        disable_raw_mode()?;
+        if self.terminal_mode == TerminalMode::RestoreOnLeave {
+            disable_raw_mode()?;
+        }
         Ok(())
     }
 }
@@ -2530,9 +2617,9 @@ fn has_da1_reply(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attached, DSR_STATUS_QUERY, DSR_STATUS_REPLY, Ending, Flow, InflightWrite, InputReader,
-        KeyAction, PALETTE_BATCH, PALETTE_LEN, REPLY_FRAGMENT_HOLD, REPLY_HOLD, RESET_MODES,
-        RETRY_FIRST, RETRY_MAX, Replies, Theme, WATCH_SCHEME, backoff, closed_block,
+        Attached, BlockSelection, DSR_STATUS_QUERY, DSR_STATUS_REPLY, Ending, Flow, InflightWrite,
+        InputReader, KeyAction, PALETTE_BATCH, PALETTE_LEN, REPLY_FRAGMENT_HOLD, REPLY_HOLD,
+        RESET_MODES, RETRY_FIRST, RETRY_MAX, Replies, Theme, WATCH_SCHEME, backoff, closed_block,
         contains_detach, contains_detach_for, detach, drain_after_reset_with, find_next_key_action,
         finish_write, has_da1_reply, parse_theme_reply, probe_theme_with, read_chunks_with_limits,
         reports_scheme, split_at_detach, split_at_detach_for, split_replies, take_utf8,
@@ -3254,7 +3341,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            (None, None),
+            BlockSelection::Selectors(None, None),
             (40, 10),
             theme,
         )
@@ -3621,7 +3708,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            (None, None),
+            BlockSelection::Selectors(None, None),
             (80, 24),
             Theme::default(),
         )
@@ -3822,7 +3909,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            (None, None),
+            BlockSelection::Selectors(None, None),
             (80, 24),
             Theme::default(),
         )
@@ -4150,7 +4237,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            (None, None),
+            BlockSelection::Selectors(None, None),
             (80, 24),
             Theme::default(),
         )
@@ -4505,7 +4592,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            (None, None),
+            BlockSelection::Selectors(None, None),
             (80, 24),
             Theme::default(),
         )
@@ -4574,7 +4661,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            (None, None),
+            BlockSelection::Selectors(None, None),
             (80, 24),
             Theme::default(),
         )
@@ -4661,7 +4748,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            (None, None),
+            BlockSelection::Selectors(None, None),
             (80, 24),
             Theme::default(),
         )
@@ -4770,7 +4857,7 @@ mod tests {
             &mut ctrl,
             "session:1",
             &address,
-            (None, None),
+            BlockSelection::Selectors(None, None),
             (80, 24),
             Theme::default(),
         )
