@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -14,8 +16,94 @@ use crate::text::clean_one_line;
 
 pub const DISCOVERY_TIME: Duration = Duration::from_secs(3);
 
+/// Key binding that detaches from an attached Rex block (and quits the picker).
+/// Pressing `Alt` with the configured key forwards the literal control byte to
+/// the remote block so nested `zrex` sessions can be detached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetachKey {
+    /// ASCII control character (`0x00..=0x1f`, excluding `0x1b` / ESC).
+    Ctrl(u8),
+    /// Disables local detach interception so every key reaches the remote block.
+    None,
+}
+
+impl Default for DetachKey {
+    fn default() -> Self {
+        Self::Ctrl(0x1c) // Ctrl-\
+    }
+}
+
+impl DetachKey {
+    pub const COMPLETION_CANDIDATES: [&'static str; 5] =
+        ["ctrl-\\", "ctrl-]", "ctrl-^", "ctrl-_", "none"];
+
+    pub fn ctrl_byte(self) -> Option<u8> {
+        match self {
+            Self::Ctrl(byte) => Some(byte),
+            Self::None => None,
+        }
+    }
+}
+
+impl fmt::Display for DetachKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::Ctrl(byte) => match *byte {
+                0x00 => f.write_str("Ctrl-@"),
+                0x01..=0x1a => write!(f, "Ctrl-{}", (b'A' + byte - 1) as char),
+                0x1c => f.write_str("Ctrl-\\"),
+                0x1d => f.write_str("Ctrl-]"),
+                0x1e => f.write_str("Ctrl-^"),
+                0x1f => f.write_str("Ctrl-_"),
+                other => write!(f, "0x{other:02x}"),
+            },
+        }
+    }
+}
+
+impl FromStr for DetachKey {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if matches!(lower.as_str(), "none" | "off" | "disabled") {
+            return Ok(Self::None);
+        }
+        let key = lower
+            .strip_prefix("ctrl-")
+            .or_else(|| lower.strip_prefix("ctrl+"))
+            .or_else(|| lower.strip_prefix("c-"))
+            .or_else(|| lower.strip_prefix('^'))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid detach key `{trimmed}`; use e.g. ctrl-\\, ctrl-], ctrl-a..ctrl-z, or none"
+                )
+            })?;
+        match key {
+            "@" | "space" => Ok(Self::Ctrl(0x00)),
+            "[" | "esc" | "escape" => {
+                bail!("ctrl-[ conflicts with terminal escape sequences; choose another detach key")
+            }
+            "\\" | "backslash" => Ok(Self::Ctrl(0x1c)),
+            "]" => Ok(Self::Ctrl(0x1d)),
+            "^" | "6" => Ok(Self::Ctrl(0x1e)),
+            "_" => Ok(Self::Ctrl(0x1f)),
+            single if single.len() == 1 && single.as_bytes()[0].is_ascii_lowercase() => {
+                Ok(Self::Ctrl(single.as_bytes()[0] - b'a' + 1))
+            }
+            _ => bail!(
+                "invalid detach key `{trimmed}`; use e.g. ctrl-\\, ctrl-], ctrl-a..ctrl-z, or none"
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Default, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub detach_key: Option<String>,
     #[serde(default)]
     pub servers: BTreeMap<String, String>,
 }
@@ -94,6 +182,39 @@ pub fn load_config() -> Result<Config> {
         .map(read_config)
         .transpose()?
         .unwrap_or_default())
+}
+
+/// Resolves the detach key from `--detach-key` (`-d`), `ZREX_DETACH_KEY`,
+/// `detach_key` in `config.toml`, or the default (`Ctrl-\`).
+pub fn resolve_detach_key(flag: Option<&str>, env: Option<&str>) -> Result<DetachKey> {
+    if let Some(raw) = flag {
+        return raw.parse();
+    }
+    if let Some(raw) = env.filter(|value| !value.trim().is_empty()) {
+        return raw.parse();
+    }
+    resolve_detach_key_in(&load_config()?, None, None)
+}
+
+pub(crate) fn resolve_detach_key_in(
+    config: &Config,
+    flag: Option<&str>,
+    env: Option<&str>,
+) -> Result<DetachKey> {
+    if let Some(raw) = flag {
+        return raw.parse();
+    }
+    if let Some(raw) = env.filter(|value| !value.trim().is_empty()) {
+        return raw.parse();
+    }
+    match config
+        .detach_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(raw) => raw.parse(),
+        None => Ok(DetachKey::default()),
+    }
 }
 
 pub fn load_saved_servers(command: &str) -> Result<SavedServers> {
@@ -258,11 +379,86 @@ mod tests {
 
     fn sample_config(entries: &[(&str, &str)]) -> Config {
         Config {
+            detach_key: None,
             servers: entries
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn parses_and_resolves_detach_keys() {
+        assert_eq!(DetachKey::default(), DetachKey::Ctrl(0x1c));
+        assert_eq!(DetachKey::default().to_string(), "Ctrl-\\");
+        assert_eq!(DetachKey::None.to_string(), "none");
+
+        for (raw, expected) in [
+            ("ctrl-\\", DetachKey::Ctrl(0x1c)),
+            ("CTRL+\\", DetachKey::Ctrl(0x1c)),
+            ("c-\\", DetachKey::Ctrl(0x1c)),
+            ("^\\", DetachKey::Ctrl(0x1c)),
+            ("ctrl-backslash", DetachKey::Ctrl(0x1c)),
+            ("ctrl-]", DetachKey::Ctrl(0x1d)),
+            ("^]", DetachKey::Ctrl(0x1d)),
+            ("ctrl-a", DetachKey::Ctrl(0x01)),
+            ("Ctrl-Z", DetachKey::Ctrl(0x1a)),
+            ("ctrl-@", DetachKey::Ctrl(0x00)),
+            ("ctrl-space", DetachKey::Ctrl(0x00)),
+            ("ctrl-^", DetachKey::Ctrl(0x1e)),
+            ("ctrl-6", DetachKey::Ctrl(0x1e)),
+            ("ctrl-_", DetachKey::Ctrl(0x1f)),
+            ("none", DetachKey::None),
+            ("OFF", DetachKey::None),
+            ("disabled", DetachKey::None),
+        ] {
+            assert_eq!(
+                raw.parse::<DetachKey>().unwrap(),
+                expected,
+                "failed to parse `{raw}`"
+            );
+        }
+
+        assert!(
+            "ctrl-["
+                .parse::<DetachKey>()
+                .unwrap_err()
+                .to_string()
+                .contains("escape")
+        );
+        assert!("^[".parse::<DetachKey>().is_err());
+        assert!("".parse::<DetachKey>().is_err());
+        assert!("alt-x".parse::<DetachKey>().is_err());
+        assert!("ctrl-1".parse::<DetachKey>().is_err());
+
+        let mut cfg = Config::default();
+        assert_eq!(
+            resolve_detach_key_in(&cfg, None, None).unwrap(),
+            DetachKey::Ctrl(0x1c)
+        );
+        cfg.detach_key = Some("ctrl-]".to_owned());
+        assert_eq!(
+            resolve_detach_key_in(&cfg, None, None).unwrap(),
+            DetachKey::Ctrl(0x1d)
+        );
+        assert_eq!(
+            resolve_detach_key_in(&cfg, None, Some("  ")).unwrap(),
+            DetachKey::Ctrl(0x1d)
+        );
+        assert_eq!(
+            resolve_detach_key_in(&cfg, None, Some("ctrl-^")).unwrap(),
+            DetachKey::Ctrl(0x1e)
+        );
+        assert_eq!(
+            resolve_detach_key_in(&cfg, Some("none"), Some("ctrl-^")).unwrap(),
+            DetachKey::None
+        );
+
+        let parsed: Config = toml::from_str(
+            "detach_key = \"ctrl-]\"\n[servers]\noffice = \"https://office.example\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.detach_key.as_deref(), Some("ctrl-]"));
     }
 
     #[tokio::test]

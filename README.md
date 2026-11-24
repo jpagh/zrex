@@ -103,6 +103,9 @@ zrex completion fish | source
 | Input | Action |
 | --- | --- |
 | `Ctrl-\` | Detach and leave the session running |
+| `Alt-Ctrl-\` | Forward a literal `Ctrl-\` to the remote block (for detaching a nested `zrex` session) |
+
+You can change or disable the detach key with `--detach-key` (`-d`), `ZREX_DETACH_KEY`, or `detach_key` in `~/.config/zrex/config.toml` (e.g. `ctrl-]`, `ctrl-^`, or `none`). When customized, `Alt` with that key forwards the literal control byte to the remote block.
 
 All other input—including keys, bracketed paste, Kitty keyboard sequences, and mouse events when requested by a running program—is passed directly to the remote block. Scrollback, search, and text selection are handled natively by your host terminal.
 
