@@ -12,7 +12,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app;
 use crate::config::{self, DISCOVERY_TIME, Server, ServerConfig};
-use crate::discovery::{LocalDiscovery, fan_out, probe_local};
+use crate::discovery::{LocalDiscovery, NO_SERVER_FOUND, fan_out, probe_local};
 use crate::rex::{BlockRef, ServerAddress, control::Control, proto::ApiError};
 use crate::session;
 use crate::text::{clean_one_line, clean_truncated, truncate_to_columns};
@@ -215,13 +215,6 @@ impl TargetLabel {
     }
 }
 
-const NO_SERVERS_INTRO: &str = "\
-zrex: no Rex server found.
-
-To get started, start a local Rex server, set REX_SERVER (or pass -S SERVER),
-or add servers under [servers] in ~/.config/zrex/config.toml.
-Run `zrex --help` for usage.";
-
 pub(super) struct DiscoveryOutcome {
     servers: Vec<Server>,
     sessions: Vec<SessionChoice>,
@@ -357,23 +350,6 @@ fn discovery_warning_feedback(warnings: &[String]) -> Option<prompt::Feedback> {
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AttachAction {
-    Existing,
-    NewSession,
-    NewWindow,
-}
-
-impl AttachAction {
-    fn error_prefix(self) -> &'static str {
-        match self {
-            Self::Existing => "Attach failed",
-            Self::NewSession => "Create session failed",
-            Self::NewWindow => "Create window failed",
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum PostAttach {
     Quit,
@@ -405,7 +381,7 @@ fn format_prefixed_error(prefix: &str, error: &anyhow::Error) -> String {
 }
 
 fn classify_attach_result(
-    action: AttachAction,
+    error_prefix: &str,
     server_name: String,
     result: Result<app::AttachExit>,
 ) -> PostAttach {
@@ -426,19 +402,77 @@ fn classify_attach_result(
             }),
             feedback: None,
         },
-        Ok(
-            exit @ (app::AttachExit::BlockClosed { .. } | app::AttachExit::SessionClosed { .. }),
-        ) => PostAttach::with_feedback(
-            capitalize_first(exit.closed_message().expect("closed exit has message")),
-            false,
-        ),
-        Err(error) => {
-            PostAttach::with_feedback(format_prefixed_error(action.error_prefix(), &error), true)
+        Ok(exit @ (app::AttachExit::BlockClosed | app::AttachExit::SessionClosed)) => {
+            PostAttach::with_feedback(
+                capitalize_first(exit.closed_message().expect("closed exit has message")),
+                false,
+            )
+        }
+        Err(error) => PostAttach::with_feedback(format_prefixed_error(error_prefix, &error), true),
+    }
+}
+
+async fn execute_attach(
+    outcome: &DiscoveryOutcome,
+    selection: prompt::AttachSelection,
+) -> (&'static str, String, Result<app::AttachExit>) {
+    match selection {
+        prompt::AttachSelection::Existing(index) => {
+            let target = &outcome.choices[index];
+            let server = &outcome.servers[target.server_index];
+            let name = clean_one_line(&server.name);
+            let res =
+                app::attach_existing(&server.address, &target.session_id, &target.block_id).await;
+            ("Attach failed", name, res)
+        }
+        prompt::AttachSelection::NewSession {
+            server_index,
+            label,
+        } => {
+            let server = &outcome.servers[server_index];
+            let name = clean_one_line(&server.name);
+            let res = app::attach_new_session(&server.address, label.as_deref()).await;
+            ("Create session failed", name, res)
+        }
+        prompt::AttachSelection::NewWindow {
+            session_index,
+            label,
+        } => {
+            let session = &outcome.sessions[session_index];
+            let server = &outcome.servers[session.server_index];
+            let name = clean_one_line(&server.name);
+            let res =
+                app::attach_new_window(&server.address, &session.session_id, label.as_deref())
+                    .await;
+            ("Create window failed", name, res)
         }
     }
 }
 
 type RefreshFuture = Pin<Box<dyn Future<Output = DiscoveryOutcome>>>;
+
+enum RefreshState {
+    Idle,
+    InFlight(RefreshFuture),
+    Ready(DiscoveryOutcome),
+}
+
+impl RefreshState {
+    fn clear(&mut self) {
+        *self = Self::Idle;
+    }
+
+    fn take_ready(&mut self) -> Option<DiscoveryOutcome> {
+        if matches!(self, Self::Ready(_)) {
+            match std::mem::replace(self, Self::Idle) {
+                Self::Ready(outcome) => Some(outcome),
+                _ => unreachable!(),
+            }
+        } else {
+            None
+        }
+    }
+}
 
 fn start_refresh(loaded: &LoadedServers) -> RefreshFuture {
     let servers = loaded.servers.clone();
@@ -493,8 +527,7 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
     let mut outcome = start_refresh(&loaded).await;
     if outcome.servers.is_empty() {
         if outcome.has_no_sources(loaded.has_configured_sources) {
-            println!("{NO_SERVERS_INTRO}");
-            return Ok(());
+            bail!("{NO_SERVER_FOUND}");
         }
         if outcome.warnings.len() > 1 {
             for warning in &outcome.warnings {
@@ -525,97 +558,49 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
         state.set_feedback(feedback);
     }
 
-    let mut in_flight_refresh: Option<RefreshFuture> = None;
-    let mut ready_refresh: Option<DiscoveryOutcome> = None;
+    let mut refresh = RefreshState::Idle;
 
     loop {
         if state.is_attach_mode()
-            && let Some(refreshed) = ready_refresh.take()
+            && let Some(refreshed) = refresh.take_ready()
         {
             apply_refresh_outcome(&mut outcome, &mut state, refreshed);
         }
 
-        let step = match in_flight_refresh.as_mut() {
-            Some(refresh) => screen.step_until(&mut state, refresh).await?,
-            None => match screen.step(&mut state)? {
-                None => prompt::StepEvent::Cancel,
-                Some(selection) => prompt::StepEvent::Selected(selection),
-            },
+        let step = match &mut refresh {
+            RefreshState::InFlight(future) => screen.step_until(&mut state, future).await?,
+            RefreshState::Idle | RefreshState::Ready(_) => screen.step(&mut state)?,
         };
 
         match step {
             prompt::StepEvent::Cancel => return Ok(()),
             prompt::StepEvent::Refreshed(refreshed) => {
-                in_flight_refresh = None;
                 if state.is_attach_mode() {
+                    refresh.clear();
                     apply_refresh_outcome(&mut outcome, &mut state, refreshed);
                 } else {
                     state.clear_refreshing();
-                    ready_refresh = Some(refreshed);
+                    refresh = RefreshState::Ready(refreshed);
                 }
             }
-            prompt::StepEvent::Selected(
-                selection @ (prompt::Selection::Attach(_)
-                | prompt::Selection::NewSession { .. }
-                | prompt::Selection::NewWindow { .. }),
-            ) => {
-                drop(in_flight_refresh.take());
-                ready_refresh = None;
+            prompt::StepEvent::Selected(prompt::Selection::Attach(selection)) => {
+                refresh.clear();
                 drop(screen);
-                let (action, server_name, result) = match selection {
-                    prompt::Selection::Attach(index) => {
-                        let target = outcome.choices[index].clone();
-                        let server = outcome.servers[target.server_index].clone();
-                        let name = clean_one_line(&server.name);
-                        let res = app::attach_existing(
-                            &server.address,
-                            &target.session_id,
-                            &target.block_id,
-                        )
-                        .await;
-                        (AttachAction::Existing, name, res)
-                    }
-                    prompt::Selection::NewSession {
-                        server_index,
-                        label,
-                    } => {
-                        let server = outcome.servers[server_index].clone();
-                        let name = clean_one_line(&server.name);
-                        let res = app::attach_new_session(&server.address, label.as_deref()).await;
-                        (AttachAction::NewSession, name, res)
-                    }
-                    prompt::Selection::NewWindow {
-                        session_index,
-                        label,
-                    } => {
-                        let session = outcome.sessions[session_index].clone();
-                        let server = outcome.servers[session.server_index].clone();
-                        let name = clean_one_line(&server.name);
-                        let res = app::attach_new_window(
-                            &server.address,
-                            &session.session_id,
-                            label.as_deref(),
-                        )
-                        .await;
-                        (AttachAction::NewWindow, name, res)
-                    }
-                    _ => unreachable!(),
-                };
-                match classify_attach_result(action, server_name, result) {
+                let (error_prefix, server_name, result) = execute_attach(&outcome, selection).await;
+                match classify_attach_result(error_prefix, server_name, result) {
                     PostAttach::Quit => return Ok(()),
                     PostAttach::Return { focus, feedback } => {
                         if prompt::take_queued_quit_key()? {
                             return Ok(());
                         }
                         screen = prompt::Screen::enter(&raw_mode)?;
-                        state.reset_after_attach(focus, feedback, true);
-                        in_flight_refresh = Some(start_refresh(&loaded));
+                        state.reset_after_attach(focus, feedback);
+                        refresh = RefreshState::InFlight(start_refresh(&loaded));
                     }
                 }
             }
             prompt::StepEvent::Selected(prompt::Selection::Rename { target, label }) => {
-                in_flight_refresh = None;
-                ready_refresh = None;
+                refresh.clear();
                 run_manage_op(
                     &mut screen,
                     &mut state,
@@ -628,8 +613,7 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
                 .await?;
             }
             prompt::StepEvent::Selected(prompt::Selection::Kill { target }) => {
-                in_flight_refresh = None;
-                ready_refresh = None;
+                refresh.clear();
                 run_manage_op(
                     &mut screen,
                     &mut state,
@@ -2311,7 +2295,7 @@ mod tests {
         assert_eq!(outcome.warnings.len(), 1);
         assert!(!outcome.has_no_sources(false));
 
-        // 6. Explicit -S against an unreachable server -> always an error, never intro.
+        // 6. Explicit -S against an unreachable server -> reports unreachable error, not no-server error.
         let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_url = format!("http://{}", dead_listener.local_addr().unwrap());
         drop(dead_listener);
@@ -2332,7 +2316,7 @@ mod tests {
         assert_eq!(outcome.warnings.len(), 1);
         assert!(!outcome.has_no_sources(loaded.has_configured_sources));
 
-        // 7. REX_SERVER=local with absent/unreachable local server -> warning & configured source, never intro.
+        // 7. REX_SERVER=local with absent/unreachable local server -> warning & configured source, not no-server error.
         let loaded = load_servers_with(
             &ServerConfig::Env("local".to_owned()),
             &empty_config,
@@ -2988,7 +2972,7 @@ mod tests {
     fn classify_attach_result_handles_detach_double_detach_close_and_errors() {
         assert_eq!(
             classify_attach_result(
-                AttachAction::Existing,
+                "Attach failed",
                 "office".to_owned(),
                 Ok(app::AttachExit::Detached {
                     session_id: "session:1".to_owned(),
@@ -3001,7 +2985,7 @@ mod tests {
 
         assert_eq!(
             classify_attach_result(
-                AttachAction::Existing,
+                "Attach failed",
                 "office".to_owned(),
                 Ok(app::AttachExit::Detached {
                     session_id: "session:1".to_owned(),
@@ -3021,12 +3005,9 @@ mod tests {
 
         assert_eq!(
             classify_attach_result(
-                AttachAction::NewSession,
+                "Create session failed",
                 "local".to_owned(),
-                Ok(app::AttachExit::BlockClosed {
-                    session_id: "session:9".to_owned(),
-                    block_id: "block:9".to_owned(),
-                }),
+                Ok(app::AttachExit::BlockClosed),
             ),
             PostAttach::Return {
                 focus: None,
@@ -3039,11 +3020,9 @@ mod tests {
 
         assert_eq!(
             classify_attach_result(
-                AttachAction::NewWindow,
+                "Create window failed",
                 "local".to_owned(),
-                Ok(app::AttachExit::SessionClosed {
-                    session_id: "session:9".to_owned(),
-                }),
+                Ok(app::AttachExit::SessionClosed),
             ),
             PostAttach::Return {
                 focus: None,
@@ -3056,7 +3035,7 @@ mod tests {
 
         assert_eq!(
             classify_attach_result(
-                AttachAction::NewWindow,
+                "Create window failed",
                 "office".to_owned(),
                 Err(anyhow!("connection refused")),
             ),
@@ -3105,7 +3084,6 @@ mod tests {
                 block_id: "block:2".to_owned(),
             }),
             None,
-            true,
         );
 
         // If refresh finds no reachable servers, keep the existing server list and report the error.

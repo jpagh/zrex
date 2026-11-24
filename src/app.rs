@@ -112,12 +112,8 @@ impl Theme {
     }
 }
 
-pub fn has_terminal() -> bool {
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-}
-
 pub fn ensure_terminal() -> Result<()> {
-    if !has_terminal() {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("zrex needs a terminal to attach to a session");
     }
     Ok(())
@@ -132,20 +128,15 @@ pub enum AttachExit {
         /// first detach sequence (fast double-detach).
         double_detach: bool,
     },
-    BlockClosed {
-        session_id: String,
-        block_id: String,
-    },
-    SessionClosed {
-        session_id: String,
-    },
+    BlockClosed,
+    SessionClosed,
 }
 
 impl AttachExit {
     pub fn closed_message(&self) -> Option<&'static str> {
         match self {
-            Self::BlockClosed { .. } => Some("the block closed"),
-            Self::SessionClosed { .. } => Some("the session closed"),
+            Self::BlockClosed => Some("the block closed"),
+            Self::SessionClosed => Some("the session closed"),
             Self::Detached { .. } => None,
         }
     }
@@ -302,12 +293,7 @@ async fn attach_block(
                                     }
                                     Err(error) if closed_block(&error) => {
                                         attached.flush(guard.out())?;
-                                        return finish_ending(
-                                            &mut input,
-                                            &mut guard,
-                                            attached,
-                                            Ending::Block,
-                                        );
+                                        return finish_ending(&mut input, &mut guard, Ending::Block);
                                     }
                                     Err(error) => {
                                         lost = Some(stream_lost(error));
@@ -318,7 +304,7 @@ async fn attach_block(
                         }
                     }
                     Some(Err(error)) if closed_block(&error) => {
-                        return finish_ending(&mut input, &mut guard, attached, Ending::Block);
+                        return finish_ending(&mut input, &mut guard, Ending::Block);
                     }
                     Some(Err(error)) => lost = Some(stream_lost(error)),
                     None => lost = Some(data_ended()),
@@ -329,7 +315,7 @@ async fn attach_block(
                     Some((name, payload)) => {
                         match attached.event(&name, &payload, &mut ctrl).await {
                             Ok(Some(ending)) => {
-                                return finish_ending(&mut input, &mut guard, attached, ending);
+                                return finish_ending(&mut input, &mut guard, ending);
                             }
                             Ok(None) => {}
                             Err(error) => lost = Some(error),
@@ -452,7 +438,7 @@ async fn attach_block(
                     .await;
                 }
                 Recovered::Ended(ending) => {
-                    return finish_ending(&mut input, &mut guard, attached, ending);
+                    return finish_ending(&mut input, &mut guard, ending);
                 }
             }
         }
@@ -472,12 +458,11 @@ enum DetachMode {
 fn finish_ending(
     input: &mut InputReader,
     guard: &mut Screen,
-    attached: Attached<'_>,
     ending: Ending,
 ) -> Result<AttachExit> {
     input.stop();
     guard.leave()?;
-    Ok(ending.into_exit(attached.session_id, attached.block_id))
+    Ok(ending.into_exit())
 }
 
 async fn finish_detach(
@@ -528,13 +513,10 @@ enum Ending {
 }
 
 impl Ending {
-    fn into_exit(self, session_id: String, block_id: String) -> AttachExit {
+    fn into_exit(self) -> AttachExit {
         match self {
-            Ending::Block => AttachExit::BlockClosed {
-                session_id,
-                block_id,
-            },
-            Ending::Session => AttachExit::SessionClosed { session_id },
+            Ending::Block => AttachExit::BlockClosed,
+            Ending::Session => AttachExit::SessionClosed,
         }
     }
 }
@@ -710,20 +692,10 @@ impl<'a> Attached<'a> {
             let Ok(Some(bytes)) = tokio::time::timeout(remaining, input.recv()).await else {
                 break;
             };
-            let (before, after_detach) = split_at_detach(&bytes);
-            if !before.is_empty() {
-                let (found, typed) = self.replies.push(before);
-                replies.extend_from_slice(&found);
-                if let Flow::Detach { double } = self.accept(&found, &typed) {
-                    self.flush_input(ctrl)?;
-                    return Ok(Flow::Detach {
-                        double: double || after_detach.is_some(),
-                    });
-                }
-            }
+            let flow = self.queue_input(&bytes, Some(&mut replies));
             self.flush_input(ctrl)?;
-            if let Some(tail) = after_detach {
-                return Ok(Flow::detach_after(tail));
+            if let Flow::Detach { .. } = flow {
+                return Ok(flow);
             }
             if has_da1_reply(&replies) {
                 break;
@@ -745,17 +717,17 @@ impl<'a> Attached<'a> {
         input: &mut InputReader,
         ctrl: &mut Control,
     ) -> Result<Flow> {
-        if let Flow::Detach { mut double } = self.queue_input(first) {
+        let mut flow = self.queue_input(first, None);
+        while flow == Flow::Continue {
+            let Some(bytes) = input.try_recv() else {
+                break;
+            };
+            flow = self.queue_input(&bytes, None);
+        }
+        if let Flow::Detach { mut double } = flow {
             double |= input.drain_detach();
             self.flush_input(ctrl)?;
             return Ok(Flow::Detach { double });
-        }
-        while let Some(bytes) = input.try_recv() {
-            if let Flow::Detach { mut double } = self.queue_input(&bytes) {
-                double |= input.drain_detach();
-                self.flush_input(ctrl)?;
-                return Ok(Flow::Detach { double });
-            }
         }
         let typed = !self.input_buf.is_empty();
         self.flush_input(ctrl)?;
@@ -765,10 +737,13 @@ impl<'a> Attached<'a> {
         Ok(Flow::Continue)
     }
 
-    fn queue_input(&mut self, bytes: &[u8]) -> Flow {
+    fn queue_input(&mut self, bytes: &[u8], collected_replies: Option<&mut Vec<u8>>) -> Flow {
         let (before, after_detach) = split_at_detach(bytes);
         if !before.is_empty() {
             let (replies, typed) = self.replies.push(before);
+            if let Some(collected) = collected_replies {
+                collected.extend_from_slice(&replies);
+            }
             if let Flow::Detach { double } = self.accept(&replies, &typed) {
                 return Flow::Detach {
                     double: double || after_detach.is_some(),

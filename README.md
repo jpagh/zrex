@@ -27,8 +27,8 @@ cargo build --release
 ## Usage
 
 ```sh
-# Fuzzy-pick an existing session, window, or split (`zrex pick` also works)
-zrex
+# Fuzzy-pick an existing session, window, or split (`zrex p` is short for `zrex pick`)
+zrex pick
 
 # List sessions, windows, split blocks, and terminal titles
 zrex -S https://server.example ls
@@ -58,9 +58,9 @@ The server is read from `--server` (`-S`), then `REX_SERVER`. It may be a saved 
 
 ```sh
 # Use a saved server alias from config.toml with any command
-zrex -S office
 zrex -S office ls
 zrex -S office a work
+zrex -S office pick
 zrex -S office kill work
 
 # Target only the local server. The name `local` is reserved (case-insensitive);
@@ -72,7 +72,7 @@ To reach a Rex server on another machine over Tailscale, use the HTTPS address t
 
 ### Attach Picker
 
-Run `zrex` (or `zrex pick`), type to filter, and use the arrow keys (or `Tab`/`Shift-Tab`) and Enter to attach in the same terminal. Detaching (`Ctrl-\`) from a session attached via the picker returns you to the picker with a refreshed view, and pressing `Ctrl-\` in the picker quits back to your shell—so a double `Ctrl-\` detaches all the way out. Press `Ctrl-N` to create a new session (optionally choosing a server and name, or pressing Enter for the default), `Ctrl-T` to create a new window in a session (defaulting to the highlighted target's session), `Ctrl-R` to rename the highlighted session, window, or block (clearing with `Ctrl-U` restores the server default), or `Ctrl-K` to kill a session, window, or block (use `Tab`/arrows or `s`/`w`/`b` to choose the scope, and `Enter`/`y` to confirm). Renames and kills update the picker in place so you can keep working without leaving it. `Ctrl-U` clears the current input, `Esc` backs out of a prompt or quits the picker, and `Ctrl-C` or `Ctrl-\` quits immediately from any prompt. When run without a terminal, bare `zrex` prints usage instead of launching the picker.
+Run `zrex pick` (or `zrex p`), type to filter, and use the arrow keys (or `Tab`/`Shift-Tab`) and Enter to attach in the same terminal. Detaching (`Ctrl-\`) from a session attached via the picker returns you to the picker with a refreshed view, and pressing `Ctrl-\` in the picker quits back to your shell—so a double `Ctrl-\` detaches all the way out. Press `Ctrl-N` to create a new session (optionally choosing a server and name, or pressing Enter for the default), `Ctrl-T` to create a new window in a session (defaulting to the highlighted target's session), `Ctrl-R` to rename the highlighted session, window, or block (clearing with `Ctrl-U` restores the server default), or `Ctrl-K` to kill a session, window, or block (use `Tab`/arrows or `s`/`w`/`b` to choose the scope, and `Enter`/`y` to confirm). Renames and kills update the picker in place so you can keep working without leaving it. `Ctrl-U` clears the current input, `Esc` backs out of a prompt or quits the picker, and `Ctrl-C` or `Ctrl-\` quits immediately from any prompt.
 
 Use `Alt/Option-←` and `Alt/Option-→` to move by word. `Ctrl-←`/`Ctrl-→` and `Alt-B`/`Alt-F` also work, depending on what your terminal sends. `Home`/`End` or `Ctrl-A`/`Ctrl-E` go to the start or end of the query.
 
@@ -86,7 +86,7 @@ office = "https://office.example.com"
 lab = "https://lab.example.com"
 ```
 
-Each choice shows its server name. `zrex` (or `zrex pick`) searches the saved servers alongside a running local server (or `REX_SERVER`, if set); if no local server is running, it is silently skipped. If no local server, `REX_SERVER`, or saved server is configured, it prints a short getting-started message and exits with status 0. Servers are queried in parallel with a short timeout, so an unreachable server doesn't prevent you from picking from another one. Use `zrex -S SERVER` (or `zrex -S SERVER pick`, with a saved server name, `local`, or a URL) to search just one server.
+Each choice shows its server name. `zrex pick` (or `zrex p`) searches the saved servers alongside a running local server (or `REX_SERVER`, if set); if no local server is running, it is silently skipped when saved servers are configured, and it exits with an error when no local or saved server is available. Servers are queried in parallel with a short timeout, so an unreachable server doesn't prevent you from picking from another one. Use `zrex -S SERVER pick` (or `zrex -S SERVER p`, with a saved server name, `local`, or a URL) to search just one server.
 
 `zrex ls` (without `--server` or `REX_SERVER`) likewise lists sessions from any running local server and saved servers in `config.toml`, silently skipping an absent local server when saved servers are configured and exiting with an error when no local or saved server is available.
 

@@ -44,8 +44,8 @@ pub(super) enum StepEvent {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Selection {
-    Attach(usize),
+pub(super) enum AttachSelection {
+    Existing(usize),
     NewSession {
         server_index: usize,
         label: Option<String>,
@@ -54,19 +54,28 @@ pub(super) enum Selection {
         session_index: usize,
         label: Option<String>,
     },
-    Rename {
-        target: ManageTarget,
-        label: String,
-    },
-    Kill {
-        target: ManageTarget,
-    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Selection {
+    Attach(AttachSelection),
+    Rename { target: ManageTarget, label: String },
+    Kill { target: ManageTarget },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Cancel,
     Selected(Selection),
+}
+
+impl From<Outcome> for StepEvent {
+    fn from(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::Cancel => Self::Cancel,
+            Outcome::Selected(selection) => Self::Selected(selection),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -276,12 +285,11 @@ impl PickerState {
     /// prior filter query, returns to attach mode, focuses `focus` if it is
     /// already present (and remembers it until the user interacts so a
     /// background refresh can focus a newly created session or window), and
-    /// optionally shows a status banner while refreshing.
+    /// shows a refreshing status banner until background discovery completes.
     pub(super) fn reset_after_attach(
         &mut self,
         focus: Option<FocusTarget>,
         feedback: Option<Feedback>,
-        refreshing: bool,
     ) {
         self.attach_input = TextInput::default();
         self.mode = Mode::Attach;
@@ -293,7 +301,7 @@ impl PickerState {
         }
         self.pending_focus = focus;
         self.feedback = feedback;
-        self.refreshing = refreshing;
+        self.refreshing = true;
     }
 
     /// Applies a full server-discovery refresh while preserving the user's
@@ -582,9 +590,11 @@ impl PickerState {
         match &mut self.mode {
             Mode::Attach => match (code, modifiers) {
                 (KeyCode::Esc, _) => Some(Outcome::Cancel),
-                (KeyCode::Enter, _) if !self.matches.is_empty() => Some(Outcome::Selected(
-                    Selection::Attach(self.matches[self.attach_selected].0),
-                )),
+                (KeyCode::Enter, _) if !self.matches.is_empty() => {
+                    Some(Outcome::Selected(Selection::Attach(
+                        AttachSelection::Existing(self.matches[self.attach_selected].0),
+                    )))
+                }
                 (KeyCode::Char('n'), KeyModifiers::CONTROL) if !self.servers.is_empty() => {
                     let server_index = self.default_server_index();
                     self.mode = Mode::NewSession {
@@ -650,10 +660,12 @@ impl PickerState {
                     self.mode = Mode::Attach;
                     None
                 }
-                (KeyCode::Enter, _) => Some(Outcome::Selected(Selection::NewSession {
-                    server_index: *server_index,
-                    label: input.trimmed_non_empty(),
-                })),
+                (KeyCode::Enter, _) => Some(Outcome::Selected(Selection::Attach(
+                    AttachSelection::NewSession {
+                        server_index: *server_index,
+                        label: input.trimmed_non_empty(),
+                    },
+                ))),
                 (KeyCode::Char('t'), KeyModifiers::CONTROL) if !self.sessions.is_empty() => {
                     let chosen_server = *server_index;
                     let session_index = self
@@ -690,10 +702,12 @@ impl PickerState {
                     self.mode = Mode::Attach;
                     None
                 }
-                (KeyCode::Enter, _) => Some(Outcome::Selected(Selection::NewWindow {
-                    session_index: *session_index,
-                    label: input.trimmed_non_empty(),
-                })),
+                (KeyCode::Enter, _) => Some(Outcome::Selected(Selection::Attach(
+                    AttachSelection::NewWindow {
+                        session_index: *session_index,
+                        label: input.trimmed_non_empty(),
+                    },
+                ))),
                 (KeyCode::Char('n'), KeyModifiers::CONTROL) if !self.servers.is_empty() => {
                     let server_index = self.sessions[*session_index].server_index;
                     self.mode = Mode::NewSession {
@@ -1234,22 +1248,21 @@ impl Screen {
         Ok(screen)
     }
 
-    pub(super) fn step(&mut self, state: &mut PickerState) -> io::Result<Option<Selection>> {
-        let mut out = io::stdout();
-        loop {
-            let (columns, rows) = terminal::size()?;
-            state.render(&mut out, columns, rows, self.use_color)?;
+    fn render(&self, out: &mut impl Write, state: &mut PickerState) -> io::Result<()> {
+        let (columns, rows) = terminal::size()?;
+        state.render(out, columns, rows, self.use_color)
+    }
 
-            let Event::Key(key) = event::read()? else {
-                continue;
-            };
-            if key.kind == KeyEventKind::Release {
-                continue;
+    pub(super) fn step(&mut self, state: &mut PickerState) -> io::Result<StepEvent> {
+        let mut out = io::stdout();
+        self.render(&mut out, state)?;
+        loop {
+            let (dirty, step) = handle_event(state, event::read()?);
+            if let Some(step) = step {
+                return Ok(step);
             }
-            match state.handle_key(key.code, key.modifiers) {
-                Some(Outcome::Cancel) => return Ok(None),
-                Some(Outcome::Selected(selection)) => return Ok(Some(selection)),
-                None => {}
+            if dirty {
+                self.render(&mut out, state)?;
             }
         }
     }
@@ -1260,8 +1273,7 @@ impl Screen {
         refresh: &mut Pin<Box<dyn Future<Output = super::DiscoveryOutcome>>>,
     ) -> io::Result<StepEvent> {
         let mut out = io::stdout();
-        let (columns, rows) = terminal::size()?;
-        state.render(&mut out, columns, rows, self.use_color)?;
+        self.render(&mut out, state)?;
 
         let mut tick = tokio::time::interval(Duration::from_millis(16));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1272,24 +1284,14 @@ impl Screen {
                 _ = tick.tick() => {
                     let mut dirty = false;
                     while event::poll(Duration::ZERO)? {
-                        match event::read()? {
-                            Event::Resize(_, _) => dirty = true,
-                            Event::Key(key) if key.kind != KeyEventKind::Release => {
-                                dirty = true;
-                                match state.handle_key(key.code, key.modifiers) {
-                                    Some(Outcome::Cancel) => return Ok(StepEvent::Cancel),
-                                    Some(Outcome::Selected(selection)) => {
-                                        return Ok(StepEvent::Selected(selection));
-                                    }
-                                    None => {}
-                                }
-                            }
-                            _ => {}
+                        let (event_dirty, step) = handle_event(state, event::read()?);
+                        if let Some(step) = step {
+                            return Ok(step);
                         }
+                        dirty |= event_dirty;
                     }
                     if dirty {
-                        let (columns, rows) = terminal::size()?;
-                        state.render(&mut out, columns, rows, self.use_color)?;
+                        self.render(&mut out, state)?;
                     }
                 }
             }
@@ -1321,6 +1323,19 @@ impl Drop for Screen {
             SetAttribute(Attribute::Reset),
             LeaveAlternateScreen
         );
+    }
+}
+
+fn handle_event(state: &mut PickerState, ev: Event) -> (bool, Option<StepEvent>) {
+    match ev {
+        Event::Resize(_, _) => (true, None),
+        Event::Key(key) if key.kind != KeyEventKind::Release => {
+            let step = state
+                .handle_key(key.code, key.modifiers)
+                .map(StepEvent::from);
+            (true, step)
+        }
+        _ => (false, None),
     }
 }
 
@@ -1648,10 +1663,12 @@ mod tests {
         type_text(&mut state, "  scratch  ");
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::NewSession {
-                server_index: 0,
-                label: Some("scratch".to_owned()),
-            }))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::NewSession {
+                    server_index: 0,
+                    label: Some("scratch".to_owned()),
+                }
+            )))
         );
 
         // Blank or whitespace-only name produces None (default Rex label).
@@ -1664,10 +1681,12 @@ mod tests {
         type_text(&mut state, "   ");
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::NewSession {
-                server_index: 1,
-                label: None,
-            }))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::NewSession {
+                    server_index: 1,
+                    label: None,
+                }
+            )))
         );
     }
 
@@ -1685,10 +1704,12 @@ mod tests {
         type_text(&mut state, "logs");
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::NewWindow {
-                session_index: 1,
-                label: Some("logs".to_owned()),
-            }))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::NewWindow {
+                    session_index: 1,
+                    label: Some("logs".to_owned()),
+                }
+            )))
         );
 
         // Can cycle to another session and submit empty name for default label.
@@ -1700,10 +1721,12 @@ mod tests {
         assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::NewWindow {
-                session_index: 1,
-                label: None,
-            }))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::NewWindow {
+                    session_index: 1,
+                    label: None,
+                }
+            )))
         );
     }
 
@@ -1722,7 +1745,9 @@ mod tests {
         assert_eq!(state.handle_key(KeyCode::Esc, KeyModifiers::NONE), None);
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::Attach(1)))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::Existing(1)
+            )))
         );
 
         // Ctrl-C cancels immediately even inside NewWindow mode.
@@ -1805,10 +1830,12 @@ mod tests {
 
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::NewSession {
-                server_index: 0,
-                label: Some("dev".to_owned()),
-            }))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::NewSession {
+                    server_index: 0,
+                    label: Some("dev".to_owned()),
+                }
+            )))
         );
     }
 
@@ -1830,10 +1857,12 @@ mod tests {
         // Should land on office's session (index 1).
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::NewWindow {
-                session_index: 1,
-                label: None,
-            }))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::NewWindow {
+                    session_index: 1,
+                    label: None,
+                }
+            )))
         );
     }
 
@@ -2215,7 +2244,9 @@ mod tests {
         // Previously selected block:3 stays selected after refresh.
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::Attach(2)))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::Existing(2)
+            )))
         );
         // Feedback cleared after keypress.
         assert!(state.feedback.is_none());
@@ -2312,7 +2343,6 @@ mod tests {
                 block_id: "block:2".to_owned(),
             }),
             None,
-            true,
         );
         assert_eq!(state.attach_input.text(), "");
         assert_eq!(state.matches.len(), 2);
@@ -2354,7 +2384,9 @@ mod tests {
         assert!(!screen.contains("Refreshing…"));
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::Attach(0)))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::Existing(0)
+            )))
         );
 
         // Detaching from a brand-new session that was not yet in the pre-attach list
@@ -2366,7 +2398,6 @@ mod tests {
                 block_id: "block:new".to_owned(),
             }),
             None,
-            true,
         );
         let mut new_sessions = sessions;
         new_sessions.push(SessionChoice {
@@ -2386,7 +2417,9 @@ mod tests {
         state.apply_discovery(new_targets, new_sessions, servers, None);
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::Attach(2)))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::Existing(2)
+            )))
         );
     }
 
@@ -2402,7 +2435,6 @@ mod tests {
                 block_id: "block:2".to_owned(),
             }),
             None,
-            true,
         );
         // User moves up to [local] work before refresh completes.
         assert_eq!(state.handle_key(KeyCode::Up, KeyModifiers::NONE), None);
@@ -2411,7 +2443,9 @@ mod tests {
         // Selection stays on [local] work (index 0) instead of snapping back to [office] api.
         assert_eq!(
             state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
-            Some(Outcome::Selected(Selection::Attach(0)))
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::Existing(0)
+            )))
         );
     }
 
@@ -2426,7 +2460,6 @@ mod tests {
                 text: "The block closed".to_owned(),
                 is_error: false,
             }),
-            true,
         );
         let mut buf = Vec::new();
         state.render(&mut buf, 80, 10, false).unwrap();

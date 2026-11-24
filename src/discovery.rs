@@ -6,6 +6,8 @@ use crate::config::Server;
 use crate::rex::{ServerAddress, control::Control};
 use crate::text::clean_one_line;
 
+pub const NO_SERVER_FOUND: &str = "no Rex server found; start a local Rex server, pass --server / set REX_SERVER, or configure ~/.config/zrex/config.toml";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalDiscovery {
     None,
