@@ -31,16 +31,22 @@ const PROBE_TIME: Duration = Duration::from_secs(5);
 const DETACH_TIME: Duration = Duration::from_secs(1);
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(5);
-const THEME_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+const THEME_PROBE_IDLE: Duration = Duration::from_millis(100);
+const THEME_PROBE_MAX: Duration = Duration::from_millis(500);
 const TITLE_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 /// An unterminated local reply grows no larger than this before zrex stops
 /// holding it and forwards the bytes as input. The longest reply a terminal
 /// sends is a 256-color palette entry at 29 bytes.
 const MAX_HELD_REPLY: usize = 64;
-/// A terminal answers a query in one burst, so a fragment held this long was
-/// typing after all, and a reply this old is no longer a sign that more are
-/// coming.
+/// A terminal answers a query in one burst, so a bare opener held this long
+/// was typing after all, and a reply this old is no longer a sign that more
+/// are coming.
 const REPLY_HOLD: Duration = Duration::from_millis(50);
+/// Definite partial host replies (such as a split `OSC 4` color entry) are
+/// never user typing; hold them longer so slow terminals or buffered PTYs can
+/// finish the sequence cleanly, and drop them rather than injecting garbage if
+/// the host never completes the reply.
+const REPLY_FRAGMENT_HOLD: Duration = Duration::from_secs(2);
 /// DECSET 2031 asks the host terminal to report light and dark switches, which
 /// the block's theme follows while attached.
 const WATCH_SCHEME: &[u8] = b"\x1b[?2031h";
@@ -260,12 +266,13 @@ async fn attach_block(
 ) -> Result<AttachExit> {
     let size = crossterm::terminal::size()?;
     let mut guard = Screen::enter(terminal_mode)?;
-    let (theme, probe_tail) = guard.probe_theme();
+    let probed = guard.probe_theme();
     let mut attached =
-        Attached::start(&mut ctrl, session_id, server, selection, size, theme).await?;
-    // Replies the probe deadline cut off arrive after it returns, so the reader
-    // that takes over stdin starts out holding the fragment it left.
-    attached.replies.hold(probe_tail);
+        Attached::start(&mut ctrl, session_id, server, selection, size, probed.theme).await?;
+    // Replies the probe cut off (or any initial scheme report after
+    // WATCH_SCHEME) arrive after probe_theme returns, so the reader that takes
+    // over stdin starts out holding the fragment it left and expecting replies.
+    attached.replies.hold_probe(probed.tail, !probed.complete);
 
     let mut input = InputReader::spawn()?;
     let mut winch = signal(SignalKind::window_change())?;
@@ -683,15 +690,23 @@ impl<'a> Attached<'a> {
         ctrl: &mut Control,
     ) -> Result<Flow> {
         self.flush(out)?;
-        out.write_all(theme_query().as_bytes())?;
-        out.flush()?;
+        for chunk in theme_query_chunks() {
+            out.write_all(chunk.as_bytes())?;
+            out.flush()?;
+        }
         self.replies.expect_reply();
-        let deadline = Instant::now() + THEME_PROBE_TIMEOUT;
+        let now = Instant::now();
+        let hard_deadline = now + THEME_PROBE_MAX;
+        let mut idle_deadline = now + THEME_PROBE_IDLE;
         let mut replies = Vec::new();
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        while let Some(remaining) = idle_deadline
+            .min(hard_deadline)
+            .checked_duration_since(Instant::now())
+        {
             let Ok(Some(bytes)) = tokio::time::timeout(remaining, input.recv()).await else {
                 break;
             };
+            idle_deadline = Instant::now() + THEME_PROBE_IDLE;
             let flow = self.queue_input(&bytes, Some(&mut replies));
             self.flush_input(ctrl)?;
             if let Flow::Detach { .. } = flow {
@@ -772,9 +787,10 @@ impl<'a> Attached<'a> {
         }
     }
 
-    /// Forwards a fragment the host stopped sending partway through.
+    /// Forwards a stalled fragment if it could be user typing, or drops an
+    /// unfinished host reply so it never leaks into the remote PTY.
     async fn flush_held(&mut self, ctrl: &mut Control) -> Result<()> {
-        let held = self.replies.give_up();
+        let held = self.replies.give_up_stalled();
         if held.is_empty() {
             return Ok(());
         }
@@ -1050,16 +1066,34 @@ fn contains_detach(bytes: &[u8]) -> bool {
 }
 
 /// Asks the host terminal for its default colors and its whole 256-color
-/// palette. DA1 (`ESC [ c`) acts as a completion sentinel because terminals
-/// answer queries in order and always support DA1, even if they ignore OSC 4
-/// or OSC 10.
-fn theme_query() -> String {
-    let mut query = String::from("\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07");
-    for index in 0..=255 {
-        query.push_str(&format!("\x1b]4;{index};?\x07"));
+/// palette in small batches so replies (~900 bytes per batch) stay well below
+/// a 4 KiB kernel PTY buffer while stdin is drained between writes. Uses ST
+/// (`ESC \`) rather than BEL (`0x07`) so compliant terminals do not emit
+/// `Ctrl-G` bytes in their replies. DA1 (`ESC [ c`) acts as a completion
+/// sentinel because terminals answer queries in order and always support DA1,
+/// even if they ignore OSC 4 or OSC 10.
+fn theme_query_chunks() -> Vec<String> {
+    const PALETTE_BATCH: usize = 32;
+    let mut chunks = Vec::with_capacity(256 / PALETTE_BATCH);
+    for start in (0..256).step_by(PALETTE_BATCH) {
+        let mut chunk = String::new();
+        if start == 0 {
+            chunk.push_str("\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\");
+        }
+        for index in start..(start + PALETTE_BATCH).min(256) {
+            chunk.push_str(&format!("\x1b]4;{index};?\x1b\\"));
+        }
+        if start + PALETTE_BATCH >= 256 {
+            chunk.push_str("\x1b[c");
+        }
+        chunks.push(chunk);
     }
-    query.push_str("\x1b[c");
-    query
+    chunks
+}
+
+#[cfg(test)]
+fn theme_query() -> String {
+    theme_query_chunks().concat()
 }
 
 /// The Rex server's `libghostty-vt` answers terminal queries on the server
@@ -1128,14 +1162,25 @@ impl Replies {
         }
         let from_reply = !replies.is_empty() || answering || (resumed && was_from_reply);
         self.hold_at(fragment, from_reply, now);
-        self.answered = (!replies.is_empty()).then_some(now);
+        self.answered = if !replies.is_empty() || (from_reply && !self.held.is_empty()) {
+            Some(now)
+        } else if answering {
+            self.answered
+        } else {
+            None
+        };
         (replies, typed)
     }
 
-    /// Keeps a probe-tail fragment back for the read that finishes it, and
-    /// starts the clock that gives up on it.
-    fn hold(&mut self, fragment: Vec<u8>) {
-        self.hold_at(fragment, true, Instant::now());
+    /// Keeps a startup probe's unfinished tail (if any) and marks that host
+    /// replies may still be arriving (either because DA1 was not yet seen or
+    /// because `WATCH_SCHEME` was just enabled).
+    fn hold_probe(&mut self, fragment: Vec<u8>, awaiting_more: bool) {
+        let now = Instant::now();
+        self.hold_at(fragment, true, now);
+        if awaiting_more || !self.held.is_empty() {
+            self.answered = Some(now);
+        }
     }
 
     /// Marks that a host query was just sent so a split first chunk is treated
@@ -1145,7 +1190,13 @@ impl Replies {
     }
 
     fn hold_at(&mut self, fragment: Vec<u8>, from_reply: bool, now: Instant) {
-        self.until = (!fragment.is_empty()).then(|| now + REPLY_HOLD);
+        let is_definite_reply = from_reply && !bare_opener(&fragment);
+        let hold_for = if is_definite_reply {
+            REPLY_FRAGMENT_HOLD
+        } else {
+            REPLY_HOLD
+        };
+        self.until = (!fragment.is_empty()).then(|| now + hold_for);
         self.held_from_reply = !fragment.is_empty() && from_reply;
         self.held = fragment;
     }
@@ -1158,7 +1209,12 @@ impl Replies {
     /// Postpones the clock while queued input can still finish the fragment.
     fn defer(&mut self) {
         if !self.held.is_empty() {
-            self.until = Some(Instant::now() + REPLY_HOLD);
+            let hold_for = if self.held_from_reply && !bare_opener(&self.held) {
+                REPLY_FRAGMENT_HOLD
+            } else {
+                REPLY_HOLD
+            };
+            self.until = Some(Instant::now() + hold_for);
         }
     }
 
@@ -1168,6 +1224,15 @@ impl Replies {
         self.answered = None;
         self.held_from_reply = false;
         std::mem::take(&mut self.held)
+    }
+
+    /// Called when the stall timer expires: forwards standalone typing or an
+    /// ambiguous bare opener (`Esc`, `Alt+[`, `Alt+]`), but drops a definite
+    /// partial host reply so truncated escape sequences never enter the PTY.
+    fn give_up_stalled(&mut self) -> Vec<u8> {
+        let drop_fragment = self.held_from_reply && !bare_opener(&self.held);
+        let held = self.give_up();
+        if drop_fragment { Vec::new() } else { held }
     }
 
     /// Like `give_up`, but drops fragments that originated from a host reply
@@ -1933,6 +1998,106 @@ fn closed_block(error: &anyhow::Error) -> bool {
         .is_some_and(StreamClosed::is_block_closed)
 }
 
+struct ProbeOutcome {
+    theme: Theme,
+    tail: Vec<u8>,
+    complete: bool,
+}
+
+fn drain_ready_input(fd: i32, input: &mut impl Read, buf: &mut Vec<u8>, chunk: &mut [u8]) {
+    loop {
+        let mut pfd = libc_pollfd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { poll(&mut pfd, 1, 0) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 || (pfd.revents & POLLIN) == 0 {
+            break;
+        }
+        match input.read(chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn probe_theme_io(
+    out: &mut impl Write,
+    input: &mut (impl Read + AsRawFd),
+    idle_timeout: Duration,
+    max_timeout: Duration,
+) -> ProbeOutcome {
+    let fd = input.as_raw_fd();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    for query in theme_query_chunks() {
+        if out.write_all(query.as_bytes()).is_err() || out.flush().is_err() {
+            return ProbeOutcome {
+                theme: Theme::default(),
+                tail: Vec::new(),
+                complete: true,
+            };
+        }
+        drain_ready_input(fd, input, &mut buf, &mut chunk);
+    }
+
+    let now = Instant::now();
+    let hard_deadline = now + max_timeout;
+    let mut idle_deadline = now + idle_timeout;
+
+    while !has_da1_reply(&buf) {
+        let Some(remaining) = idle_deadline
+            .min(hard_deadline)
+            .checked_duration_since(Instant::now())
+        else {
+            break;
+        };
+        let timeout_ms = (remaining.as_millis() as i32).max(1);
+        let mut pfd = libc_pollfd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { poll(&mut pfd, 1, timeout_ms) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 {
+            break;
+        }
+        match input.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                idle_deadline = Instant::now() + idle_timeout;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = out.write_all(WATCH_SCHEME).and_then(|()| out.flush());
+    let complete = has_da1_reply(&buf);
+    let tail = reply_tail(&buf).map_or_else(Vec::new, |start| buf[start..].to_vec());
+    ProbeOutcome {
+        theme: parse_theme_reply(&buf),
+        tail,
+        complete,
+    }
+}
+
 struct Screen {
     stdout: std::io::Stdout,
     entered: bool,
@@ -1955,47 +2120,15 @@ impl Screen {
         })
     }
 
-    /// Returns the theme and the tail of a reply the deadline cut off.
-    fn probe_theme(&mut self) -> (Theme, Vec<u8>) {
-        if self.stdout.write_all(theme_query().as_bytes()).is_err() || self.stdout.flush().is_err()
-        {
-            return (Theme::default(), Vec::new());
-        }
-
-        let stdin = std::io::stdin();
-        let fd = stdin.as_raw_fd();
-        let deadline = Instant::now() + THEME_PROBE_TIMEOUT;
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 1024];
-
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            let timeout_ms = (remaining.as_millis() as i32).max(1);
-            let mut pfd = libc_pollfd {
-                fd,
-                events: POLLIN,
-                revents: 0,
-            };
-            let ready = unsafe { poll(&mut pfd, 1, timeout_ms) };
-            if ready <= 0 {
-                break;
-            }
-            let Ok(n) = (&stdin).read(&mut chunk) else {
-                break;
-            };
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if has_da1_reply(&buf) {
-                break;
-            }
-        }
-        let _ = self
-            .stdout
-            .write_all(WATCH_SCHEME)
-            .and_then(|()| self.stdout.flush());
-        let tail = reply_tail(&buf).map_or_else(Vec::new, |start| buf[start..].to_vec());
-        (parse_theme_reply(&buf), tail)
+    /// Returns the theme and any unfinished reply state if the probe timed out.
+    fn probe_theme(&mut self) -> ProbeOutcome {
+        let mut stdin = std::io::stdin();
+        probe_theme_io(
+            &mut self.stdout,
+            &mut stdin,
+            THEME_PROBE_IDLE,
+            THEME_PROBE_MAX,
+        )
     }
 
     fn out(&mut self) -> &mut std::io::Stdout {
@@ -2054,10 +2187,11 @@ fn has_da1_reply(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attached, BlockSelection, Ending, Flow, InflightWrite, InputReader, RETRY_FIRST, RETRY_MAX,
-        Replies, Theme, backoff, closed_block, contains_detach, detach, finish_write,
-        has_da1_reply, parse_theme_reply, read_chunks_with_limits, reports_scheme, split_at_detach,
-        split_replies, take_utf8, take_write_chunk, theme_query, transient, write_target_gone,
+        Attached, BlockSelection, Ending, Flow, InflightWrite, InputReader, REPLY_FRAGMENT_HOLD,
+        REPLY_HOLD, RETRY_FIRST, RETRY_MAX, Replies, Theme, backoff, closed_block, contains_detach,
+        detach, finish_write, has_da1_reply, parse_theme_reply, probe_theme_io,
+        read_chunks_with_limits, reports_scheme, split_at_detach, split_replies, take_utf8,
+        take_write_chunk, theme_query, transient, write_target_gone,
     };
     use crate::rex::BlockRef;
     use crate::rex::control::{CallTimeout, Control};
@@ -2311,10 +2445,103 @@ mod tests {
     #[test]
     fn finishes_a_reply_the_startup_probe_read_only_the_start_of() {
         let mut replies = Replies::default();
-        replies.hold(b"\x1b]11;rgb:ffff".to_vec());
+        replies.hold_probe(b"\x1b]11;rgb:ffff".to_vec(), true);
         let (found, typed) = replies.push(b"/ffff/ffff\x07");
         assert!(typed.is_empty());
         assert_eq!(found, b"\x1b]11;rgb:ffff/ffff/ffff\x07");
+    }
+
+    #[test]
+    fn give_up_stalled_drops_definite_host_replies_but_forwards_bare_openers_and_typing() {
+        // A bare ESC right after a reply burst could be the Escape key, so it
+        // uses the short REPLY_HOLD and is forwarded on stall.
+        let mut replies = Replies::default();
+        assert!(replies.push(b"\x1b]11;rgb:ffff/ffff/ffff\x07").1.is_empty());
+        assert!(replies.push(b"\x1b").1.is_empty());
+        assert!(replies.due().unwrap() <= std::time::Instant::now() + REPLY_HOLD);
+        assert_eq!(replies.give_up_stalled(), b"\x1b");
+
+        // A definite partial OSC 4 reply (e.g. cut off before `5f\x07`) is held
+        // much longer than REPLY_HOLD and dropped rather than injected on stall.
+        let mut replies = Replies::default();
+        replies.hold_probe(b"\x1b]4;149;rgb:afaf/d7d7/5f".to_vec(), true);
+        let remaining = replies
+            .due()
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(remaining > REPLY_HOLD && remaining <= REPLY_FRAGMENT_HOLD);
+        assert!(replies.give_up_stalled().is_empty());
+
+        // Standalone typing without a prior reply is still forwarded on stall.
+        let mut replies = Replies::default();
+        assert!(replies.push(b"\x1b[?").1.is_empty());
+        assert_eq!(replies.give_up_stalled(), b"\x1b[?");
+    }
+
+    #[test]
+    fn hold_probe_keeps_expecting_split_replies_even_with_empty_tail() {
+        let mut replies = Replies::default();
+        replies.hold_probe(Vec::new(), true);
+        // A split first byte (`\x1b`) followed by the rest of a Konsole OSC 4
+        // reply must be held and stripped rather than leaking `5f\x07`.
+        let (found, typed) = replies.push(b"\x1b");
+        assert!(found.is_empty());
+        assert!(typed.is_empty());
+        let (found, typed) = replies.push(b"]4;149;rgb:afaf/d7d7/5f5f\x07");
+        assert!(typed.is_empty());
+        assert_eq!(found, b"\x1b]4;149;rgb:afaf/d7d7/5f5f\x07");
+    }
+
+    #[test]
+    fn probe_theme_io_drains_chunked_replies_and_preserves_incomplete_tail() {
+        use std::io::Write;
+
+        // 1) A slow Konsole-style 256-color reply split across chunks arriving
+        // past the idle timeout in total still finishes cleanly with DA1.
+        let (mut in_rd, mut in_wr) = std::io::pipe().unwrap();
+        let stream = palette_reply(b"\x07", 256);
+        let expected_len = stream.len();
+        let writer = std::thread::spawn(move || {
+            for part in stream.chunks(1800) {
+                in_wr.write_all(part).unwrap();
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let mut out = Vec::new();
+        let probed = probe_theme_io(
+            &mut out,
+            &mut in_rd,
+            Duration::from_millis(40),
+            Duration::from_millis(500),
+        );
+        writer.join().unwrap();
+        assert!(expected_len > 4096);
+        assert!(probed.complete);
+        assert!(probed.tail.is_empty());
+        assert_eq!(probed.theme.palette.len(), 256);
+        assert!(out.starts_with(b"\x1b]10;?\x1b\\"));
+
+        // 2) If the probe times out mid-OSC-4 right before `5f\x07`, the tail
+        // is returned with `complete == false` and reassembles cleanly.
+        let (mut in_rd, mut in_wr) = std::io::pipe().unwrap();
+        in_wr
+            .write_all(b"\x1b]10;rgb:1111/2222/3333\x1b\\\x1b]4;149;rgb:afaf/d7d7/5f")
+            .unwrap();
+        let mut out = Vec::new();
+        let probed = probe_theme_io(
+            &mut out,
+            &mut in_rd,
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+        );
+        assert!(!probed.complete);
+        assert_eq!(probed.tail, b"\x1b]4;149;rgb:afaf/d7d7/5f");
+
+        let mut replies = Replies::default();
+        replies.hold_probe(probed.tail, !probed.complete);
+        let (found, typed) = replies.push(b"5f\x07\x1b[?1;2c");
+        assert!(typed.is_empty());
+        assert_eq!(found, b"\x1b]4;149;rgb:afaf/d7d7/5f5f\x07\x1b[?1;2c");
     }
 
     #[test]
@@ -2343,7 +2570,7 @@ mod tests {
 
         // A startup probe tail is dropped on detach instead of entering the PTY.
         let mut replies = Replies::default();
-        replies.hold(b"\x1b]4;12;rgb:ffff/".to_vec());
+        replies.hold_probe(b"\x1b]4;12;rgb:ffff/".to_vec(), true);
         assert!(replies.give_up_typed().is_empty());
 
         // A partial reply trailing a host reply burst is dropped on detach.
@@ -2373,10 +2600,11 @@ mod tests {
     #[test]
     fn asks_the_host_for_its_whole_palette_and_a_da1_sentinel() {
         let query = theme_query();
-        assert!(query.starts_with("\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07"));
-        assert!(query.contains("\x1b]4;0;?\x07"));
-        assert!(query.contains("\x1b]4;255;?\x07"));
-        assert!(!query.contains("\x1b]4;256;?\x07"));
+        assert!(query.starts_with("\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\"));
+        assert!(query.contains("\x1b]4;0;?\x1b\\"));
+        assert!(query.contains("\x1b]4;255;?\x1b\\"));
+        assert!(!query.contains("\x1b]4;256;?"));
+        assert!(!query.contains('\x07'));
         assert!(query.ends_with("\x1b[c"));
     }
 
@@ -2666,7 +2894,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(flow, Flow::Continue));
-        assert!(host_out.starts_with(b"\x1b]10;?\x07"));
+        assert!(host_out.starts_with(b"\x1b]10;?\x1b\\"));
         assert_eq!(attached.theme.background.as_deref(), Some("#eeeeee"));
         assert_eq!(attached.theme.scheme.as_deref(), Some("light"));
 
