@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
-use crate::config::ServerConfig;
+use crate::config::{DetachKey, ServerConfig};
 use crate::rex::control::{CALL_TIME, CallTimeout, Control, Events};
 use crate::rex::data::{self, Data, StreamClosed};
 use crate::rex::proto;
@@ -31,9 +31,18 @@ const PROBE_TIME: Duration = Duration::from_secs(5);
 const DETACH_TIME: Duration = Duration::from_secs(1);
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(5);
-const THEME_PROBE_IDLE: Duration = Duration::from_millis(100);
-const THEME_PROBE_MAX: Duration = Duration::from_millis(500);
+const THEME_PROBE_IDLE: Duration = Duration::from_millis(200);
+const THEME_PROBE_MAX: Duration = Duration::from_millis(2000);
+const DETACH_DRAIN_IDLE: Duration = Duration::from_millis(150);
+const DETACH_DRAIN_MAX: Duration = Duration::from_millis(400);
 const TITLE_QUERY_TIMEOUT: Duration = Duration::from_millis(250);
+/// DSR Device Status Report (`CSI 5 n` -> `CSI 0 n`). Sent after `RESET_MODES`
+/// on detach so any in-flight host replies (such as delayed OSC 4/10/11/12 or
+/// DA1 responses over SSH) are drained in raw mode before restoring the shell.
+/// Using DSR 5 instead of DA1 prevents an in-flight probe DA1 from falsely
+/// ending the drain early.
+const DSR_STATUS_QUERY: &[u8] = b"\x1b[5n";
+const DSR_STATUS_REPLY: &[u8] = b"\x1b[0n";
 /// An unterminated local reply grows no larger than this before zrex stops
 /// holding it and forwards the bytes as input. The longest reply a terminal
 /// sends is a 256-color palette entry at 29 bytes.
@@ -56,17 +65,27 @@ const RESET_COLORS: &[u8] =
 
 /// Restore host terminal state on exit in case a program inside the block
 /// enabled alternate screen, mouse tracking, Kitty keyboard, color-scheme
-/// reporting, or custom palette colors.
+/// reporting, in-band resize reporting, or custom palette colors.
+///
+/// Begins with CAN (`0x18`) to abort any partial escape/OSC/DCS sequence, and
+/// resets Kitty keyboard (`<99u` + `=0u`) and `modifyOtherKeys` both before
+/// and after leaving the alternate screen because terminals like `foot`,
+/// Kitty, and Ghostty maintain separate keyboard stacks per screen buffer.
 const RESET_MODES: &[u8] = concat!(
+    "\x18",
     "\x1b[?2026l",
-    "\x1b[<u",
-    "\x1b[>4;0m",
-    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l",
+    "\x1b[<99u\x1b[=0u",
+    "\x1b[>4;0m\x1b[>4m",
+    "\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l",
     "\x1b[?1004l",
     "\x1b[?2004l",
     "\x1b[?2031l",
+    "\x1b[?2048l",
     "\x1b[?1l\x1b>",
-    "\x1b[?1049l",
+    "\x1b[?6l\x1b[?7h\x1b[4l",
+    "\x1b[?1049l\x1b[?1047l\x1b[?47l",
+    "\x1b[<99u\x1b[=0u",
+    "\x1b[>4;0m\x1b[>4m",
     "\x1b[r",
     "\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\",
     "\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07",
@@ -166,6 +185,7 @@ pub async fn attach(
     target: Option<String>,
     window: Option<String>,
     block: Option<String>,
+    detach_key: DetachKey,
 ) -> Result<()> {
     ensure_terminal()?;
     let (server, mut ctrl, events) = server_config.connect().await?;
@@ -189,6 +209,7 @@ pub async fn attach(
         &session_id,
         BlockSelection::Selectors(window.as_deref(), block.as_deref()),
         TerminalMode::RestoreOnLeave,
+        detach_key,
     )
     .await?;
     println!("{}", exit.cli_message());
@@ -200,6 +221,7 @@ pub async fn attach_existing(
     server: &ServerAddress,
     session_id: &str,
     block_id: &str,
+    detach_key: DetachKey,
 ) -> Result<AttachExit> {
     ensure_terminal()?;
     let (mut ctrl, events) = Control::connect(server, None).await?;
@@ -211,11 +233,16 @@ pub async fn attach_existing(
         session_id,
         BlockSelection::Exact(block_id),
         TerminalMode::KeepRawOnLeave,
+        detach_key,
     )
     .await
 }
 
-pub async fn attach_new_session(server: &ServerAddress, label: Option<&str>) -> Result<AttachExit> {
+pub async fn attach_new_session(
+    server: &ServerAddress,
+    label: Option<&str>,
+    detach_key: DetachKey,
+) -> Result<AttachExit> {
     ensure_terminal()?;
     let (mut ctrl, events) = Control::connect(server, None).await?;
     let session_id = session::create(&mut ctrl, label).await?;
@@ -226,6 +253,7 @@ pub async fn attach_new_session(server: &ServerAddress, label: Option<&str>) -> 
         &session_id,
         BlockSelection::Selectors(None, None),
         TerminalMode::KeepRawOnLeave,
+        detach_key,
     )
     .await
 }
@@ -234,6 +262,7 @@ pub async fn attach_new_window(
     server: &ServerAddress,
     session_id: &str,
     label: Option<&str>,
+    detach_key: DetachKey,
 ) -> Result<AttachExit> {
     ensure_terminal()?;
     let (mut ctrl, events) = Control::connect(server, None).await?;
@@ -246,6 +275,7 @@ pub async fn attach_new_window(
         session_id,
         BlockSelection::Selectors(Some(&window_id), None),
         TerminalMode::KeepRawOnLeave,
+        detach_key,
     )
     .await
 }
@@ -263,12 +293,21 @@ async fn attach_block(
     session_id: &str,
     selection: BlockSelection<'_>,
     terminal_mode: TerminalMode,
+    detach_key: DetachKey,
 ) -> Result<AttachExit> {
     let size = crossterm::terminal::size()?;
     let mut guard = Screen::enter(terminal_mode)?;
     let probed = guard.probe_theme();
     let mut attached =
-        Attached::start(&mut ctrl, session_id, server, selection, size, probed.theme).await?;
+        match Attached::start(&mut ctrl, session_id, server, selection, size, probed.theme).await {
+            Ok(attached) => attached,
+            Err(error) => {
+                let _ = guard.leave_and_drain(detach_key, probed.replied);
+                return Err(error);
+            }
+        };
+    attached.detach_key = detach_key;
+    attached.host_replied = probed.replied;
     // Replies the probe cut off (or any delayed scheme report after
     // WATCH_SCHEME) can arrive after probe_theme returns, so the reader that
     // takes over stdin starts out holding any unfinished tail and expecting
@@ -301,7 +340,13 @@ async fn attach_block(
                                     }
                                     Err(error) if closed_block(&error) => {
                                         attached.flush(guard.out())?;
-                                        return finish_ending(&mut input, &mut guard, Ending::Block);
+                                        return finish_ending(
+                                            &mut input,
+                                            &mut guard,
+                                            attached.detach_key,
+                                            attached.host_replied,
+                                            Ending::Block,
+                                        );
                                     }
                                     Err(error) => {
                                         lost = Some(stream_lost(error));
@@ -312,7 +357,13 @@ async fn attach_block(
                         }
                     }
                     Some(Err(error)) if closed_block(&error) => {
-                        return finish_ending(&mut input, &mut guard, Ending::Block);
+                        return finish_ending(
+                            &mut input,
+                            &mut guard,
+                            attached.detach_key,
+                            attached.host_replied,
+                            Ending::Block,
+                        );
                     }
                     Some(Err(error)) => lost = Some(stream_lost(error)),
                     None => lost = Some(data_ended()),
@@ -323,7 +374,13 @@ async fn attach_block(
                     Some((name, payload)) => {
                         match attached.event(&name, &payload, &mut ctrl).await {
                             Ok(Some(ending)) => {
-                                return finish_ending(&mut input, &mut guard, ending);
+                                return finish_ending(
+                                    &mut input,
+                                    &mut guard,
+                                    attached.detach_key,
+                                    attached.host_replied,
+                                    ending,
+                                );
                             }
                             Ok(None) => {}
                             Err(error) => lost = Some(error),
@@ -446,7 +503,13 @@ async fn attach_block(
                     .await;
                 }
                 Recovered::Ended(ending) => {
-                    return finish_ending(&mut input, &mut guard, ending);
+                    return finish_ending(
+                        &mut input,
+                        &mut guard,
+                        attached.detach_key,
+                        attached.host_replied,
+                        ending,
+                    );
                 }
             }
         }
@@ -466,10 +529,12 @@ enum DetachMode {
 fn finish_ending(
     input: &mut InputReader,
     guard: &mut Screen,
+    detach_key: DetachKey,
+    host_replied: bool,
     ending: Ending,
 ) -> Result<AttachExit> {
     input.stop();
-    guard.leave()?;
+    let _ = guard.leave_and_drain(detach_key, host_replied)?;
     Ok(ending.into_exit())
 }
 
@@ -481,7 +546,8 @@ async fn finish_detach(
     mut double_detach: bool,
     mode: DetachMode,
 ) -> Result<AttachExit> {
-    double_detach |= input.stop_and_drain_detach();
+    let detach_key = attached.detach_key;
+    double_detach |= input.stop_and_drain_detach(detach_key);
     match mode {
         DetachMode::Graceful => detach(ctrl, &mut attached).await,
         DetachMode::Immediate => {
@@ -493,7 +559,7 @@ async fn finish_detach(
             .await;
         }
     }
-    guard.leave()?;
+    double_detach |= guard.leave_and_drain(detach_key, attached.host_replied)?;
     Ok(AttachExit::Detached {
         session_id: attached.session_id,
         block_id: attached.block_id,
@@ -508,9 +574,9 @@ enum Flow {
 }
 
 impl Flow {
-    fn detach_after(tail: &[u8]) -> Self {
+    fn detach_after(tail: &[u8], detach_key: DetachKey) -> Self {
         Self::Detach {
-            double: contains_detach(tail),
+            double: contains_detach_for(tail, detach_key),
         }
     }
 }
@@ -550,6 +616,8 @@ struct Attached<'a> {
     write_queue: String,
     write_inflight: Option<InflightWrite>,
     replies: Replies,
+    detach_key: DetachKey,
+    host_replied: bool,
     primed: bool,
     theme_dirty: bool,
     owns: bool,
@@ -618,6 +686,8 @@ impl<'a> Attached<'a> {
             write_queue: String::new(),
             write_inflight: None,
             replies: Replies::default(),
+            detach_key: DetachKey::default(),
+            host_replied: false,
             primed: false,
             theme_dirty: false,
             owns: true,
@@ -697,6 +767,7 @@ impl<'a> Attached<'a> {
         for batch in theme_query_batches(false) {
             out.write_all(batch.as_bytes())?;
             out.flush()?;
+            self.host_replied = true;
             let batch_start = replies.len();
             let mut saw_da1 = false;
             while let Some(remaining) = deadline.remaining() {
@@ -742,7 +813,7 @@ impl<'a> Attached<'a> {
             flow = self.queue_input(&bytes, None);
         }
         if let Flow::Detach { mut double } = flow {
-            double |= input.drain_detach();
+            double |= input.drain_detach(self.detach_key);
             self.flush_input(ctrl)?;
             return Ok(Flow::Detach { double });
         }
@@ -754,39 +825,93 @@ impl<'a> Attached<'a> {
         Ok(Flow::Continue)
     }
 
-    fn queue_input(&mut self, bytes: &[u8], collected_replies: Option<&mut Vec<u8>>) -> Flow {
-        let (before, after_detach) = split_at_detach(bytes);
-        if !before.is_empty() {
-            let (replies, typed) = self.replies.push(before);
-            if let Some(collected) = collected_replies {
-                collected.extend_from_slice(&replies);
+    fn queue_input(&mut self, bytes: &[u8], mut collected_replies: Option<&mut Vec<u8>>) -> Flow {
+        match self.detach_key {
+            DetachKey::None => {
+                let (replies, typed) = self.replies.push(bytes);
+                self.record_replies(&replies, collected_replies.as_deref_mut());
+                self.input_buf.extend_from_slice(&typed);
+                Flow::Continue
             }
-            if let Flow::Detach { double } = self.accept(&replies, &typed) {
-                return Flow::Detach {
-                    double: double || after_detach.is_some(),
-                };
+            // BEL (`0x07`) also terminates legacy OSC replies, so strip host
+            // replies before scanning for `Ctrl-G` detach/pass-through.
+            DetachKey::Ctrl(0x07) => {
+                let (replies, typed) = self.replies.push(bytes);
+                self.record_replies(&replies, collected_replies.as_deref_mut());
+                self.consume_key_actions(&typed)
             }
-        }
-        match after_detach {
-            Some(tail) => Flow::detach_after(tail),
-            None => Flow::Continue,
+            DetachKey::Ctrl(_) => {
+                let mut rest = bytes;
+                while let Some((pos, len, action)) = find_next_key_action(rest, self.detach_key) {
+                    if pos > 0 {
+                        let (replies, typed) = self.replies.push(&rest[..pos]);
+                        self.record_replies(&replies, collected_replies.as_deref_mut());
+                        if let Flow::Detach { double } = self.consume_key_actions(&typed) {
+                            let tail = &rest[pos..];
+                            return Flow::Detach {
+                                double: double
+                                    || matches!(action, KeyAction::Detach)
+                                    || contains_detach_for(tail, self.detach_key),
+                            };
+                        }
+                    }
+                    let tail = &rest[pos + len..];
+                    match action {
+                        KeyAction::Detach => return Flow::detach_after(tail, self.detach_key),
+                        KeyAction::PassThrough(byte) => {
+                            self.input_buf.push(byte);
+                            rest = tail;
+                        }
+                        KeyAction::Ignore => {
+                            rest = tail;
+                        }
+                    }
+                }
+                if !rest.is_empty() {
+                    let (replies, typed) = self.replies.push(rest);
+                    self.record_replies(&replies, collected_replies);
+                    return self.consume_key_actions(&typed);
+                }
+                Flow::Continue
+            }
         }
     }
 
-    /// Keeps what `Replies::push` classified without parsing the bytes twice.
-    fn accept(&mut self, replies: &[u8], typed: &[u8]) -> Flow {
-        if reports_scheme(replies) {
-            self.theme_dirty = true;
+    fn record_replies(&mut self, replies: &[u8], collected: Option<&mut Vec<u8>>) {
+        if !replies.is_empty() {
+            self.host_replied = true;
+            if let Some(collected) = collected {
+                collected.extend_from_slice(replies);
+            }
+            if reports_scheme(replies) {
+                self.theme_dirty = true;
+            }
         }
-        // The detach key can share a read with a host reply or preceding keys.
-        let (before, after_detach) = split_at_detach(typed);
-        if !before.is_empty() {
-            self.input_buf.extend_from_slice(before);
+    }
+
+    /// Scans already-classified typed bytes for detach and pass-through
+    /// sequences, appending forwarded bytes to `self.input_buf`.
+    fn consume_key_actions(&mut self, mut bytes: &[u8]) -> Flow {
+        while let Some((pos, len, action)) = find_next_key_action(bytes, self.detach_key) {
+            if pos > 0 {
+                self.input_buf.extend_from_slice(&bytes[..pos]);
+            }
+            let tail = &bytes[pos + len..];
+            match action {
+                KeyAction::Detach => return Flow::detach_after(tail, self.detach_key),
+                KeyAction::PassThrough(byte) => {
+                    self.input_buf.push(byte);
+                    bytes = tail;
+                }
+                KeyAction::Ignore => {
+                    bytes = tail;
+                }
+            }
         }
-        match after_detach {
-            Some(tail) => Flow::detach_after(tail),
-            None => Flow::Continue,
+        if !bytes.is_empty() {
+            self.input_buf.extend_from_slice(bytes);
         }
+        Flow::Continue
     }
 
     /// Forwards a stalled fragment if it could be user typing, or drops an
@@ -1033,38 +1158,190 @@ impl<'a> Attached<'a> {
     }
 }
 
-const DETACH_SEQUENCES: [&[u8]; 8] = [
-    b"\x1c",
-    b"\x1b[92;5u",
-    b"\x1b[92;5:1u",
-    b"\x1b[92;5:2u",
-    b"\x1b[92:124;5u",
-    b"\x1b[92:124;5:1u",
-    b"\x1b[92:124;5:2u",
-    b"\x1b[27;5;92~",
-];
-
-/// Splits `bytes` before the earliest detach sequence, returning
-/// `(prefix_before_detach, Some(tail_after_detach))` when found or
-/// `(bytes, None)` otherwise.
-fn split_at_detach(bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
-    let earliest = DETACH_SEQUENCES
-        .iter()
-        .filter_map(|seq| {
-            bytes
-                .windows(seq.len())
-                .position(|window| window == *seq)
-                .map(|pos| (pos, seq.len()))
-        })
-        .min_by_key(|&(pos, _)| pos);
-    match earliest {
-        Some((pos, len)) => (&bytes[..pos], Some(&bytes[pos + len..])),
-        None => (bytes, None),
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyAction {
+    /// Detach the current zrex client.
+    Detach,
+    /// `Alt` + detach key: forward the literal control byte to the remote block
+    /// so a nested zrex (or program expecting the key) receives it.
+    PassThrough(u8),
+    /// Kitty release event for `Alt` + detach key: consume without forwarding.
+    Ignore,
 }
 
+/// Finds the earliest detach or `Alt`-pass-through sequence for `key` in
+/// `bytes`, returning `(start, byte_len, action)`.
+fn find_next_key_action(bytes: &[u8], key: DetachKey) -> Option<(usize, usize, KeyAction)> {
+    let ctrl_byte = key.ctrl_byte()?;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some((len, action)) = match_key_action_at(&bytes[i..], ctrl_byte) {
+            return Some((i, len, action));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn match_key_action_at(slice: &[u8], ctrl_byte: u8) -> Option<(usize, KeyAction)> {
+    if slice.first() == Some(&0x1b) {
+        if slice.get(1) == Some(&ctrl_byte) {
+            return Some((2, KeyAction::PassThrough(ctrl_byte)));
+        }
+        if let Some((len, cp, shifted, mods, event_type)) = parse_csi_u(slice)
+            && let Some(is_alt) = key_matches_ctrl(ctrl_byte, cp, shifted, mods)
+        {
+            return match (is_alt, event_type) {
+                (false, 1 | 2) => Some((len, KeyAction::Detach)),
+                (true, 1 | 2) => Some((len, KeyAction::PassThrough(ctrl_byte))),
+                (true, 3) => Some((len, KeyAction::Ignore)),
+                _ => None,
+            };
+        }
+        if let Some((len, mods, cp)) = parse_modify_other_keys(slice)
+            && let Some(is_alt) = key_matches_ctrl(ctrl_byte, cp, None, mods)
+        {
+            let action = if is_alt {
+                KeyAction::PassThrough(ctrl_byte)
+            } else {
+                KeyAction::Detach
+            };
+            return Some((len, action));
+        }
+        return None;
+    }
+    if slice.first() == Some(&ctrl_byte) {
+        return Some((1, KeyAction::Detach));
+    }
+    None
+}
+
+/// Parses a Kitty keyboard CSI-u sequence:
+/// `ESC [ <cp>[:<shifted>[:<base>]] ; <mods>[:<event_type>] u`.
+fn parse_csi_u(slice: &[u8]) -> Option<(usize, u32, Option<u32>, u32, u32)> {
+    let rest = slice.strip_prefix(b"\x1b[")?;
+    let mut pos = 0;
+    let (cp, n) = parse_u32_prefix(&rest[pos..])?;
+    pos += n;
+    let mut shifted = None;
+    if rest.get(pos) == Some(&b':') {
+        pos += 1;
+        if let Some((val, n)) = parse_u32_prefix(&rest[pos..]) {
+            shifted = Some(val);
+            pos += n;
+        }
+        if rest.get(pos) == Some(&b':') {
+            pos += 1;
+            if let Some((_, n)) = parse_u32_prefix(&rest[pos..]) {
+                pos += n;
+            }
+        }
+    }
+    if rest.get(pos) != Some(&b';') {
+        return None;
+    }
+    pos += 1;
+    let (mods, n) = parse_u32_prefix(&rest[pos..])?;
+    pos += n;
+    let mut event_type = 1;
+    if rest.get(pos) == Some(&b':') {
+        pos += 1;
+        let (val, n) = parse_u32_prefix(&rest[pos..])?;
+        event_type = val;
+        pos += n;
+    }
+    if rest.get(pos) != Some(&b'u') {
+        return None;
+    }
+    Some((2 + pos + 1, cp, shifted, mods, event_type))
+}
+
+/// Parses an xterm `modifyOtherKeys` sequence: `ESC [ 27 ; <mods> ; <cp> ~`.
+fn parse_modify_other_keys(slice: &[u8]) -> Option<(usize, u32, u32)> {
+    let rest = slice.strip_prefix(b"\x1b[27;")?;
+    let mut pos = 0;
+    let (mods, n) = parse_u32_prefix(&rest[pos..])?;
+    pos += n;
+    if rest.get(pos) != Some(&b';') {
+        return None;
+    }
+    pos += 1;
+    let (cp, n) = parse_u32_prefix(&rest[pos..])?;
+    pos += n;
+    if rest.get(pos) != Some(&b'~') {
+        return None;
+    }
+    Some((5 + pos + 1, mods, cp))
+}
+
+fn parse_u32_prefix(bytes: &[u8]) -> Option<(u32, usize)> {
+    let len = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    if len == 0 {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes[..len]).ok()?;
+    let value = text.parse::<u32>().ok()?;
+    Some((value, len))
+}
+
+/// Returns `Some(has_alt)` when `(cp, shifted, mods)` encodes `ctrl_byte` with
+/// Ctrl (and optionally Alt), or `None` otherwise.
+fn key_matches_ctrl(ctrl_byte: u8, cp: u32, shifted: Option<u32>, mods: u32) -> Option<bool> {
+    let bits = mods.checked_sub(1)?;
+    // Ignore Lock/Super/Hyper/Meta bits beyond Shift(1) | Alt(2) | Ctrl(4).
+    if bits & !7 != 0 || (bits & 4) == 0 {
+        return None;
+    }
+    let has_shift = (bits & 1) != 0;
+    let has_alt = (bits & 2) != 0;
+    let matched = match ctrl_byte {
+        0x00 => {
+            cp == u32::from(b'@')
+                || cp == u32::from(b'2')
+                || cp == u32::from(b' ')
+                || shifted == Some(u32::from(b'@'))
+        }
+        0x01..=0x1a => !has_shift && cp == u32::from(b'a' + ctrl_byte - 1),
+        0x1c => !has_shift && cp == u32::from(b'\\'),
+        0x1d => !has_shift && cp == u32::from(b']'),
+        0x1e => cp == u32::from(b'^') || cp == u32::from(b'6') || shifted == Some(u32::from(b'^')),
+        0x1f => {
+            cp == u32::from(b'_')
+                || cp == u32::from(b'-')
+                || cp == u32::from(b'/')
+                || shifted == Some(u32::from(b'_'))
+        }
+        _ => false,
+    };
+    matched.then_some(has_alt)
+}
+
+/// Splits `bytes` before the earliest detach sequence for `key`, skipping
+/// `Alt` pass-through sequences so `\x1b<ctrl>` is never mistaken for detach.
+fn split_at_detach_for(bytes: &[u8], key: DetachKey) -> (&[u8], Option<&[u8]>) {
+    let mut offset = 0;
+    while let Some((rel, len, action)) = find_next_key_action(&bytes[offset..], key) {
+        let pos = offset + rel;
+        match action {
+            KeyAction::Detach => return (&bytes[..pos], Some(&bytes[pos + len..])),
+            KeyAction::PassThrough(_) | KeyAction::Ignore => offset = pos + len,
+        }
+    }
+    (bytes, None)
+}
+
+fn contains_detach_for(bytes: &[u8], key: DetachKey) -> bool {
+    split_at_detach_for(bytes, key).1.is_some()
+}
+
+#[cfg(test)]
+fn split_at_detach(bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
+    split_at_detach_for(bytes, DetachKey::default())
+}
+
+#[cfg(test)]
 fn contains_detach(bytes: &[u8]) -> bool {
-    split_at_detach(bytes).1.is_some()
+    contains_detach_for(bytes, DetachKey::default())
 }
 
 const PALETTE_LEN: usize = 256;
@@ -1358,7 +1635,7 @@ fn csi_open(rest: &[u8]) -> bool {
         [] => true,
         [b'?' | b'>', params @ ..] => params
             .iter()
-            .all(|&b| b.is_ascii_digit() || b == b';' || b == b':'),
+            .all(|&b| b.is_ascii_digit() || b == b';' || b == b':' || b == b'$'),
         _ => false,
     }
 }
@@ -1398,8 +1675,14 @@ fn csi_reply_end(slice: &[u8]) -> Option<usize> {
         .iter()
         .position(|&b| !b.is_ascii_digit() && b != b';' && b != b':')?;
     let final_byte = params[end];
-    if final_byte == b'c' || (prefix == b'?' && final_byte == b'n' && params.starts_with(b"997;")) {
+    if final_byte == b'c'
+        || (prefix == b'?' && final_byte == b'n' && params.starts_with(b"997;"))
+        || (prefix == b'?' && final_byte == b'u')
+    {
         return Some(2 + 1 + end + 1);
+    }
+    if prefix == b'?' && final_byte == b'$' && params.get(end + 1) == Some(&b'y') {
+        return Some(2 + 1 + end + 2);
     }
     None
 }
@@ -1805,10 +2088,10 @@ impl InputReader {
         self.rx.is_empty()
     }
 
-    fn drain_detach(&mut self) -> bool {
+    fn drain_detach(&mut self, detach_key: DetachKey) -> bool {
         let mut saw_detach = false;
         while let Some(bytes) = self.try_recv() {
-            if contains_detach(&bytes) {
+            if contains_detach_for(&bytes, detach_key) {
                 saw_detach = true;
             }
         }
@@ -1827,9 +2110,9 @@ impl InputReader {
     /// Stops the background reader thread so it cannot steal subsequent keys
     /// from the picker, and reports whether any already-queued chunks carried a
     /// second detach key.
-    fn stop_and_drain_detach(&mut self) -> bool {
+    fn stop_and_drain_detach(&mut self, detach_key: DetachKey) -> bool {
         self.stop();
-        self.drain_detach()
+        self.drain_detach(detach_key)
     }
 }
 
@@ -1916,9 +2199,9 @@ async fn recover(
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
                     Some(bytes) = input.recv() => {
-                        if let Some(tail) = split_at_detach(&bytes).1 {
+                        if let Some(tail) = split_at_detach_for(&bytes, attached.detach_key).1 {
                             return Ok(Recovered::Detach {
-                                double: contains_detach(tail),
+                                double: contains_detach_for(tail, attached.detach_key),
                             });
                         }
                     }
@@ -2047,6 +2330,7 @@ struct ProbeOutcome {
     theme: Theme,
     tail: Vec<u8>,
     da1_seen: bool,
+    replied: bool,
 }
 
 fn drain_ready_input(fd: i32, input: &mut impl Read, chunk: &mut [u8]) {
@@ -2137,16 +2421,92 @@ fn probe_theme_with(
     }
 
     let tail = reply_tail(&buf).map_or_else(Vec::new, |start| buf[start..].to_vec());
+    let replied = !buf.is_empty();
     ProbeOutcome {
         theme: parse_theme_reply(&buf),
         tail,
         da1_seen: all_da1_seen,
+        replied,
     }
+}
+
+fn has_dsr_reply(bytes: &[u8]) -> bool {
+    bytes
+        .windows(DSR_STATUS_REPLY.len())
+        .any(|window| window == DSR_STATUS_REPLY)
+}
+
+/// Writes `RESET_MODES` and, when `wait_for_dsr` is true, sends a DSR status
+/// query (`CSI 5 n`) and drains stdin while raw mode is still active until the
+/// terminal replies `CSI 0 n` (or the deadline expires). This ensures any
+/// in-flight OSC/DA1 replies over SSH arrive and are discarded before cooked
+/// mode or the picker resumes. Returns true if the drained bytes contained the
+/// configured detach key (fast double-detach).
+fn drain_after_reset_with(
+    out: &mut impl Write,
+    input: &mut (impl Read + AsRawFd),
+    detach_key: DetachKey,
+    wait_for_dsr: bool,
+    idle_timeout: Duration,
+    max_timeout: Duration,
+) -> Result<bool> {
+    out.write_all(RESET_MODES)?;
+    if !wait_for_dsr {
+        out.flush()?;
+        return Ok(false);
+    }
+    out.write_all(DSR_STATUS_QUERY)?;
+    out.flush()?;
+
+    let fd = input.as_raw_fd();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut deadline = ProbeDeadline::new(idle_timeout, max_timeout);
+
+    while !has_dsr_reply(&buf) {
+        let Some(remaining) = deadline.remaining() else {
+            break;
+        };
+        let timeout_ms = (remaining.as_millis() as i32).max(1);
+        let mut pfd = libc_pollfd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { poll(&mut pfd, 1, timeout_ms) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 {
+            break;
+        }
+        match input.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                deadline.bump();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    let saw_detach = if detach_key == DetachKey::Ctrl(0x07) {
+        let (_, typed) = split_replies(&buf);
+        contains_detach_for(&typed, detach_key)
+    } else {
+        contains_detach_for(&buf, detach_key)
+    };
+    Ok(saw_detach)
 }
 
 struct Screen {
     stdout: std::io::Stdout,
     entered: bool,
+    host_replied: bool,
     terminal_mode: TerminalMode,
 }
 
@@ -2162,6 +2522,7 @@ impl Screen {
         Ok(Self {
             stdout,
             entered: true,
+            host_replied: false,
             terminal_mode,
         })
     }
@@ -2169,19 +2530,42 @@ impl Screen {
     /// Returns the theme and any unfinished reply state if the probe timed out.
     fn probe_theme(&mut self) -> ProbeOutcome {
         let mut stdin = std::io::stdin();
-        probe_theme_with(
+        let outcome = probe_theme_with(
             &mut self.stdout,
             &mut stdin,
             THEME_PROBE_IDLE,
             THEME_PROBE_MAX,
-        )
+        );
+        self.host_replied |= outcome.replied;
+        outcome
     }
 
     fn out(&mut self) -> &mut std::io::Stdout {
         &mut self.stdout
     }
 
-    fn leave(&mut self) -> Result<()> {
+    fn leave_and_drain(&mut self, detach_key: DetachKey, host_replied: bool) -> Result<bool> {
+        if !self.entered {
+            return Ok(false);
+        }
+        self.entered = false;
+        let wait_for_dsr = self.host_replied || host_replied;
+        let mut stdin = std::io::stdin();
+        let saw_detach = drain_after_reset_with(
+            &mut self.stdout,
+            &mut stdin,
+            detach_key,
+            wait_for_dsr,
+            DETACH_DRAIN_IDLE,
+            DETACH_DRAIN_MAX,
+        )?;
+        if self.terminal_mode == TerminalMode::RestoreOnLeave {
+            disable_raw_mode()?;
+        }
+        Ok(saw_detach)
+    }
+
+    fn leave_immediate(&mut self) -> Result<()> {
         if !self.entered {
             return Ok(());
         }
@@ -2197,7 +2581,7 @@ impl Screen {
 
 impl Drop for Screen {
     fn drop(&mut self) {
-        let _ = self.leave();
+        let _ = self.leave_immediate();
     }
 }
 
@@ -2233,13 +2617,15 @@ fn has_da1_reply(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attached, BlockSelection, Ending, Flow, InflightWrite, InputReader, PALETTE_BATCH,
-        PALETTE_LEN, REPLY_FRAGMENT_HOLD, REPLY_HOLD, RETRY_FIRST, RETRY_MAX, Replies, Theme,
-        WATCH_SCHEME, backoff, closed_block, contains_detach, detach, finish_write, has_da1_reply,
-        parse_theme_reply, probe_theme_with, read_chunks_with_limits, reports_scheme,
-        split_at_detach, split_replies, take_utf8, take_write_chunk, theme_query_batches,
-        transient, write_target_gone,
+        Attached, BlockSelection, DSR_STATUS_QUERY, DSR_STATUS_REPLY, Ending, Flow, InflightWrite,
+        InputReader, KeyAction, PALETTE_BATCH, PALETTE_LEN, REPLY_FRAGMENT_HOLD, REPLY_HOLD,
+        RESET_MODES, RETRY_FIRST, RETRY_MAX, Replies, Theme, WATCH_SCHEME, backoff, closed_block,
+        contains_detach, contains_detach_for, detach, drain_after_reset_with, find_next_key_action,
+        finish_write, has_da1_reply, parse_theme_reply, probe_theme_with, read_chunks_with_limits,
+        reports_scheme, split_at_detach, split_at_detach_for, split_replies, take_utf8,
+        take_write_chunk, theme_query_batches, transient, write_target_gone,
     };
+    use crate::config::DetachKey;
     use crate::rex::BlockRef;
     use crate::rex::control::{CallTimeout, Control};
     use crate::rex::data::StreamClosed;
@@ -2339,7 +2725,7 @@ mod tests {
         while reader.is_empty() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(reader.stop_and_drain_detach());
+        assert!(reader.stop_and_drain_detach(DetachKey::default()));
 
         // Bytes written after stop() stay in the pipe for the next reader (e.g. picker).
         input_wr.write_all(b"\x1cnext").unwrap();
@@ -4359,5 +4745,228 @@ mod tests {
         detach(&mut ctrl, &mut attached).await;
         let (writes, _) = server.await.unwrap();
         assert_eq!(writes.concat(), "ok");
+    }
+
+    #[test]
+    fn recognizes_custom_detach_keys_and_alt_passthrough_sequences() {
+        let default_key = DetachKey::default();
+        // Legacy, Kitty CSI-u, and xterm modifyOtherKeys Alt-Ctrl-\ map to PassThrough(0x1c)
+        // and are never misclassified as detach.
+        for seq in [
+            b"\x1b\x1c".as_slice(),
+            b"\x1b[92;7u".as_slice(),
+            b"\x1b[92;7:1u".as_slice(),
+            b"\x1b[92;7:2u".as_slice(),
+            b"\x1b[92:124;7u".as_slice(),
+            b"\x1b[27;7;92~".as_slice(),
+        ] {
+            assert_eq!(
+                find_next_key_action(seq, default_key),
+                Some((0, seq.len(), KeyAction::PassThrough(0x1c))),
+                "expected pass-through for {seq:?}"
+            );
+            assert!(!contains_detach_for(seq, default_key));
+        }
+        // Kitty release event for Alt-Ctrl-\ is consumed without forwarding.
+        assert_eq!(
+            find_next_key_action(b"\x1b[92;7:3u", default_key),
+            Some((0, 9, KeyAction::Ignore))
+        );
+        // Kitty release event for Ctrl-\ does not detach.
+        assert_eq!(find_next_key_action(b"\x1b[92;5:3u", default_key), None);
+        // Detach followed by Alt-Ctrl-\ is not a double-detach.
+        assert_eq!(
+            split_at_detach_for(b"\x1c\x1b\x1c", default_key),
+            (b"".as_slice(), Some(b"\x1b\x1c".as_slice()))
+        );
+        assert!(!contains_detach_for(b"\x1b\x1c", default_key));
+
+        // Custom detach key: Ctrl-] (0x1d). Ctrl-\ passes untouched.
+        let ctrl_rbracket = DetachKey::Ctrl(0x1d);
+        assert_eq!(find_next_key_action(b"\x1c", ctrl_rbracket), None);
+        assert_eq!(
+            find_next_key_action(b"\x1d", ctrl_rbracket),
+            Some((0, 1, KeyAction::Detach))
+        );
+        assert_eq!(
+            find_next_key_action(b"\x1b[93;5u", ctrl_rbracket),
+            Some((0, 7, KeyAction::Detach))
+        );
+        assert_eq!(
+            find_next_key_action(b"\x1b\x1d", ctrl_rbracket),
+            Some((0, 2, KeyAction::PassThrough(0x1d)))
+        );
+        assert_eq!(
+            find_next_key_action(b"\x1b[93;7u", ctrl_rbracket),
+            Some((0, 7, KeyAction::PassThrough(0x1d)))
+        );
+        assert_eq!(
+            find_next_key_action(b"\x1b[27;7;93~", ctrl_rbracket),
+            Some((0, 10, KeyAction::PassThrough(0x1d)))
+        );
+
+        // Shifted symbol detach keys like Ctrl-^ (0x1e) match both Ctrl-^ and Ctrl-Shift-6.
+        let ctrl_caret = DetachKey::Ctrl(0x1e);
+        assert_eq!(
+            find_next_key_action(b"\x1b[54:94;6u", ctrl_caret),
+            Some((0, 10, KeyAction::Detach))
+        );
+        assert_eq!(
+            find_next_key_action(b"\x1b[54:94;8u", ctrl_caret),
+            Some((0, 10, KeyAction::PassThrough(0x1e)))
+        );
+
+        // DetachKey::None disables both detach and Alt pass-through.
+        assert_eq!(find_next_key_action(b"\x1c\x1b\x1c", DetachKey::None), None);
+    }
+
+    #[tokio::test]
+    async fn forwards_literal_ctrl_backslash_on_alt_ctrl_backslash_and_respects_custom_key() {
+        let (addr, server) = spawn_simple_attach_server().await;
+        let address = addr.parse().unwrap();
+        let (mut ctrl, _events) = Control::connect(&address, None).await.unwrap();
+        let mut attached = Attached::start(
+            &mut ctrl,
+            "session:1",
+            &address,
+            BlockSelection::Selectors(None, None),
+            (80, 24),
+            Theme::default(),
+        )
+        .await
+        .unwrap();
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut input = InputReader::from_channel(rx);
+
+        // Legacy Alt-Ctrl-\, Kitty Alt-Ctrl-\ (press + release), and xterm modifyOtherKeys
+        // all forward a single literal 0x1c each without detaching.
+        let flow = attached
+            .burst(
+                b"a\x1b\x1cb\x1b[92;7:1u\x1b[92;7:3uc\x1b[27;7;92~d",
+                &mut input,
+                &mut ctrl,
+            )
+            .await
+            .unwrap();
+        assert_eq!(flow, Flow::Continue);
+
+        // With detach_key = ctrl-], raw Ctrl-\ passes straight through to the remote block.
+        attached.detach_key = DetachKey::Ctrl(0x1d);
+        let flow = attached
+            .burst(b"\x1c", &mut input, &mut ctrl)
+            .await
+            .unwrap();
+        assert_eq!(flow, Flow::Continue);
+
+        // With detach_key = ctrl-g (BEL), BEL-terminated OSC replies are still stripped
+        // instead of falsely detaching.
+        attached.detach_key = DetachKey::Ctrl(0x07);
+        let flow = attached
+            .burst(b"\x1b]4;0;rgb:0000/0000/0000\x07ok", &mut input, &mut ctrl)
+            .await
+            .unwrap();
+        assert_eq!(flow, Flow::Continue);
+
+        // Alt-Ctrl-G followed by Ctrl-G forwards 0x07 and detaches.
+        let flow = attached
+            .burst(b"\x1b\x07\x07", &mut input, &mut ctrl)
+            .await
+            .unwrap();
+        assert_eq!(flow, Flow::Detach { double: false });
+
+        detach(&mut ctrl, &mut attached).await;
+        let (writes, _) = server.await.unwrap();
+        assert_eq!(writes.concat(), "a\x1cb\x1cc\x1cd\x1cok\x07");
+    }
+
+    #[test]
+    fn reset_modes_clears_kitty_keyboard_on_both_screens_and_foot_modes() {
+        let reset = std::str::from_utf8(RESET_MODES).unwrap();
+        assert!(reset.starts_with('\x18'));
+        assert!(reset.contains("\x1b[?2048l"));
+        assert!(reset.contains("\x1b[?1016l"));
+        assert!(reset.contains("\x1b[?1049l\x1b[?1047l\x1b[?47l"));
+
+        let leave_alt = reset.find("\x1b[?1049l").unwrap();
+        let first_kitty = reset.find("\x1b[<99u\x1b[=0u").unwrap();
+        let last_kitty = reset.rfind("\x1b[<99u\x1b[=0u").unwrap();
+        assert!(first_kitty < leave_alt);
+        assert!(last_kitty > leave_alt);
+    }
+
+    #[test]
+    fn strips_decrpm_and_kitty_keyboard_query_replies() {
+        let mixed = b"hi\x1b[?2026;2$y\x1b[?0u!";
+        let (replies, typed) = split_replies(mixed);
+        assert_eq!(replies, b"\x1b[?2026;2$y\x1b[?0u");
+        assert_eq!(typed, b"hi!");
+
+        let mut stateful = Replies::default();
+        let (r1, t1) = stateful.push(b"\x1b[?2026;2$");
+        assert!(r1.is_empty());
+        assert!(t1.is_empty());
+        let (r2, t2) = stateful.push(b"yok");
+        assert_eq!(r2, b"\x1b[?2026;2$y");
+        assert_eq!(t2, b"ok");
+    }
+
+    #[test]
+    fn drain_after_reset_consumes_inflight_osc_and_stale_da1_until_dsr_reply() {
+        use std::io::{Read, Write};
+
+        let (mut query_rd, mut query_wr) = std::io::pipe().unwrap();
+        let (mut reply_rd, mut reply_wr) = std::io::pipe().unwrap();
+
+        let terminal = std::thread::spawn(move || {
+            let mut expected = Vec::new();
+            expected.extend_from_slice(RESET_MODES);
+            expected.extend_from_slice(DSR_STATUS_QUERY);
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while got.len() < expected.len() {
+                let n = query_rd.read(&mut buf).unwrap();
+                assert!(n > 0);
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expected);
+
+            // Simulate delayed SSH OSC 4 + stale DA1 from an earlier probe arriving
+            // before the DSR 5 sentinel reply, plus a queued second Ctrl-\.
+            reply_wr
+                .write_all(b"\x1b]4;12;rgb:1111/2222/3333\x1b\\\x1b[?62;22c")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            reply_wr.write_all(b"\x1c").unwrap();
+            reply_wr.write_all(DSR_STATUS_REPLY).unwrap();
+        });
+
+        let saw_detach = drain_after_reset_with(
+            &mut query_wr,
+            &mut reply_rd,
+            DetachKey::default(),
+            true,
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        terminal.join().unwrap();
+        assert!(saw_detach);
+
+        // When wait_for_dsr is false (e.g. terminal never answered queries), only RESET_MODES
+        // is written and drain returns immediately without sending CSI 5 n.
+        let mut out = Vec::new();
+        let (mut dummy_rd, _dummy_wr) = std::io::pipe().unwrap();
+        let saw_detach = drain_after_reset_with(
+            &mut out,
+            &mut dummy_rd,
+            DetachKey::default(),
+            false,
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(!saw_detach);
+        assert_eq!(out, RESET_MODES);
     }
 }

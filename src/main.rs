@@ -15,7 +15,7 @@ use futures_util::future::join_all;
 use serde_json::Value;
 use tokio::time::{Instant, timeout, timeout_at};
 
-use crate::config::{DISCOVERY_TIME, Server, ServerConfig};
+use crate::config::{DISCOVERY_TIME, DetachKey, Server, ServerConfig};
 use crate::discovery::{LocalDiscovery, NO_SERVER_FOUND, fan_out, probe_local};
 use crate::rex::control::Control;
 use crate::rex::{BlockRef, ServerAddress};
@@ -26,8 +26,8 @@ zrex: use a session on a Rex server from a terminal
 
 Usage:
   zrex [--server SERVER] ls
-  zrex [--server SERVER] p|pick
-  zrex [--server SERVER] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
+  zrex [--server SERVER] [--detach-key KEY] p|pick
+  zrex [--server SERVER] [--detach-key KEY] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
   zrex [--server SERVER] kill SESSION
   zrex completion zsh|bash|fish
   zrex --help | --version
@@ -58,14 +58,20 @@ labels, window numbers and labels, and block numbers and labels. pick (or p)
 fuzzy-searches existing sessions, windows, and splits on the default (when
 running) and saved servers (~/.config/zrex/config.toml, or
 $XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that server.
-Enter attaches, Ctrl-N creates a new session, Ctrl-T creates a new window in a
-session, Ctrl-R renames a session, window, or block, Ctrl-K kills a session,
-window, or block, and Esc, Ctrl-C, or Ctrl-backslash quits. Detaching from a
-session attached via the picker returns to the picker, so pressing Ctrl-backslash
-twice detaches all the way back to your shell.
+Enter attaches, Ctrl-G toggles the agents view, Ctrl-N creates a new session,
+Ctrl-T creates a new window in a session, Ctrl-R renames a session, window, or
+block, Ctrl-K kills a session, window, or block, and Esc, Ctrl-C, or
+Ctrl-backslash quits. Detaching from a session attached via the picker returns
+to the picker (staying on the agents view if you attached from it), so pressing
+Ctrl-backslash twice detaches all the way back to your shell.
 
 While attached:
   Ctrl-backslash          detach, and leave the session running (returns to picker if launched from it)
+  Alt-Ctrl-backslash      send a literal Ctrl-backslash to the remote block (for nested zrex)
+
+Use --detach-key (-d), ZREX_DETACH_KEY, or detach_key in config.toml to change
+the detach key (for example ctrl-] or none). When changed, Alt with that key
+forwards the literal control byte to the remote block.
 
 Terminal output streams directly to your terminal, so your terminal's own
 scrollback, mouse selection, and clipboard work as they always do.";
@@ -75,11 +81,14 @@ enum Command {
     Help,
     Version,
     List,
-    Pick,
+    Pick {
+        detach_key: Option<String>,
+    },
     Attach {
         target: Option<String>,
         window: Option<String>,
         block: Option<String>,
+        detach_key: Option<String>,
     },
     Kill {
         target: String,
@@ -145,6 +154,7 @@ enum ValueOption {
     Server,
     Window,
     Block,
+    DetachKey,
 }
 
 #[derive(Default)]
@@ -154,6 +164,7 @@ struct Arguments {
     target: Option<String>,
     window: Option<String>,
     block: Option<String>,
+    detach_key: Option<String>,
     pending: Option<ValueOption>,
     early_command: Option<Command>,
 }
@@ -169,6 +180,7 @@ impl Arguments {
                     ValueOption::Server => &mut parsed.server,
                     ValueOption::Window => &mut parsed.window,
                     ValueOption::Block => &mut parsed.block,
+                    ValueOption::DetachKey => &mut parsed.detach_key,
                 };
                 *slot = Some(arg);
                 continue;
@@ -179,6 +191,7 @@ impl Arguments {
                 "-S" | "--server" => parsed.pending = Some(ValueOption::Server),
                 "-w" | "--window" => parsed.pending = Some(ValueOption::Window),
                 "-b" | "--block" => parsed.pending = Some(ValueOption::Block),
+                "-d" | "--detach-key" => parsed.pending = Some(ValueOption::DetachKey),
                 _ if parsed.command.is_none() => parsed.command = Some(arg),
                 _ if parsed.target.is_none() => parsed.target = Some(arg),
                 _ => anyhow::bail!("unexpected argument {arg}"),
@@ -201,6 +214,7 @@ fn parse_args(
         target,
         window,
         block,
+        detach_key,
         pending,
         early_command,
     } = Arguments::scan(args)?;
@@ -214,29 +228,33 @@ fn parse_args(
         Some(ValueOption::Block) => {
             anyhow::bail!("--block needs a block number, a label, or an ID")
         }
+        Some(ValueOption::DetachKey) => {
+            anyhow::bail!("--detach-key needs a key such as ctrl-\\, ctrl-], or none")
+        }
         None => {}
     }
     let cmd = match command.as_deref() {
         Some(name) => match Subcommand::parse(name) {
             Some(Subcommand::List) => {
-                if target.is_some() || window.is_some() || block.is_some() {
+                if target.is_some() || window.is_some() || block.is_some() || detach_key.is_some() {
                     anyhow::bail!("usage: zrex [--server SERVER] ls");
                 }
                 Command::List
             }
             Some(Subcommand::Pick) => {
                 if target.is_some() || window.is_some() || block.is_some() {
-                    anyhow::bail!("usage: zrex [--server SERVER] p|pick");
+                    anyhow::bail!("usage: zrex [--server SERVER] [--detach-key KEY] p|pick");
                 }
-                Command::Pick
+                Command::Pick { detach_key }
             }
             Some(Subcommand::Attach) => Command::Attach {
                 target,
                 window,
                 block,
+                detach_key,
             },
             Some(Subcommand::Kill) => {
-                if window.is_some() || block.is_some() {
+                if window.is_some() || block.is_some() || detach_key.is_some() {
                     anyhow::bail!("usage: zrex [--server SERVER] kill SESSION");
                 }
                 match target {
@@ -245,7 +263,7 @@ fn parse_args(
                 }
             }
             Some(Subcommand::Completion) => {
-                if window.is_some() || block.is_some() {
+                if window.is_some() || block.is_some() || detach_key.is_some() {
                     anyhow::bail!("usage: zrex completion zsh|bash|fish");
                 }
                 match target.as_deref() {
@@ -290,12 +308,25 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::List => list(&server_config).await,
-        Command::Pick => picker::run(&server_config).await,
+        Command::Pick { detach_key } => {
+            let detach_key = config::resolve_detach_key(
+                detach_key.as_deref(),
+                env::var("ZREX_DETACH_KEY").ok().as_deref(),
+            )?;
+            picker::run(&server_config, detach_key).await
+        }
         Command::Attach {
             target,
             window,
             block,
-        } => app::attach(&server_config, target, window, block).await,
+            detach_key,
+        } => {
+            let detach_key = config::resolve_detach_key(
+                detach_key.as_deref(),
+                env::var("ZREX_DETACH_KEY").ok().as_deref(),
+            )?;
+            app::attach(&server_config, target, window, block, detach_key).await
+        }
         Command::Kill { target } => kill(&server_config, &target).await,
         Command::Completion(shell) => {
             print!("{}", shell.script());
@@ -603,9 +634,11 @@ enum Completion {
     Commands,
     Shells,
     Servers,
+    DetachKeys,
     Sessions,
     Flags {
         attach: bool,
+        detach_key: bool,
     },
     Windows {
         session: Option<String>,
@@ -623,6 +656,7 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
     }
     match parsed.pending {
         Some(ValueOption::Server) => return Completion::Servers,
+        Some(ValueOption::DetachKey) => return Completion::DetachKeys,
         Some(ValueOption::Window) => {
             return Completion::Windows {
                 session: parsed.target.clone(),
@@ -638,8 +672,12 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
     }
     let subcommand = parsed.command.as_deref().map(Subcommand::parse);
     let attach = matches!(subcommand, Some(Some(Subcommand::Attach)));
+    let detach_key = matches!(
+        subcommand,
+        None | Some(Some(Subcommand::Attach | Subcommand::Pick))
+    );
     if current.starts_with('-') {
-        return Completion::Flags { attach };
+        return Completion::Flags { attach, detach_key };
     }
     match subcommand {
         None => Completion::Commands,
@@ -647,10 +685,20 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
         Some(Some(Subcommand::Attach | Subcommand::Kill)) if parsed.target.is_none() => {
             Completion::Sessions
         }
-        Some(Some(Subcommand::Attach)) => Completion::Flags { attach: true },
-        Some(Some(
-            Subcommand::Kill | Subcommand::List | Subcommand::Pick | Subcommand::Completion,
-        )) => Completion::Flags { attach: false },
+        Some(Some(Subcommand::Attach)) => Completion::Flags {
+            attach: true,
+            detach_key: true,
+        },
+        Some(Some(Subcommand::Pick)) => Completion::Flags {
+            attach: false,
+            detach_key: true,
+        },
+        Some(Some(Subcommand::Kill | Subcommand::List | Subcommand::Completion)) => {
+            Completion::Flags {
+                attach: false,
+                detach_key: false,
+            }
+        }
         Some(None) => Completion::Nothing,
     }
 }
@@ -671,7 +719,11 @@ async fn complete(mut args: impl Iterator<Item = String>) {
             .collect(),
         Completion::Shells => Shell::NAMES.into_iter().map(str::to_owned).collect(),
         Completion::Servers => server_candidates().await,
-        Completion::Flags { attach } => flags(attach),
+        Completion::DetachKeys => DetachKey::COMPLETION_CANDIDATES
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        Completion::Flags { attach, detach_key } => flags(attach, detach_key),
         context => {
             let server_config =
                 ServerConfig::from_sources(parsed.server, env::var("REX_SERVER").ok());
@@ -717,11 +769,14 @@ fn filter_completion_candidates(candidates: Vec<String>, current: &str) -> Vec<S
         .collect()
 }
 
-fn flags(attach: bool) -> Vec<String> {
+fn flags(attach: bool, detach_key: bool) -> Vec<String> {
     let mut flags: Vec<String> = ["-S", "--server", "-h", "--help", "-V", "--version"]
         .into_iter()
         .map(str::to_owned)
         .collect();
+    if detach_key {
+        flags.extend(["-d", "--detach-key"].map(str::to_owned));
+    }
     if attach {
         flags.extend(["-w", "--window", "-b", "--block"].map(str::to_owned));
     }
@@ -865,18 +920,20 @@ mod tests {
                 parse_args(args(&[subcommand]), env.clone()).unwrap(),
                 (
                     ServerConfig::Env("https://default.example".to_owned()),
-                    Command::Pick
+                    Command::Pick { detach_key: None }
                 )
             );
             assert_eq!(
                 parse_args(
-                    args(&[subcommand, "-S", "https://only.example"]),
+                    args(&[subcommand, "-S", "https://only.example", "-d", "ctrl-]"]),
                     env.clone()
                 )
                 .unwrap(),
                 (
                     ServerConfig::Explicit("https://only.example".to_owned()),
-                    Command::Pick
+                    Command::Pick {
+                        detach_key: Some("ctrl-]".to_owned())
+                    }
                 )
             );
             assert!(parse_args(args(&[subcommand, "--window", "1"]), None).is_err());
@@ -935,11 +992,21 @@ mod tests {
                 target: Some("work".to_owned()),
                 window: Some("1.2".to_owned()),
                 block: None,
+                detach_key: None,
             }
         );
 
         let (_, cmd) = parse_args(
-            args(&["attach", "work", "--window", "1", "--block", "2"]),
+            args(&[
+                "attach",
+                "work",
+                "--window",
+                "1",
+                "--block",
+                "2",
+                "--detach-key",
+                "none",
+            ]),
             None,
         )
         .unwrap();
@@ -949,6 +1016,7 @@ mod tests {
                 target: Some("work".to_owned()),
                 window: Some("1".to_owned()),
                 block: Some("2".to_owned()),
+                detach_key: Some("none".to_owned()),
             }
         );
 
@@ -963,7 +1031,10 @@ mod tests {
         );
 
         assert!(parse_args(args(&["kill"]), None).is_err());
+        assert!(parse_args(args(&["kill", "work", "--detach-key", "ctrl-]"]), None).is_err());
+        assert!(parse_args(args(&["ls", "-d", "ctrl-]"]), None).is_err());
         assert!(parse_args(args(&["-S"]), None).is_err());
+        assert!(parse_args(args(&["-d"]), None).is_err());
         assert!(parse_args(args(&["-w"]), None).is_err());
         assert!(parse_args(args(&["-b"]), None).is_err());
         assert!(parse_args(args(&["a", "one", "two"]), None).is_err());
@@ -1088,19 +1159,31 @@ mod tests {
         );
         assert_eq!(
             completion_context("--w", &args(&["a", "work"])),
-            Completion::Flags { attach: true }
+            Completion::Flags {
+                attach: true,
+                detach_key: true
+            }
         );
         assert_eq!(
             completion_context("--server", &[]),
-            Completion::Flags { attach: false }
+            Completion::Flags {
+                attach: false,
+                detach_key: true
+            }
         );
         assert_eq!(
             completion_context("-", &[]),
-            Completion::Flags { attach: false }
+            Completion::Flags {
+                attach: false,
+                detach_key: true
+            }
         );
         assert_eq!(
             completion_context("-", &args(&["a"])),
-            Completion::Flags { attach: true }
+            Completion::Flags {
+                attach: true,
+                detach_key: true
+            }
         );
         assert_eq!(
             completion_context("-", &args(&["a", "work", "-w"])),
@@ -1118,7 +1201,10 @@ mod tests {
         );
         assert_eq!(
             completion_context("", &args(&["completion", "zsh"])),
-            Completion::Flags { attach: false }
+            Completion::Flags {
+                attach: false,
+                detach_key: false
+            }
         );
         assert_eq!(
             completion_context("", &args(&["--server", "http://example.com"])),
@@ -1138,12 +1224,26 @@ mod tests {
             Completion::Servers
         );
         assert_eq!(
+            completion_context("", &args(&["--detach-key"])),
+            Completion::DetachKeys
+        );
+        assert_eq!(
+            completion_context("", &args(&["a", "-d"])),
+            Completion::DetachKeys
+        );
+        assert_eq!(
             completion_context("", &args(&["p"])),
-            Completion::Flags { attach: false }
+            Completion::Flags {
+                attach: false,
+                detach_key: true
+            }
         );
         assert_eq!(
             completion_context("", &args(&["pick"])),
-            Completion::Flags { attach: false }
+            Completion::Flags {
+                attach: false,
+                detach_key: true
+            }
         );
         assert!(Subcommand::COMPLETION_NAMES.contains(&"p"));
         assert!(Subcommand::COMPLETION_NAMES.contains(&"pick"));

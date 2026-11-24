@@ -11,7 +11,7 @@ use tokio::time::{Duration, Instant, timeout_at};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app;
-use crate::config::{self, DISCOVERY_TIME, Server, ServerConfig};
+use crate::config::{self, DISCOVERY_TIME, DetachKey, Server, ServerConfig};
 use crate::discovery::{LocalDiscovery, NO_SERVER_FOUND, fan_out, probe_local};
 use crate::rex::{BlockRef, ServerAddress, control::Control, proto::ApiError};
 use crate::session;
@@ -416,14 +416,20 @@ fn classify_attach_result(
 async fn execute_attach(
     outcome: &DiscoveryOutcome,
     selection: prompt::AttachSelection,
+    detach_key: DetachKey,
 ) -> (&'static str, String, Result<app::AttachExit>) {
     match selection {
         prompt::AttachSelection::Existing(index) => {
             let target = &outcome.choices[index];
             let server = &outcome.servers[target.server_index];
             let name = clean_one_line(&server.name);
-            let res =
-                app::attach_existing(&server.address, &target.session_id, &target.block_id).await;
+            let res = app::attach_existing(
+                &server.address,
+                &target.session_id,
+                &target.block_id,
+                detach_key,
+            )
+            .await;
             ("Attach failed", name, res)
         }
         prompt::AttachSelection::NewSession {
@@ -432,7 +438,7 @@ async fn execute_attach(
         } => {
             let server = &outcome.servers[server_index];
             let name = clean_one_line(&server.name);
-            let res = app::attach_new_session(&server.address, label.as_deref()).await;
+            let res = app::attach_new_session(&server.address, label.as_deref(), detach_key).await;
             ("Create session failed", name, res)
         }
         prompt::AttachSelection::NewWindow {
@@ -442,9 +448,13 @@ async fn execute_attach(
             let session = &outcome.sessions[session_index];
             let server = &outcome.servers[session.server_index];
             let name = clean_one_line(&server.name);
-            let res =
-                app::attach_new_window(&server.address, &session.session_id, label.as_deref())
-                    .await;
+            let res = app::attach_new_window(
+                &server.address,
+                &session.session_id,
+                label.as_deref(),
+                detach_key,
+            )
+            .await;
             ("Create window failed", name, res)
         }
     }
@@ -522,7 +532,7 @@ fn apply_refresh_outcome(
     );
 }
 
-pub async fn run(server_config: &ServerConfig) -> Result<()> {
+pub async fn run(server_config: &ServerConfig, detach_key: DetachKey) -> Result<()> {
     app::ensure_terminal()?;
     let loaded = load_servers(server_config).await?;
     let mut outcome = start_refresh(&loaded).await;
@@ -555,6 +565,7 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
         outcome.sessions.clone(),
         server_names,
     );
+    state.set_detach_key(detach_key);
     if let Some(feedback) = initial_feedback {
         state.set_feedback(feedback);
     }
@@ -587,11 +598,12 @@ pub async fn run(server_config: &ServerConfig) -> Result<()> {
             prompt::StepEvent::Selected(prompt::Selection::Attach(selection)) => {
                 refresh.clear();
                 drop(screen);
-                let (error_prefix, server_name, result) = execute_attach(&outcome, selection).await;
+                let (error_prefix, server_name, result) =
+                    execute_attach(&outcome, selection, detach_key).await;
                 match classify_attach_result(error_prefix, server_name, result) {
                     PostAttach::Quit => return Ok(()),
                     PostAttach::Return { focus, feedback } => {
-                        if prompt::take_queued_quit_key()? {
+                        if prompt::take_queued_quit_key(detach_key)? {
                             return Ok(());
                         }
                         screen = prompt::Screen::enter(&raw_mode)?;

@@ -20,6 +20,7 @@ use super::{
     ManageScope, ManageTarget, ProgramState, SessionChoice, StyleRole, StyledSpan, Target,
     styled_scope_row, styled_server_row,
 };
+use crate::config::DetachKey;
 use crate::text::truncate_with_ellipsis;
 
 const MIN_INPUT_WIDTH: usize = 12;
@@ -248,6 +249,7 @@ pub(super) struct PickerState {
     feedback: Option<Feedback>,
     pending_focus: Option<FocusTarget>,
     refreshing: bool,
+    detach_key: DetachKey,
 }
 
 impl PickerState {
@@ -272,9 +274,14 @@ impl PickerState {
             feedback: None,
             pending_focus: None,
             refreshing: false,
+            detach_key: DetachKey::default(),
         };
         state.recompute_matches();
         state
+    }
+
+    pub(super) fn set_detach_key(&mut self, detach_key: DetachKey) {
+        self.detach_key = detach_key;
     }
 
     pub(super) fn is_attach_mode(&self) -> bool {
@@ -622,7 +629,7 @@ impl PickerState {
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<Outcome> {
         self.feedback = None;
         self.pending_focus = None;
-        if is_quit_key(code, modifiers) {
+        if is_quit_key(code, modifiers, self.detach_key) {
             return Some(Outcome::Cancel);
         }
         match &mut self.mode {
@@ -1279,23 +1286,48 @@ fn choose_prompt_with_tail<'a>(width: usize, min_tail: usize, candidates: &[&'a 
     if width > 2 { "> " } else { "" }
 }
 
-fn is_quit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    // In raw Unix mode crossterm decodes ASCII 0x1c (Ctrl-\) as Ctrl-4,
-    // while Kitty / modifyOtherKeys sends Ctrl-\ directly.
-    matches!(
-        (code, modifiers),
-        (KeyCode::Char('c' | '\\' | '4'), KeyModifiers::CONTROL)
-    )
+fn is_quit_key(code: KeyCode, modifiers: KeyModifiers, detach_key: DetachKey) -> bool {
+    if !modifiers.contains(KeyModifiers::CONTROL)
+        || modifiers.contains(KeyModifiers::ALT)
+        || modifiers.contains(KeyModifiers::SUPER)
+    {
+        return false;
+    }
+    if matches!(code, KeyCode::Char('c' | 'C')) && !modifiers.contains(KeyModifiers::SHIFT) {
+        return true;
+    }
+    let Some(ctrl_byte) = detach_key.ctrl_byte() else {
+        return false;
+    };
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+    // In raw Unix mode crossterm decodes ASCII 0x1c..=0x1f as Ctrl-4..Ctrl-7,
+    // while Kitty / modifyOtherKeys sends the punctuation key directly.
+    match ctrl_byte {
+        0x00 => matches!(code, KeyCode::Char('@' | ' ' | '2')),
+        0x01..=0x1a => {
+            !shift
+                && matches!(
+                    code,
+                    KeyCode::Char(ch) if ch.to_ascii_lowercase() as u8 == b'a' + ctrl_byte - 1
+                )
+        }
+        0x1c => !shift && matches!(code, KeyCode::Char('\\' | '4')),
+        0x1d => !shift && matches!(code, KeyCode::Char(']' | '5')),
+        0x1e => matches!(code, KeyCode::Char('^' | '6')),
+        0x1f => matches!(code, KeyCode::Char('_' | '7' | '/' | '-')),
+        _ => false,
+    }
 }
 
 /// Drains any input already queued in the terminal buffer (while raw mode is
-/// active) and returns true if a quit key (`Ctrl-\` or `Ctrl-C`) was queued,
-/// enabling instant double-detach without re-entering the alternate screen.
-pub(super) fn take_queued_quit_key() -> io::Result<bool> {
+/// active) and returns true if a quit key (`Ctrl-C` or the configured detach
+/// key) was queued, enabling instant double-detach without re-entering the
+/// alternate screen.
+pub(super) fn take_queued_quit_key(detach_key: DetachKey) -> io::Result<bool> {
     while event::poll(Duration::ZERO)? {
         if let Event::Key(key) = event::read()?
             && key.kind != KeyEventKind::Release
-            && is_quit_key(key.code, key.modifiers)
+            && is_quit_key(key.code, key.modifiers, detach_key)
         {
             return Ok(true);
         }
@@ -2778,5 +2810,61 @@ mod tests {
             },
         );
         assert_eq!(state.view, AttachView::Agents);
+    }
+
+    #[test]
+    fn picker_quit_key_respects_configured_detach_key() {
+        assert!(is_quit_key(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL,
+            DetachKey::default()
+        ));
+        assert!(is_quit_key(
+            KeyCode::Char('4'),
+            KeyModifiers::CONTROL,
+            DetachKey::default()
+        ));
+        assert!(!is_quit_key(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            DetachKey::default()
+        ));
+        assert!(is_quit_key(
+            KeyCode::Char(']'),
+            KeyModifiers::CONTROL,
+            DetachKey::Ctrl(0x1d)
+        ));
+        assert!(is_quit_key(
+            KeyCode::Char('5'),
+            KeyModifiers::CONTROL,
+            DetachKey::Ctrl(0x1d)
+        ));
+        assert!(!is_quit_key(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL,
+            DetachKey::Ctrl(0x1d)
+        ));
+        assert!(!is_quit_key(
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL,
+            DetachKey::None
+        ));
+        assert!(is_quit_key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            DetachKey::None
+        ));
+
+        let (targets, sessions, servers) = sample_fixture();
+        let mut state = PickerState::new(targets, sessions, servers);
+        state.set_detach_key(DetachKey::Ctrl(0x1d));
+        assert_eq!(
+            state.handle_key(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Char(']'), KeyModifiers::CONTROL),
+            Some(Outcome::Cancel)
+        );
     }
 }
