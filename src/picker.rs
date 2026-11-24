@@ -177,6 +177,7 @@ pub(super) struct Target {
     label_parts: TargetLabel,
     title: String,
     status: Option<ProgramStatus>,
+    agent_process: bool,
     pub(super) session_id: String,
 }
 
@@ -1043,19 +1044,21 @@ fn describe_targets(
                     .and_then(|reply| session::live_terminal_title(reply, process.as_ref()))
                     .map_or_else(String::new, |title| clean_truncated(title, 64));
                 let status = status.as_ref().and_then(status_summary);
+                let agent_process = process.as_ref().is_some_and(session::has_agent_process);
                 let process = process.as_ref().and_then(session::process_name);
-                (id, (title, status, process))
+                (id, (title, status, process, agent_process))
             },
         ))
         .await
         .into_iter()
         .collect();
         for target in &mut targets {
-            if let Some((title, status, process)) = details.get(&target.block_id) {
+            if let Some((title, status, process, agent_process)) = details.get(&target.block_id) {
                 target.label = target.label_parts.format(process.as_deref());
                 target.process.clone_from(process);
                 target.title.clone_from(title);
                 target.status.clone_from(status);
+                target.agent_process = *agent_process;
             }
         }
         (index, targets)
@@ -1217,6 +1220,7 @@ impl Target {
             label_parts,
             title: String::new(),
             status: None,
+            agent_process: false,
             session_id: spec.session_id.to_owned(),
         }
     }
@@ -1227,6 +1231,41 @@ impl Target {
             window_id: self.window_id.clone(),
             block_id: self.block_id.clone(),
         }
+    }
+
+    pub(super) fn is_agent(&self) -> bool {
+        self.status.is_some()
+            || self.agent_process
+            || self
+                .process
+                .as_deref()
+                .is_some_and(session::is_known_agent_name)
+    }
+
+    pub(super) fn status_rank(&self) -> u8 {
+        match self.status.as_ref().map(|status| status.state) {
+            Some(ProgramState::Blocked) => 0,
+            Some(ProgramState::Error) => 1,
+            Some(ProgramState::Working) => 2,
+            Some(ProgramState::Done) => 3,
+            Some(ProgramState::Idle) => 4,
+            None => 5,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_status(mut self, state: ProgramState, summary: &str) -> Self {
+        self.status = Some(ProgramStatus {
+            state,
+            summary: summary.to_owned(),
+        });
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_agent_process(mut self, agent_process: bool) -> Self {
+        self.agent_process = agent_process;
+        self
     }
 }
 
@@ -1650,6 +1689,7 @@ pub(super) fn test_target_full(
         },
         title: String::new(),
         status: None,
+        agent_process: false,
         session_id: session_id.to_owned(),
     }
 }
@@ -1689,6 +1729,7 @@ mod tests {
             },
             title: title.to_owned(),
             status,
+            agent_process: false,
             session_id: "session:1".to_owned(),
         }
     }
@@ -3128,5 +3169,53 @@ mod tests {
         apply_refresh_outcome(&mut outcome, &mut state, refreshed);
         assert_eq!(outcome.choices.len(), 2);
         assert_eq!(outcome.sessions.len(), 2);
+    }
+
+    #[test]
+    fn target_agent_classification_and_status_ranking() {
+        let plain = sample_target("[local] work / 1 zsh", "", "");
+        assert!(!plain.is_agent());
+        assert_eq!(plain.status_rank(), 5);
+
+        let by_status = sample_target("[local] work / 1 cargo", "", "working cargo");
+        assert!(by_status.is_agent());
+        assert_eq!(by_status.status_rank(), 2);
+
+        let by_process = test_target_full(
+            0,
+            0,
+            "[local] work / 1 agy",
+            "session:1",
+            "window:1",
+            1,
+            None,
+            1,
+            "block:1",
+            1,
+            None,
+            "shell",
+            Some("agy"),
+        );
+        assert!(by_process.is_agent());
+        assert_eq!(by_process.status_rank(), 5);
+
+        let ranks: Vec<u8> = [
+            Some(ProgramState::Blocked),
+            Some(ProgramState::Error),
+            Some(ProgramState::Working),
+            Some(ProgramState::Done),
+            Some(ProgramState::Idle),
+            None,
+        ]
+        .into_iter()
+        .map(|state| {
+            let mut target = test_target(0, 0, "[local] work / 1 claude", "session:1", "block:1");
+            if let Some(state) = state {
+                target = target.with_status(state, state.label());
+            }
+            target.status_rank()
+        })
+        .collect();
+        assert_eq!(ranks, vec![0, 1, 2, 3, 4, 5]);
     }
 }

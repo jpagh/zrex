@@ -165,6 +165,90 @@ fn basename(value: &str) -> &str {
     trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
 }
 
+pub fn is_known_agent_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower
+        .strip_suffix(".js")
+        .or_else(|| lower.strip_suffix(".mjs"))
+        .or_else(|| lower.strip_suffix(".cjs"))
+        .or_else(|| lower.strip_suffix(".py"))
+        .or_else(|| lower.strip_suffix(".sh"))
+        .unwrap_or(&lower);
+    matches!(
+        stem,
+        "agy"
+            | "antigravity"
+            | "claude"
+            | "claude-code"
+            | "codex"
+            | "gemini"
+            | "opencode"
+            | "aider"
+            | "amp"
+            | "goose"
+            | "copilot"
+            | "pi"
+            | "cursor-agent"
+            | "kiro"
+            | "kiro-cli"
+            | "droid"
+            | "crush"
+            | "cline"
+            | "qwen"
+    )
+}
+
+/// Returns true when the terminal's live process tree includes a known coding
+/// agent (checking `foreground`, `child`, and `ancestors`).
+pub fn has_agent_process(reply: &Value) -> bool {
+    if reply.get("last_exit").is_some_and(|value| !value.is_null()) {
+        return false;
+    }
+    [reply.get("foreground"), reply.get("child")]
+        .into_iter()
+        .flatten()
+        .chain(
+            reply
+                .get("ancestors")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+        .any(process_entry_is_agent)
+}
+
+fn process_entry_is_agent(process: &Value) -> bool {
+    if process.is_null() {
+        return false;
+    }
+    for (key, strip_login_dash) in [
+        ("script", false),
+        ("argv0", true),
+        ("invoked_path", false),
+        ("name", false),
+    ] {
+        let Some(raw) = process.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let cleaned = clean_one_line(raw);
+        let candidate = if strip_login_dash {
+            cleaned.strip_prefix('-').unwrap_or(&cleaned)
+        } else {
+            &cleaned
+        };
+        let base = basename(candidate);
+        let base = if strip_login_dash {
+            base.strip_prefix('-').unwrap_or(base)
+        } else {
+            base
+        };
+        if !base.is_empty() && is_known_agent_name(base) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Derives a pane's display title from its live terminal title, falling back
 /// to the foreground process name (and OSC 7 working directory when a VT
 /// snapshot is available).
@@ -1173,5 +1257,56 @@ mod tests {
             process_pwd_title(Some(&process), Some(b"no osc7")).as_deref(),
             Some("zsh")
         );
+    }
+
+    #[test]
+    fn detects_known_agent_processes_across_fields_and_ancestors() {
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {"pid": 200, "name": "agy"}
+        })));
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {
+                "pid": 201,
+                "name": "node",
+                "script": "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js"
+            }
+        })));
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {
+                "pid": 202,
+                "name": "2.1.76",
+                "argv0": "claude",
+                "script": "/opt/claude/cli.js"
+            }
+        })));
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {
+                "pid": 203,
+                "name": "node",
+                "invoked_path": "/opt/homebrew/bin/gemini"
+            }
+        })));
+        assert!(has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {"pid": 300, "name": "cargo"},
+            "ancestors": [
+                {"pid": 250, "name": "zsh"},
+                {"pid": 200, "name": "claude"}
+            ],
+            "child": {"pid": 100, "name": "login"}
+        })));
+        assert!(!has_agent_process(&json!({
+            "last_exit": {"exit_code": 0},
+            "foreground": {"pid": 200, "name": "claude"}
+        })));
+        assert!(!has_agent_process(&json!({
+            "last_exit": null,
+            "foreground": {"pid": 200, "argv0": "-zsh", "name": "zsh"},
+            "child": {"pid": 100, "name": "login"}
+        })));
     }
 }

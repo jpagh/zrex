@@ -201,6 +201,12 @@ struct ManageChoice {
     initial_label: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachView {
+    All,
+    Agents,
+}
+
 enum Mode {
     Attach,
     NewSession {
@@ -237,6 +243,7 @@ pub(super) struct PickerState {
     matches: Vec<(usize, Vec<usize>)>,
     attach_selected: usize,
     attach_first: usize,
+    view: AttachView,
     mode: Mode,
     feedback: Option<Feedback>,
     pending_focus: Option<FocusTarget>,
@@ -260,6 +267,7 @@ impl PickerState {
             matches: Vec::new(),
             attach_selected: 0,
             attach_first: 0,
+            view: AttachView::All,
             mode: Mode::Attach,
             feedback: None,
             pending_focus: None,
@@ -405,22 +413,52 @@ impl PickerState {
         })
     }
 
+    fn has_agents(&self) -> bool {
+        self.targets.iter().any(Target::is_agent)
+    }
+
+    fn set_view(&mut self, view: AttachView) {
+        if self.view == view {
+            return;
+        }
+        let prev = self.selected_identity();
+        self.view = view;
+        self.recompute_matches();
+        if let Some((prev_server, prev_key)) = prev
+            && let Some(pos) = self.matches.iter().position(|&(index, _)| {
+                let target = &self.targets[index];
+                self.is_on_server(target, &prev_server) && prev_key.matches_block(target)
+            })
+        {
+            self.attach_selected = pos;
+        }
+    }
+
     fn recompute_matches(&mut self) {
         let pattern = self.attach_input.text();
+        let agents_only = self.view == AttachView::Agents;
         let mut ranked: Vec<_> = self
             .labels
             .iter()
             .enumerate()
+            .filter(|&(index, _)| !agents_only || self.targets[index].is_agent())
             .filter_map(|(index, label)| {
                 self.matcher
                     .fuzzy_indices(label, &pattern)
-                    .map(|(score, indices)| (Reverse(score), index, indices))
+                    .map(|(score, indices)| {
+                        let status_rank = if agents_only {
+                            self.targets[index].status_rank()
+                        } else {
+                            0
+                        };
+                        (Reverse(score), status_rank, index, indices)
+                    })
             })
             .collect();
-        ranked.sort_unstable_by_key(|&(score, index, _)| (score, index));
+        ranked.sort_unstable_by_key(|&(score, status_rank, index, _)| (score, status_rank, index));
         self.matches = ranked
             .into_iter()
-            .map(|(_, index, indices)| (index, indices))
+            .map(|(_, _, index, indices)| (index, indices))
             .collect();
         self.attach_selected = 0;
         self.attach_first = 0;
@@ -589,7 +627,22 @@ impl PickerState {
         }
         match &mut self.mode {
             Mode::Attach => match (code, modifiers) {
-                (KeyCode::Esc, _) => Some(Outcome::Cancel),
+                (KeyCode::Esc, _) => {
+                    if self.view == AttachView::Agents {
+                        self.set_view(AttachView::All);
+                        None
+                    } else {
+                        Some(Outcome::Cancel)
+                    }
+                }
+                (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
+                    let next = match self.view {
+                        AttachView::All => AttachView::Agents,
+                        AttachView::Agents => AttachView::All,
+                    };
+                    self.set_view(next);
+                    None
+                }
                 (KeyCode::Enter, _) if !self.matches.is_empty() => {
                     Some(Outcome::Selected(Selection::Attach(
                         AttachSelection::Existing(self.matches[self.attach_selected].0),
@@ -898,6 +951,10 @@ impl PickerState {
                         };
                         queue!(out, MoveTo(0, 1))?;
                         render_hint(out, hint, width - 2)?;
+                    } else if self.view == AttachView::Agents && !self.has_agents() {
+                        let hint = "No active agents — press Ctrl-G or Esc to show all panes";
+                        queue!(out, MoveTo(0, 1))?;
+                        render_hint(out, hint, width - 2)?;
                     } else {
                         for (line, &(index, ref indices)) in self
                             .matches
@@ -913,30 +970,58 @@ impl PickerState {
                         }
                     }
                 }
-                let prompt = if self.sessions.is_empty() {
-                    choose_prompt(
-                        width,
-                        &[
-                            "Attach (Ctrl-N new session, Esc)> ",
-                            "Attach (^N/Esc)> ",
-                            "Attach> ",
-                        ],
-                    )
-                } else {
-                    choose_prompt(
-                        width,
-                        &[
-                            "Attach (Ctrl-N session, Ctrl-T window, Ctrl-R rename, Ctrl-K kill, Esc)> ",
-                            "Attach (^N session, ^T window, ^R rename, ^K kill, Esc)> ",
-                            "Attach (^N/^T/^R/^K/Esc)> ",
-                            "Attach> ",
-                        ],
-                    )
+                let (prompt, prompt_color) = match self.view {
+                    AttachView::All => {
+                        let prompt = if self.sessions.is_empty() {
+                            choose_prompt(
+                                width,
+                                &[
+                                    "Attach (Ctrl-N new session, Esc)> ",
+                                    "Attach (^N/Esc)> ",
+                                    "Attach> ",
+                                ],
+                            )
+                        } else {
+                            choose_prompt(
+                                width,
+                                &[
+                                    "Attach (Ctrl-G agents, Ctrl-N session, Ctrl-T window, Ctrl-R rename, Ctrl-K kill, Esc)> ",
+                                    "Attach (^G agents, ^N session, ^T window, ^R rename, ^K kill, Esc)> ",
+                                    "Attach (^G/^N/^T/^R/^K/Esc)> ",
+                                    "Attach> ",
+                                ],
+                            )
+                        };
+                        (prompt, Color::DarkCyan)
+                    }
+                    AttachView::Agents => {
+                        let prompt = if self.sessions.is_empty() {
+                            choose_prompt(
+                                width,
+                                &[
+                                    "Agents (Ctrl-G all, Ctrl-N new session, Esc: back)> ",
+                                    "Agents (^G all, ^N/Esc)> ",
+                                    "Agents> ",
+                                ],
+                            )
+                        } else {
+                            choose_prompt(
+                                width,
+                                &[
+                                    "Agents (Ctrl-G all, Ctrl-N session, Ctrl-T window, Ctrl-R rename, Ctrl-K kill, Esc: back)> ",
+                                    "Agents (^G all, ^N session, ^T window, ^R rename, ^K kill, Esc)> ",
+                                    "Agents (^G/^N/^T/^R/^K/Esc)> ",
+                                    "Agents> ",
+                                ],
+                            )
+                        };
+                        (prompt, Color::DarkMagenta)
+                    }
                 };
                 let (displayed, offset) = self
                     .attach_input
                     .visible(width.saturating_sub(prompt.width()));
-                (prompt.to_owned(), displayed, offset, Color::DarkCyan)
+                (prompt.to_owned(), displayed, offset, prompt_color)
             }
             Mode::NewSession {
                 server_index,
@@ -1768,6 +1853,7 @@ mod tests {
         for detach_key in [KeyCode::Char('\\'), KeyCode::Char('4')] {
             for enter_mode in [
                 None,
+                Some(KeyCode::Char('g')),
                 Some(KeyCode::Char('n')),
                 Some(KeyCode::Char('t')),
                 Some(KeyCode::Char('r')),
@@ -2473,5 +2559,224 @@ mod tests {
         state.render(&mut buf, 80, 10, false).unwrap();
         let screen = String::from_utf8(buf).unwrap();
         assert!(screen.contains("The block closed"));
+    }
+
+    fn agents_fixture() -> (Vec<Target>, Vec<SessionChoice>, Vec<String>) {
+        let servers = vec!["local".to_owned(), "office".to_owned()];
+        let sessions = vec![
+            SessionChoice {
+                server_index: 0,
+                server_name: "local".to_owned(),
+                session_id: "session:1".to_owned(),
+                label: "work".to_owned(),
+            },
+            SessionChoice {
+                server_index: 1,
+                server_name: "office".to_owned(),
+                session_id: "session:2".to_owned(),
+                label: "api".to_owned(),
+            },
+        ];
+        let targets = vec![
+            // 0: plain shell (not an agent)
+            test_target(0, 0, "[local] work / 1 zsh", "session:1", "block:zsh"),
+            // 1: agent process with no OSC 7501 status
+            test_target(0, 0, "[local] work / 2 agy", "session:1", "block:agy")
+                .with_agent_process(true),
+            // 2: idle agent
+            test_target(0, 0, "[local] work / 3 claude", "session:1", "block:idle")
+                .with_status(ProgramState::Idle, "idle claude"),
+            // 3: done agent
+            test_target(1, 1, "[office] api / 1 codex", "session:2", "block:done")
+                .with_status(ProgramState::Done, "done codex"),
+            // 4: working agent (first)
+            test_target(1, 1, "[office] api / 2 claude", "session:2", "block:work1")
+                .with_status(ProgramState::Working, "working claude"),
+            // 5: error agent
+            test_target(0, 0, "[local] work / 4 opencode", "session:1", "block:err")
+                .with_status(ProgramState::Error, "error opencode"),
+            // 6: blocked agent
+            test_target(1, 1, "[office] api / 3 claude", "session:2", "block:blk")
+                .with_status(ProgramState::Blocked, "blocked claude (permission)"),
+            // 7: working agent (second, preserves discovery order after index 4)
+            test_target(0, 0, "[local] work / 5 gemini", "session:1", "block:work2")
+                .with_status(ProgramState::Working, "working gemini"),
+        ];
+        (targets, sessions, servers)
+    }
+
+    #[test]
+    fn ctrl_g_filters_to_agents_sorted_by_status_priority_and_preserves_ctrl_a() {
+        let (targets, sessions, servers) = agents_fixture();
+        let mut state = PickerState::new(targets, sessions, servers);
+
+        assert_eq!(state.matches.len(), 8);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(state.view, AttachView::Agents);
+
+        // Excludes plain zsh (0); sorts blocked(6), error(5), working(4, 7), done(3), idle(2), none(1).
+        let ordered: Vec<usize> = state.matches.iter().map(|&(idx, _)| idx).collect();
+        assert_eq!(ordered, vec![6, 5, 4, 7, 3, 2, 1]);
+
+        // Agents prompt renders distinctly.
+        let mut buf = Vec::new();
+        state.render(&mut buf, 100, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("Agents ("));
+
+        // Ctrl-A still moves cursor to start of query instead of toggling Agents.
+        type_text(&mut state, "claude");
+        assert_eq!(
+            state.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(state.view, AttachView::Agents);
+        assert_eq!(state.attach_input.cursor, 0);
+        // Typing at cursor 0 prepends to query.
+        type_text(&mut state, "api ");
+        assert_eq!(state.attach_input.text(), "api claude");
+    }
+
+    #[test]
+    fn toggling_between_all_and_agents_preserves_highlighted_agent_and_esc_backs_out() {
+        let (targets, sessions, servers) = agents_fixture();
+        let mut state = PickerState::new(targets, sessions, servers);
+
+        // Toggle into Agents: blocked agent (index 6) is selected.
+        assert_eq!(
+            state.handle_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            None
+        );
+        // Move down to error agent (index 5).
+        assert_eq!(state.handle_key(KeyCode::Down, KeyModifiers::NONE), None);
+        assert_eq!(state.matches[state.attach_selected].0, 5);
+
+        // Esc from Agents returns to All view and keeps index 5 selected.
+        assert_eq!(state.handle_key(KeyCode::Esc, KeyModifiers::NONE), None);
+        assert_eq!(state.view, AttachView::All);
+        assert_eq!(state.matches[state.attach_selected].0, 5);
+
+        // Ctrl-G from All while highlighting an agent keeps it selected in Agents.
+        assert_eq!(
+            state.handle_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(state.view, AttachView::Agents);
+        assert_eq!(state.matches[state.attach_selected].0, 5);
+
+        // Ctrl-G back to All, then Esc from All cancels the picker.
+        assert_eq!(
+            state.handle_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(state.view, AttachView::All);
+        assert_eq!(
+            state.handle_key(KeyCode::Esc, KeyModifiers::NONE),
+            Some(Outcome::Cancel)
+        );
+    }
+
+    #[test]
+    fn attach_and_detach_from_agents_view_returns_to_agents_view_and_refocuses() {
+        let (targets, sessions, servers) = agents_fixture();
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers.clone());
+
+        assert_eq!(
+            state.handle_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            None
+        );
+        // Filter and attach to the blocked agent (index 6).
+        type_text(&mut state, "blocked");
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::Existing(6)
+            )))
+        );
+
+        // Detach returns to Agents view, clears query, and highlights block:blk.
+        state.reset_after_attach(
+            Some(FocusTarget {
+                server_name: "office".to_owned(),
+                session_id: "session:2".to_owned(),
+                block_id: "block:blk".to_owned(),
+            }),
+            None,
+        );
+        assert_eq!(state.view, AttachView::Agents);
+        assert_eq!(state.attach_input.text(), "");
+        assert_eq!(state.matches[state.attach_selected].0, 6);
+
+        // Background refresh updates block:blk from blocked -> working; it stays in Agents view
+        // and stays highlighted even though its sorted rank moved behind error (index 5).
+        let mut refreshed_targets = targets;
+        refreshed_targets[6] = refreshed_targets[6]
+            .clone()
+            .with_status(ProgramState::Working, "working claude");
+        state.apply_discovery(refreshed_targets, sessions, servers, None);
+        assert_eq!(state.view, AttachView::Agents);
+        let ordered: Vec<usize> = state.matches.iter().map(|&(idx, _)| idx).collect();
+        assert_eq!(ordered, vec![5, 4, 6, 7, 3, 2, 1]);
+        assert_eq!(state.matches[state.attach_selected].0, 6);
+    }
+
+    #[test]
+    fn agents_view_handles_no_active_agents_and_manage_roundtrips() {
+        let (targets, sessions, servers) = sample_fixture();
+        let mut state = PickerState::new(targets, sessions, servers);
+
+        // Switch to Agents when no targets are agents.
+        assert_eq!(
+            state.handle_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(state.view, AttachView::Agents);
+        assert!(state.matches.is_empty());
+        // Enter, Ctrl-R, Ctrl-K are no-ops when no agent row is available.
+        assert_eq!(state.handle_key(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None
+        );
+        assert!(matches!(state.mode, Mode::Attach));
+        assert_eq!(
+            state.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None
+        );
+        assert!(matches!(state.mode, Mode::Attach));
+
+        let mut buf = Vec::new();
+        state.render(&mut buf, 80, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("No active agents"));
+        assert!(screen.contains("Agents"));
+
+        // Manage (rename) from Agents view returns to Agents view after Esc and refresh.
+        let (targets, sessions, servers) = agents_fixture();
+        let mut state = PickerState::new(targets.clone(), sessions.clone(), servers);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            None
+        );
+        assert_eq!(state.handle_key(KeyCode::Esc, KeyModifiers::NONE), None);
+        assert_eq!(state.view, AttachView::Agents);
+        assert!(matches!(state.mode, Mode::Attach));
+
+        state.refresh(
+            targets,
+            sessions,
+            Feedback {
+                text: "Renamed window".to_owned(),
+                is_error: false,
+            },
+        );
+        assert_eq!(state.view, AttachView::Agents);
     }
 }
