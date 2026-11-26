@@ -86,7 +86,7 @@ office = "https://office.example.com"
 lab = "https://lab.example.com"
 ```
 
-Each choice shows its server name. `zrex pick` (or `zrex p`) searches the saved servers alongside a running local server (or `REX_SERVER`, if set); if no local server is running, it is silently skipped when saved servers are configured, and it exits with an error when no local or saved server is available. Servers are queried in parallel with a short timeout, so an unreachable server doesn't prevent you from picking from another one. Use `zrex -S SERVER pick` (or `zrex -S SERVER p`, with a saved server name, `local`, or a URL) to search just one server.
+Each choice shows its server name. `zrex pick` (or `zrex p`) opens immediately and queries saved servers alongside a running local server (or `REX_SERVER`, if set) in parallel, displaying each server's sessions as it connects and showing a notification in the status banner if a server times out or cannot be reached. If no local server is running, it is silently skipped when saved servers are configured, and `zrex pick` exits with an error when no local or saved server is available. Use `zrex -S SERVER pick` (or `zrex -S SERVER p`, with a saved server name, `local`, or a URL) to search just one server.
 
 `zrex ls` (without `--server` or `REX_SERVER`) likewise lists sessions from any running local server and saved servers in `config.toml`, silently skipping an absent local server when saved servers are configured and exiting with an error when no local or saved server is available.
 
