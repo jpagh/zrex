@@ -10,9 +10,9 @@
 | `src/config.rs` | Saved-server config (`config.toml`) loading and server alias resolution shared across CLI commands, `zrex ls`, and the picker |
 | `src/discovery.rs` | Parallel local + saved server discovery fan-out, address deduplication, and deadline handling shared by `zrex ls` and the picker |
 | `src/text.rs` | One-line control-character sanitization, display-width truncation, percent-decoding, and home-path shortening helpers shared across CLI, config, session, app, and picker |
-| `src/picker.rs` | Parallel session discovery, target/status formatting, return-to-picker loop with background refresh on detach, and in-place session/window/block management (`rename`/`kill`) for `zrex pick` (`zrex p`) |
-| `src/picker/prompt.rs` | Alternate-screen fuzzy prompt UI, raw-mode guard (`RawModeGuard`) and queued quit-key check, background-refresh stepping (`Screen::step_until`), key/word navigation, and rendering for the picker |
-| `src/app.rs` | Attach lifecycle: bootstrap, block ownership, sizing, VT stream priming, raw I/O pass-through, events, and reconnection |
+| `src/picker.rs` | Streaming parallel session discovery (`DiscoveryStream`), target/status formatting, instant-start picker loop with incremental server updates and post-detach refresh, and in-place session/window/block management (`rename`/`kill`) for `zrex pick` (`zrex p`) |
+| `src/picker/prompt.rs` | Alternate-screen fuzzy prompt UI, raw-mode guard (`RawModeGuard`) and queued quit-key check, incremental async discovery stepping (`Screen::step_until`), key/word navigation, and rendering for the picker |
+| `src/app.rs` | Attach lifecycle: interruptible pre-attach connect, bootstrap, block ownership, sizing, VT stream priming, raw I/O pass-through, non-blocking liveness probes, events, and detach-interruptible reconnection |
 | `src/session.rs` | Session lookup/creation, `session.view` queries, terminal title/process derivation, and session/window/block mutation helpers |
 | `src/rex/mod.rs` | Server address parsing, `BlockRef` addressing, local socket discovery, WebSocket connection setup, and frame helpers |
 | `src/rex/proto.rs` | Control connection JSON messages, responses, and event envelope unwrapping |

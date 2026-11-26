@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::future::Future;
 use std::io::{IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
@@ -14,7 +16,7 @@ use crate::rex::control::{CALL_TIME, CallTimeout, Control, Events};
 use crate::rex::data::{self, Data, StreamClosed};
 use crate::rex::proto;
 use crate::rex::stream::{self, Filter};
-use crate::rex::{BlockRef, ServerAddress, format_timeout};
+use crate::rex::{BlockRef, CONNECT_TIME, ServerAddress, format_timeout};
 use crate::session;
 
 const DATA_REF: &str = "terminal";
@@ -153,6 +155,12 @@ pub enum AttachExit {
         /// first detach sequence (fast double-detach).
         double_detach: bool,
     },
+    /// User cancelled before the block was fully attached (e.g. while
+    /// connecting to a slow or unreachable server).
+    Cancelled {
+        /// True when the user pressed `Ctrl-C` or double-detached.
+        quit: bool,
+    },
     BlockClosed,
     SessionClosed,
 }
@@ -162,13 +170,14 @@ impl AttachExit {
         match self {
             Self::BlockClosed => Some("the block closed"),
             Self::SessionClosed => Some("the session closed"),
-            Self::Detached { .. } => None,
+            Self::Detached { .. } | Self::Cancelled { .. } => None,
         }
     }
 
     fn cli_message(&self) -> String {
         match self {
             Self::Detached { session_id, .. } => format!("detached from {session_id}"),
+            Self::Cancelled { .. } => "cancelled".to_owned(),
             other => other.closed_message().unwrap_or_default().to_owned(),
         }
     }
@@ -216,6 +225,23 @@ pub async fn attach(
     Ok(())
 }
 
+/// Runs a pre-attach network step while listening for the detach key or `Ctrl-C`
+/// so connecting to a dead/rebooting server while raw mode is active never freezes.
+async fn run_pre_attach<T>(
+    detach_key: DetachKey,
+    future: impl Future<Output = Result<T>>,
+) -> Result<std::result::Result<T, AttachExit>> {
+    let mut input = InputReader::spawn()?;
+    let outcome = input.await_or_cancel(detach_key, future).await;
+    let extra_detach = input.stop_and_drain_detach(detach_key);
+    match outcome {
+        PreAttachOutcome::Done(result) => Ok(Ok(result?)),
+        PreAttachOutcome::Cancelled { quit } => Ok(Err(AttachExit::Cancelled {
+            quit: quit || extra_detach,
+        })),
+    }
+}
+
 /// Picker targets are a snapshot of existing IDs, never creation selectors.
 pub async fn attach_existing(
     server: &ServerAddress,
@@ -224,8 +250,16 @@ pub async fn attach_existing(
     detach_key: DetachKey,
 ) -> Result<AttachExit> {
     ensure_terminal()?;
-    let (mut ctrl, events) = Control::connect(server, None).await?;
-    session::attach(&mut ctrl, session_id).await?;
+    let (ctrl, events) = match run_pre_attach(detach_key, async {
+        let (mut ctrl, events) = Control::connect(server, None).await?;
+        session::attach(&mut ctrl, session_id).await?;
+        Ok((ctrl, events))
+    })
+    .await?
+    {
+        Ok(pair) => pair,
+        Err(exit) => return Ok(exit),
+    };
     attach_block(
         server,
         ctrl,
@@ -244,8 +278,16 @@ pub async fn attach_new_session(
     detach_key: DetachKey,
 ) -> Result<AttachExit> {
     ensure_terminal()?;
-    let (mut ctrl, events) = Control::connect(server, None).await?;
-    let session_id = session::create(&mut ctrl, label).await?;
+    let (ctrl, events, session_id) = match run_pre_attach(detach_key, async {
+        let (mut ctrl, events) = Control::connect(server, None).await?;
+        let session_id = session::create(&mut ctrl, label).await?;
+        Ok((ctrl, events, session_id))
+    })
+    .await?
+    {
+        Ok(triple) => triple,
+        Err(exit) => return Ok(exit),
+    };
     attach_block(
         server,
         ctrl,
@@ -265,9 +307,17 @@ pub async fn attach_new_window(
     detach_key: DetachKey,
 ) -> Result<AttachExit> {
     ensure_terminal()?;
-    let (mut ctrl, events) = Control::connect(server, None).await?;
-    session::attach(&mut ctrl, session_id).await?;
-    let window_id = session::new_window(&mut ctrl, session_id, label).await?;
+    let (ctrl, events, window_id) = match run_pre_attach(detach_key, async {
+        let (mut ctrl, events) = Control::connect(server, None).await?;
+        session::attach(&mut ctrl, session_id).await?;
+        let window_id = session::new_window(&mut ctrl, session_id, label).await?;
+        Ok((ctrl, events, window_id))
+    })
+    .await?
+    {
+        Ok(triple) => triple,
+        Err(exit) => return Ok(exit),
+    };
     attach_block(
         server,
         ctrl,
@@ -298,14 +348,26 @@ async fn attach_block(
     let size = crossterm::terminal::size()?;
     let mut guard = Screen::enter(terminal_mode)?;
     let probed = guard.probe_theme();
-    let mut attached =
-        match Attached::start(&mut ctrl, session_id, server, selection, size, probed.theme).await {
-            Ok(attached) => attached,
-            Err(error) => {
-                let _ = guard.leave_and_drain(detach_key, probed.replied);
-                return Err(error);
-            }
-        };
+    let mut input = InputReader::spawn()?;
+    let mut attached = match input
+        .await_or_cancel(
+            detach_key,
+            Attached::start(&mut ctrl, session_id, server, selection, size, probed.theme),
+        )
+        .await
+    {
+        PreAttachOutcome::Done(Ok(attached)) => attached,
+        PreAttachOutcome::Done(Err(error)) => {
+            input.stop();
+            let _ = guard.leave_and_drain(detach_key, probed.replied);
+            return Err(error);
+        }
+        PreAttachOutcome::Cancelled { mut quit } => {
+            quit |= input.stop_and_drain_detach(detach_key);
+            quit |= guard.leave_and_drain(detach_key, probed.replied)?;
+            return Ok(AttachExit::Cancelled { quit });
+        }
+    };
     attached.detach_key = detach_key;
     attached.host_replied = probed.replied;
     // Replies the probe cut off (or any delayed scheme report after
@@ -314,11 +376,11 @@ async fn attach_block(
     // split host replies.
     attached.replies.hold_probe(probed.tail, !probed.da1_seen);
 
-    let mut input = InputReader::spawn()?;
     let mut winch = signal(SignalKind::window_change())?;
     let mut probe = tokio::time::interval(PROBE_EVERY);
     probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     probe.reset();
+    let mut probe_inflight: Option<InflightCall> = None;
     let mut token = ctrl.reconnect_token.clone();
 
     loop {
@@ -327,30 +389,66 @@ async fn attach_block(
             chunk = attached.data.next_chunk() => {
                 match chunk {
                     Some(Ok(bytes)) => {
-                        if let Err(error) = attached.feed(&bytes, &mut ctrl).await {
-                            lost = Some(error);
-                        } else {
-                            while let Some(next) = attached.data.try_next_chunk() {
-                                match next {
-                                    Ok(more) => {
-                                        if let Err(error) = attached.feed(&more, &mut ctrl).await {
-                                            lost = Some(error);
+                        match input
+                            .await_or_detach(detach_key, false, attached.feed(&bytes, &mut ctrl))
+                            .await
+                        {
+                            Interruptible::Detach { double } => {
+                                return finish_detach(
+                                    &mut ctrl,
+                                    &mut input,
+                                    &mut guard,
+                                    attached,
+                                    double,
+                                    DetachMode::Immediate,
+                                )
+                                .await;
+                            }
+                            Interruptible::Done(Err(error)) => lost = Some(error),
+                            Interruptible::Done(Ok(())) => {
+                                while let Some(next) = attached.data.try_next_chunk() {
+                                    match next {
+                                        Ok(more) => {
+                                            match input
+                                                .await_or_detach(
+                                                    detach_key,
+                                                    false,
+                                                    attached.feed(&more, &mut ctrl),
+                                                )
+                                                .await
+                                            {
+                                                Interruptible::Detach { double } => {
+                                                    return finish_detach(
+                                                        &mut ctrl,
+                                                        &mut input,
+                                                        &mut guard,
+                                                        attached,
+                                                        double,
+                                                        DetachMode::Immediate,
+                                                    )
+                                                    .await;
+                                                }
+                                                Interruptible::Done(Err(error)) => {
+                                                    lost = Some(error);
+                                                    break;
+                                                }
+                                                Interruptible::Done(Ok(())) => {}
+                                            }
+                                        }
+                                        Err(error) if closed_block(&error) => {
+                                            attached.flush(guard.out())?;
+                                            return finish_ending(
+                                                &mut input,
+                                                &mut guard,
+                                                attached.detach_key,
+                                                attached.host_replied,
+                                                Ending::Block,
+                                            );
+                                        }
+                                        Err(error) => {
+                                            lost = Some(stream_lost(error));
                                             break;
                                         }
-                                    }
-                                    Err(error) if closed_block(&error) => {
-                                        attached.flush(guard.out())?;
-                                        return finish_ending(
-                                            &mut input,
-                                            &mut guard,
-                                            attached.detach_key,
-                                            attached.host_replied,
-                                            Ending::Block,
-                                        );
-                                    }
-                                    Err(error) => {
-                                        lost = Some(stream_lost(error));
-                                        break;
                                     }
                                 }
                             }
@@ -372,8 +470,26 @@ async fn attach_block(
             message = events.recv() => {
                 match message {
                     Some((name, payload)) => {
-                        match attached.event(&name, &payload, &mut ctrl).await {
-                            Ok(Some(ending)) => {
+                        match input
+                            .await_or_detach(
+                                detach_key,
+                                false,
+                                attached.event(&name, &payload, &mut ctrl),
+                            )
+                            .await
+                        {
+                            Interruptible::Detach { double } => {
+                                return finish_detach(
+                                    &mut ctrl,
+                                    &mut input,
+                                    &mut guard,
+                                    attached,
+                                    double,
+                                    DetachMode::Immediate,
+                                )
+                                .await;
+                            }
+                            Interruptible::Done(Ok(Some(ending))) => {
                                 return finish_ending(
                                     &mut input,
                                     &mut guard,
@@ -382,8 +498,8 @@ async fn attach_block(
                                     ending,
                                 );
                             }
-                            Ok(None) => {}
-                            Err(error) => lost = Some(error),
+                            Interruptible::Done(Ok(None)) => {}
+                            Interruptible::Done(Err(error)) => lost = Some(error),
                         }
                     }
                     None => lost = Some(anyhow!("the control connection ended")),
@@ -425,33 +541,75 @@ async fn attach_block(
                     Err(error) => lost = Some(error),
                 }
             }
+            // Non-blocking liveness probe reply so a black-holed connection
+            // never blocks detach or user input.
+            result = finish_inflight(&mut probe_inflight) => {
+                if let Err(error) = result {
+                    lost = Some(error);
+                }
+            }
             // A fragment the host stopped sending was typing after all.
             _ = stalled(attached.replies.due()) => {
                 // Another arm can hold the loop long enough for the host's
                 // continuation to queue up behind it, so take that first.
                 if input.is_empty() {
-                    if let Err(error) = attached.flush_held(&mut ctrl).await {
-                        lost = Some(error);
+                    match attached.flush_held(&mut input, &mut ctrl).await {
+                        Ok(Flow::Continue) => {}
+                        Ok(Flow::Detach { double }) => {
+                            return finish_detach(
+                                &mut ctrl,
+                                &mut input,
+                                &mut guard,
+                                attached,
+                                double,
+                                DetachMode::Immediate,
+                            )
+                            .await;
+                        }
+                        Err(error) => lost = Some(error),
                     }
                 } else {
                     attached.replies.defer();
                 }
             }
             _ = winch.recv() => {
-                if let Ok((cols, rows)) = crossterm::terminal::size()
-                    && let Err(error) = attached.resize(cols, rows, &mut ctrl).await
-                {
-                    lost = Some(error);
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    match input
+                        .await_or_detach(detach_key, false, attached.resize(cols, rows, &mut ctrl))
+                        .await
+                    {
+                        Interruptible::Detach { double } => {
+                            return finish_detach(
+                                &mut ctrl,
+                                &mut input,
+                                &mut guard,
+                                attached,
+                                double,
+                                DetachMode::Immediate,
+                            )
+                            .await;
+                        }
+                        Interruptible::Done(Err(error)) => lost = Some(error),
+                        Interruptible::Done(Ok(())) => {}
+                    }
                 }
             }
             _ = probe.tick() => {
                 // A socket reports a dead network only when something uses
-                // it, so use it.
-                if let Err(error) = ctrl
-                    .call_with_timeout("server.version", Value::Null, PROBE_TIME)
-                    .await
-                {
-                    lost = Some(error);
+                // it, so use it — without blocking the event loop while waiting
+                // for the reply.
+                if probe_inflight.is_none() {
+                    match ctrl.start_call("server.version", Value::Null) {
+                        Ok(rx) => {
+                            probe_inflight = Some(InflightCall {
+                                method: "server.version",
+                                timeout: PROBE_TIME,
+                                rx,
+                                deadline: tokio::time::Instant::now() + PROBE_TIME,
+                            });
+                        }
+                        Err(error) => lost = Some(error),
+                    }
                 }
             }
         }
@@ -481,6 +639,8 @@ async fn attach_block(
             if !transient(&ctrl, &error) {
                 return Err(error);
             }
+            probe_inflight = None;
+            write_reconnecting_title(guard.out(), detach_key)?;
             match recover(
                 &mut token,
                 &mut ctrl,
@@ -490,7 +650,19 @@ async fn attach_block(
             )
             .await?
             {
-                Recovered::Live => {}
+                Recovered::Live => {
+                    probe.reset();
+                    if attached.primed {
+                        let title = attached
+                            .last_title
+                            .as_deref()
+                            .or(attached.fallback_title.as_deref())
+                            .unwrap_or("");
+                        attached
+                            .out
+                            .extend_from_slice(&stream::format_osc_title(b'0', title, b"\x07"));
+                    }
+                }
                 Recovered::Detach { double } => {
                     return finish_detach(
                         &mut ctrl,
@@ -551,12 +723,9 @@ async fn finish_detach(
     match mode {
         DetachMode::Graceful => detach(ctrl, &mut attached).await,
         DetachMode::Immediate => {
-            detach_session(
-                ctrl,
-                &attached.session_id,
-                tokio::time::Instant::now() + DETACH_TIME,
-            )
-            .await;
+            if !ctrl.is_lost() {
+                let _ = ctrl.post("session.detach", json!({"session_id": attached.session_id}));
+            }
         }
     }
     double_detach |= guard.leave_and_drain(detach_key, attached.host_replied)?;
@@ -581,6 +750,7 @@ impl Flow {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Ending {
     Block,
     Session,
@@ -600,6 +770,13 @@ struct InflightWrite {
     deadline: tokio::time::Instant,
 }
 
+struct InflightCall {
+    method: &'static str,
+    timeout: Duration,
+    rx: tokio::sync::oneshot::Receiver<Result<Value>>,
+    deadline: tokio::time::Instant,
+}
+
 struct Attached<'a> {
     server: &'a ServerAddress,
     session_id: String,
@@ -608,6 +785,7 @@ struct Attached<'a> {
     size: (u16, u16),
     theme: Theme,
     fallback_title: Option<String>,
+    last_title: Option<String>,
     data: Data,
     filter: Filter,
     pending: Vec<u8>,
@@ -678,6 +856,7 @@ impl<'a> Attached<'a> {
             size: (cols, rows),
             theme,
             fallback_title,
+            last_title: None,
             data,
             filter,
             pending: Vec::new(),
@@ -731,6 +910,7 @@ impl<'a> Attached<'a> {
             Some(&screen),
         )
         .or_else(|| self.fallback_title.clone());
+        self.last_title = title.clone();
         self.out.extend_from_slice(b"\x1b[2J\x1b[H");
         self.out.extend_from_slice(&screen);
         self.out.extend_from_slice(&stream::format_osc_title(
@@ -795,8 +975,16 @@ impl<'a> Attached<'a> {
             return Ok(Flow::Continue);
         }
         self.theme = theme;
-        self.sync(ctrl, Push::Theme).await?;
-        Ok(Flow::Continue)
+        match input
+            .await_or_detach(self.detach_key, false, self.sync(ctrl, Push::Theme))
+            .await
+        {
+            Interruptible::Done(res) => {
+                res?;
+                Ok(Flow::Continue)
+            }
+            Interruptible::Detach { double } => Ok(Flow::Detach { double }),
+        }
     }
 
     async fn burst(
@@ -820,7 +1008,13 @@ impl<'a> Attached<'a> {
         let typed = !self.input_buf.is_empty();
         self.flush_input(ctrl)?;
         if typed && !self.owns {
-            self.claim(ctrl).await?;
+            match input
+                .await_or_detach(self.detach_key, false, self.claim(ctrl))
+                .await
+            {
+                Interruptible::Done(res) => res?,
+                Interruptible::Detach { double } => return Ok(Flow::Detach { double }),
+            }
         }
         Ok(Flow::Continue)
     }
@@ -916,18 +1110,24 @@ impl<'a> Attached<'a> {
 
     /// Forwards a stalled fragment if it could be user typing, or drops an
     /// unfinished host reply so it never leaks into the remote PTY.
-    async fn flush_held(&mut self, ctrl: &mut Control) -> Result<()> {
+    async fn flush_held(&mut self, input: &mut InputReader, ctrl: &mut Control) -> Result<Flow> {
         let held = self.replies.give_up_stalled();
         if held.is_empty() {
-            return Ok(());
+            return Ok(Flow::Continue);
         }
         self.input_buf.extend_from_slice(&held);
         self.flush_input(ctrl)?;
         // Typing this late still makes this client the block's owner.
         if !self.owns {
-            self.claim(ctrl).await?;
+            match input
+                .await_or_detach(self.detach_key, false, self.claim(ctrl))
+                .await
+            {
+                Interruptible::Done(res) => res?,
+                Interruptible::Detach { double } => return Ok(Flow::Detach { double }),
+            }
         }
-        Ok(())
+        Ok(Flow::Continue)
     }
 
     fn flush_input(&mut self, ctrl: &mut Control) -> Result<()> {
@@ -950,28 +1150,28 @@ impl<'a> Attached<'a> {
         Ok(())
     }
 
-    async fn drain_writes(
-        &mut self,
-        ctrl: &mut Control,
-        deadline: tokio::time::Instant,
-    ) -> Result<()> {
+    async fn drain_writes(&mut self, ctrl: &mut Control, deadline: tokio::time::Instant) -> bool {
         self.input_buf.extend(self.replies.give_up_typed());
-        self.flush_input(ctrl)?;
+        if self.flush_input(ctrl).is_err() {
+            return false;
+        }
         loop {
             if self.write_inflight.is_some() {
                 match tokio::time::timeout_at(deadline, finish_write(&mut self.write_inflight))
                     .await
                 {
                     Ok(Ok(_)) => {}
-                    Ok(Err(_)) | Err(_) => break,
+                    Ok(Err(_)) | Err(_) => return false,
                 }
             }
             if self.write_queue.is_empty() {
                 break;
             }
-            self.pump_write(ctrl)?;
+            if self.pump_write(ctrl).is_err() {
+                return false;
+            }
         }
-        Ok(())
+        true
     }
 
     async fn resize(&mut self, cols: u16, rows: u16, ctrl: &mut Control) -> Result<()> {
@@ -1103,10 +1303,17 @@ impl<'a> Attached<'a> {
                 }),
             )
             .await?;
-        let Some(view) = bootstrap
-            .get("selected_session")
-            .and_then(|selected| selected.get("view"))
-        else {
+        let Some(selected) = bootstrap.get("selected_session") else {
+            return Ok(Some(Ending::Session));
+        };
+        if selected
+            .get("session_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != self.session_id)
+        {
+            return Ok(Some(Ending::Session));
+        }
+        let Some(view) = selected.get("view") else {
             return Ok(Some(Ending::Session));
         };
         if let Some(client_id) = bootstrap.get("client_id").and_then(Value::as_str) {
@@ -1801,6 +2008,23 @@ async fn finish_write(inflight: &mut Option<InflightWrite>) -> Result<Value> {
     }
 }
 
+async fn finish_inflight(inflight: &mut Option<InflightCall>) -> Result<Value> {
+    let Some(call) = inflight.as_mut() else {
+        return std::future::pending().await;
+    };
+    let method = call.method;
+    let timeout = call.timeout;
+    let outcome = tokio::time::timeout_at(call.deadline, &mut call.rx).await;
+    *inflight = None;
+    match outcome {
+        Ok(received) => received.map_err(|_| anyhow!("the control connection ended"))?,
+        Err(_) => Err(anyhow::Error::new(CallTimeout(format!(
+            "the server did not answer {method} within {}",
+            format_timeout(timeout)
+        )))),
+    }
+}
+
 struct PendingRpc {
     method: &'static str,
     rx: tokio::sync::oneshot::Receiver<Result<Value>>,
@@ -2043,8 +2267,32 @@ async fn stalled(at: Option<Instant>) {
     }
 }
 
+enum Interruptible<T> {
+    Done(T),
+    Detach { double: bool },
+}
+
+enum PreAttachOutcome<T> {
+    Done(T),
+    Cancelled { quit: bool },
+}
+
+fn detect_detach_in_input(bytes: &[u8], detach_key: DetachKey) -> Option<bool> {
+    if detach_key == DetachKey::Ctrl(0x07) {
+        let (_, typed) = split_replies(bytes);
+        split_at_detach_for(&typed, detach_key)
+            .1
+            .map(|tail| contains_detach_for(tail, detach_key))
+    } else {
+        split_at_detach_for(bytes, detach_key)
+            .1
+            .map(|tail| contains_detach_for(tail, detach_key))
+    }
+}
+
 struct InputReader {
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    buffered: VecDeque<Vec<u8>>,
     wake: Option<std::io::PipeWriter>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -2062,6 +2310,7 @@ impl InputReader {
         });
         Ok(Self {
             rx,
+            buffered: VecDeque::new(),
             wake: Some(wake_wr),
             thread: Some(thread),
         })
@@ -2071,31 +2320,117 @@ impl InputReader {
     fn from_channel(rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
         Self {
             rx,
+            buffered: VecDeque::new(),
             wake: None,
             thread: None,
         }
     }
 
     async fn recv(&mut self) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.buffered.pop_front() {
+            return Some(bytes);
+        }
         self.rx.recv().await
     }
 
     fn try_recv(&mut self) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.buffered.pop_front() {
+            return Some(bytes);
+        }
         self.rx.try_recv().ok()
     }
 
     fn is_empty(&self) -> bool {
-        self.rx.is_empty()
+        self.buffered.is_empty() && self.rx.is_empty()
     }
 
     fn drain_detach(&mut self, detach_key: DetachKey) -> bool {
         let mut saw_detach = false;
         while let Some(bytes) = self.try_recv() {
-            if contains_detach_for(&bytes, detach_key) {
+            if detect_detach_in_input(&bytes, detach_key).is_some() {
                 saw_detach = true;
             }
         }
         saw_detach
+    }
+
+    /// Awaits `future` while continuously monitoring stdin for `detach_key`.
+    /// When `discard_other` is false (live session), non-detach input chunks
+    /// are buffered in order and delivered on subsequent `recv()` calls; when
+    /// true (offline recovery), non-detach input is dropped and EOF detaches.
+    async fn await_or_detach<T>(
+        &mut self,
+        detach_key: DetachKey,
+        discard_other: bool,
+        future: impl Future<Output = T>,
+    ) -> Interruptible<T> {
+        if discard_other {
+            while let Some(bytes) = self.try_recv() {
+                if let Some(double) = detect_detach_in_input(&bytes, detach_key) {
+                    return Interruptible::Detach {
+                        double: double || self.drain_detach(detach_key),
+                    };
+                }
+            }
+        }
+        let mut fut = std::pin::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                bytes = self.rx.recv() => {
+                    match bytes {
+                        Some(bytes) => {
+                            if let Some(double) = detect_detach_in_input(&bytes, detach_key) {
+                                return Interruptible::Detach {
+                                    double: double || self.drain_detach(detach_key),
+                                };
+                            }
+                            if !discard_other {
+                                self.buffered.push_back(bytes);
+                            }
+                        }
+                        None => {
+                            if discard_other {
+                                return Interruptible::Detach { double: false };
+                            }
+                            return Interruptible::Done(fut.await);
+                        }
+                    }
+                }
+                result = fut.as_mut() => return Interruptible::Done(result),
+            }
+        }
+    }
+
+    /// Awaits a pre-attach network step while monitoring stdin for `detach_key`
+    /// or `Ctrl-C`, cancelling immediately if the user interrupts.
+    async fn await_or_cancel<T>(
+        &mut self,
+        detach_key: DetachKey,
+        future: impl Future<Output = T>,
+    ) -> PreAttachOutcome<T> {
+        let mut fut = std::pin::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                bytes = self.rx.recv() => {
+                    match bytes {
+                        Some(bytes) => {
+                            if let Some(double) = detect_detach_in_input(&bytes, detach_key) {
+                                return PreAttachOutcome::Cancelled {
+                                    quit: double || self.drain_detach(detach_key),
+                                };
+                            }
+                            if contains_detach_for(&bytes, DetachKey::Ctrl(0x03)) {
+                                return PreAttachOutcome::Cancelled { quit: true };
+                            }
+                        }
+                        None => return PreAttachOutcome::Cancelled { quit: true },
+                    }
+                }
+                result = fut.as_mut() => return PreAttachOutcome::Done(result),
+            }
+        }
     }
 
     fn stop(&mut self) {
@@ -2168,6 +2503,17 @@ fn read_until_wake(
     }
 }
 
+fn write_reconnecting_title(out: &mut impl Write, detach_key: DetachKey) -> Result<()> {
+    let title = match detach_key {
+        DetachKey::None => "reconnecting…".to_owned(),
+        key => format!("reconnecting… ({key} to detach)"),
+    };
+    out.write_all(&stream::format_osc_title(b'0', &title, b"\x07"))?;
+    out.flush()?;
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum Recovered {
     Live,
     Detach { double: bool },
@@ -2181,13 +2527,27 @@ async fn recover(
     attached: &mut Attached<'_>,
     input: &mut InputReader,
 ) -> Result<Recovered> {
+    let detach_key = attached.detach_key;
     let mut delay = RETRY_FIRST;
     loop {
-        match attempt(token, ctrl, events, attached).await {
+        let outcome = match input
+            .await_or_detach(detach_key, true, attempt(token, ctrl, events, attached))
+            .await
+        {
+            Interruptible::Detach { double } => return Ok(Recovered::Detach { double }),
+            Interruptible::Done(outcome) => outcome,
+        };
+        match outcome {
             Ok(None) => {
                 // Keys pressed while the link was down have nowhere to go,
-                // and the reply a held fragment belonged to is gone with them.
-                while input.try_recv().is_some() {}
+                // except a detach key that raced with reconnect completion.
+                while let Some(bytes) = input.try_recv() {
+                    if let Some(double) = detect_detach_in_input(&bytes, detach_key) {
+                        return Ok(Recovered::Detach {
+                            double: double || input.drain_detach(detach_key),
+                        });
+                    }
+                }
                 attached.replies = Replies::default();
                 attached.input_buf.clear();
                 attached.write_queue.clear();
@@ -2196,15 +2556,11 @@ async fn recover(
             }
             Ok(Some(ending)) => return Ok(Recovered::Ended(ending)),
             Err(_) => {
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    Some(bytes) = input.recv() => {
-                        if let Some(tail) = split_at_detach_for(&bytes, attached.detach_key).1 {
-                            return Ok(Recovered::Detach {
-                                double: contains_detach_for(tail, attached.detach_key),
-                            });
-                        }
-                    }
+                if let Interruptible::Detach { double } = input
+                    .await_or_detach(detach_key, true, tokio::time::sleep(delay))
+                    .await
+                {
+                    return Ok(Recovered::Detach { double });
                 }
                 delay = backoff(delay);
             }
@@ -2223,7 +2579,8 @@ async fn attempt(
         .await
         .is_err()
     {
-        let (new_ctrl, new_events) = Control::connect(attached.server, token.as_deref()).await?;
+        let (new_ctrl, new_events) =
+            Control::connect_once(attached.server, token.as_deref(), CONNECT_TIME).await?;
         *token = new_ctrl.reconnect_token.clone();
         *ctrl = new_ctrl;
         *events = new_events;
@@ -2277,19 +2634,18 @@ fn stream_lost(error: anyhow::Error) -> anyhow::Error {
 
 async fn detach(ctrl: &mut Control, attached: &mut Attached<'_>) {
     let deadline = tokio::time::Instant::now() + DETACH_TIME;
-    if !ctrl.is_lost() {
-        let _ = attached.drain_writes(ctrl, deadline).await;
+    if !ctrl.is_lost() && attached.drain_writes(ctrl, deadline).await {
+        detach_session(ctrl, &attached.session_id, deadline).await;
     }
-    detach_session(ctrl, &attached.session_id, deadline).await;
 }
 
 async fn detach_session(ctrl: &mut Control, session_id: &str, deadline: tokio::time::Instant) {
     if ctrl.is_lost() {
         return;
     }
-    let timeout = deadline
-        .checked_duration_since(tokio::time::Instant::now())
-        .unwrap_or(Duration::from_millis(200));
+    let Some(timeout) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
+        return;
+    };
     let _ = ctrl
         .call_with_timeout("session.detach", json!({"session_id": session_id}), timeout)
         .await;
@@ -4625,7 +4981,10 @@ mod tests {
         attached
             .replies
             .hold_probe(b"\x1b]4;150;rgb:afaf/d7d7/5f".to_vec(), true);
-        attached.flush_held(&mut ctrl).await.unwrap();
+        assert_eq!(
+            attached.flush_held(&mut input, &mut ctrl).await.unwrap(),
+            Flow::Continue
+        );
         let flow = attached
             .burst(b"\x1b", &mut input, &mut ctrl)
             .await
@@ -4643,7 +5002,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(flow, Flow::Continue);
-        attached.flush_held(&mut ctrl).await.unwrap();
+        assert_eq!(
+            attached.flush_held(&mut input, &mut ctrl).await.unwrap(),
+            Flow::Continue
+        );
 
         detach(&mut ctrl, &mut attached).await;
         let (writes, _) = server.await.unwrap();
@@ -4996,5 +5358,395 @@ mod tests {
         .unwrap();
         assert!(!saw_detach);
         assert_eq!(out, RESET_MODES);
+    }
+
+    #[tokio::test]
+    async fn recover_detaches_immediately_during_hung_reconnect_attempt() {
+        use super::{Recovered, recover};
+
+        // First accept the initial attach, then accept subsequent TCP connections
+        // and intentionally never respond (simulating a rebooting/black-holed host).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            // 1. Control connection for initial attach.
+            let (stream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                })
+                .await
+                .unwrap();
+            let _ = ws.next().await;
+            ws.send(Message::text(
+                json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            let (ctrl_done_tx, ctrl_done_rx) = tokio::sync::oneshot::channel::<()>();
+            let ctrl_task = tokio::spawn(async move {
+                let ticket_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([5u8; 16]);
+                let mut done_tx = Some(ctrl_done_tx);
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&text).unwrap();
+                    let id = req["id"].as_str().unwrap();
+                    let payload = match req["method"].as_str().unwrap() {
+                        "session.bootstrap" => json!({
+                            "client_id": "client:1",
+                            "selected_session": {
+                                "session_id": "session:1",
+                                "label": "work",
+                                "view": {
+                                    "active_window_id": "window:1",
+                                    "windows": [{
+                                        "window_id": "window:1",
+                                        "label": "shell",
+                                        "focused_block_id": "block:1",
+                                        "layers": [{"blocks": [{"block_id": "block:1", "label": "shell"}]}]
+                                    }]
+                                }
+                            }
+                        }),
+                        "data.connect" => json!({"ticket": ticket_b64}),
+                        _ => json!({"ok": true}),
+                    };
+                    ws.send(Message::text(
+                        json!({"type": "response", "id": id, "seq": 0, "payload": payload})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    if req["method"].as_str() == Some("block.event") {
+                        if let Some(tx) = done_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        break;
+                    }
+                }
+                drop(ws);
+            });
+
+            // 2. Data connection for initial attach.
+            let (dstream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut dws =
+                tokio_tungstenite::accept_hdr_async(dstream, |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                })
+                .await
+                .unwrap();
+            let _ = dws.next().await;
+            let mut welcome = vec![0x81u8];
+            welcome.extend_from_slice(&[9u8; 16]);
+            welcome.extend_from_slice(&[0u8; 7]);
+            welcome.extend_from_slice(&42u64.to_le_bytes());
+            dws.send(Message::Binary(welcome.into())).await.unwrap();
+            dws.send(Message::Binary(snapshot_header().into()))
+                .await
+                .unwrap();
+
+            // Wait for initial attach focus event, then drop initial sockets and
+            // black-hole all subsequent TCP connections without answering.
+            let _ = ctrl_done_rx.await;
+            let _ = ctrl_task.await;
+            drop(dws);
+            let mut held = Vec::new();
+            while let Ok((hung, _)) = listener.accept().await {
+                held.push(hung);
+            }
+        });
+
+        let address: crate::rex::ServerAddress = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, mut events) = Control::connect(&address, None).await.unwrap();
+        let mut attached = Attached::start(
+            &mut ctrl,
+            "session:1",
+            &address,
+            BlockSelection::Exact("block:1"),
+            (80, 24),
+            Theme::default(),
+        )
+        .await
+        .unwrap();
+
+        // Wait until the dropped control socket is detected, then enter recover()
+        // while the server black-holes the reconnect TCP socket.
+        assert!(events.recv().await.is_none());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut input = InputReader::from_channel(rx);
+        let mut token = ctrl.reconnect_token.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Non-detach input is ignored without aborting recovery.
+            let _ = tx.send(b"hello".to_vec());
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // Pressing Ctrl-\ detaches immediately even while reconnect is hung.
+            let _ = tx.send(b"\x1c".to_vec());
+        });
+
+        let started = std::time::Instant::now();
+        let recovered = recover(
+            &mut token,
+            &mut ctrl,
+            &mut events,
+            &mut attached,
+            &mut input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered, Recovered::Detach { double: false });
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "detach waited {:?} during hung reconnect",
+            started.elapsed()
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn recover_ends_session_when_restarted_server_lacks_original_session() {
+        use super::{Recovered, recover};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            // Initial control + data setup.
+            let (stream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ws =
+                tokio_tungstenite::accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                })
+                .await
+                .unwrap();
+            let _ = ws.next().await;
+            ws.send(Message::text(
+                json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            let (ctrl_done_tx, ctrl_done_rx) = tokio::sync::oneshot::channel::<()>();
+            let ctrl_task = tokio::spawn(async move {
+                let ticket_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([6u8; 16]);
+                let mut done_tx = Some(ctrl_done_tx);
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let req: Value = serde_json::from_str(&text).unwrap();
+                    let id = req["id"].as_str().unwrap();
+                    let payload = match req["method"].as_str().unwrap() {
+                        "session.bootstrap" => json!({
+                            "client_id": "client:1",
+                            "selected_session": {
+                                "session_id": "session:old",
+                                "label": "work",
+                                "view": {
+                                    "active_window_id": "window:1",
+                                    "windows": [{
+                                        "window_id": "window:1",
+                                        "label": "shell",
+                                        "focused_block_id": "block:1",
+                                        "layers": [{"blocks": [{"block_id": "block:1", "label": "shell"}]}]
+                                    }]
+                                }
+                            }
+                        }),
+                        "data.connect" => json!({"ticket": ticket_b64}),
+                        _ => json!({"ok": true}),
+                    };
+                    ws.send(Message::text(
+                        json!({"type": "response", "id": id, "seq": 0, "payload": payload})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    if req["method"].as_str() == Some("block.event") {
+                        if let Some(tx) = done_tx.take() {
+                            let _ = tx.send(());
+                        }
+                        break;
+                    }
+                }
+                drop(ws);
+            });
+            let (dstream, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut dws =
+                tokio_tungstenite::accept_hdr_async(dstream, |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                })
+                .await
+                .unwrap();
+            let _ = dws.next().await;
+            let mut welcome = vec![0x81u8];
+            welcome.extend_from_slice(&[9u8; 16]);
+            welcome.extend_from_slice(&[0u8; 7]);
+            welcome.extend_from_slice(&42u64.to_le_bytes());
+            dws.send(Message::Binary(welcome.into())).await.unwrap();
+            let _ = ctrl_done_rx.await;
+            let _ = ctrl_task.await;
+            drop(dws);
+
+            // Reconnect after "reboot": server only has a different session now.
+            let (stream2, _) = listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ws2 =
+                tokio_tungstenite::accept_hdr_async(stream2, |req: &Request, mut res: Response| {
+                    if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                        res.headers_mut()
+                            .insert("Sec-WebSocket-Protocol", proto.clone());
+                    }
+                    Ok(res)
+                })
+                .await
+                .unwrap();
+            let _ = ws2.next().await;
+            ws2.send(Message::text(
+                json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            if let Some(Ok(Message::Text(text))) = ws2.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_str().unwrap();
+                ws2.send(Message::text(
+                    json!({
+                        "type": "response",
+                        "id": id,
+                        "seq": 0,
+                        "payload": {
+                            "client_id": "client:2",
+                            "selected_session": {
+                                "session_id": "session:brand-new",
+                                "label": "fresh",
+                                "view": {"windows": []}
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+
+        let address: crate::rex::ServerAddress = format!("http://{addr}").parse().unwrap();
+        let (mut ctrl, mut events) = Control::connect(&address, None).await.unwrap();
+        let mut attached = Attached::start(
+            &mut ctrl,
+            "session:old",
+            &address,
+            BlockSelection::Exact("block:1"),
+            (80, 24),
+            Theme::default(),
+        )
+        .await
+        .unwrap();
+        assert!(events.recv().await.is_none());
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut input = InputReader::from_channel(rx);
+        let mut token = ctrl.reconnect_token.clone();
+        let recovered = recover(
+            &mut token,
+            &mut ctrl,
+            &mut events,
+            &mut attached,
+            &mut input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered, Recovered::Ended(Ending::Session));
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_reader_buffers_typing_during_live_rpc_and_interrupts_on_detach_or_cancel() {
+        use super::{Interruptible, PreAttachOutcome};
+
+        // 1. Live RPC: non-detach keystrokes are buffered in order while awaiting.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut input = InputReader::from_channel(rx);
+        tx.send(b"ab".to_vec()).unwrap();
+        tx.send(b"cd".to_vec()).unwrap();
+        let res = input
+            .await_or_detach(DetachKey::default(), false, async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                42
+            })
+            .await;
+        assert!(matches!(res, Interruptible::Done(42)));
+        assert_eq!(input.recv().await, Some(b"ab".to_vec()));
+        assert_eq!(input.recv().await, Some(b"cd".to_vec()));
+
+        // 2. Live RPC hung on a dead link: detach key interrupts immediately.
+        tx.send(b"x\x1c\x1c".to_vec()).unwrap();
+        let res = input
+            .await_or_detach(DetachKey::default(), false, std::future::pending::<()>())
+            .await;
+        assert!(matches!(res, Interruptible::Detach { double: true }));
+
+        // 3. Pre-attach connect hung: Ctrl-\ cancels back to picker, Ctrl-C quits.
+        tx.send(b"\x1c".to_vec()).unwrap();
+        let res = input
+            .await_or_cancel(DetachKey::default(), std::future::pending::<()>())
+            .await;
+        assert!(matches!(res, PreAttachOutcome::Cancelled { quit: false }));
+
+        tx.send(b"\x03".to_vec()).unwrap();
+        let res = input
+            .await_or_cancel(DetachKey::default(), std::future::pending::<()>())
+            .await;
+        assert!(matches!(res, PreAttachOutcome::Cancelled { quit: true }));
+    }
+
+    #[tokio::test]
+    async fn finish_inflight_times_out_with_call_timeout_and_clears_inflight() {
+        use super::{InflightCall, finish_inflight};
+
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut inflight = Some(InflightCall {
+            method: "server.version",
+            timeout: Duration::from_millis(20),
+            rx,
+            deadline: tokio::time::Instant::now() + Duration::from_millis(20),
+        });
+        let err = finish_inflight(&mut inflight).await.unwrap_err();
+        assert!(inflight.is_none());
+        assert!(err.downcast_ref::<CallTimeout>().is_some());
     }
 }

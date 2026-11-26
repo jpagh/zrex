@@ -18,7 +18,6 @@ pub enum LocalDiscovery {
 pub struct FanOutOutcome<T> {
     pub entries: Vec<(Server, Result<T>)>,
     pub local_error: Option<String>,
-    pub attempted_any: bool,
 }
 
 pub async fn probe_local(
@@ -105,11 +104,9 @@ where
         Err(error) => local_error = Some(clean_one_line(&format!("{error:#}"))),
     }
     entries.extend(servers.into_iter().zip(saved_results));
-    let attempted_any = !entries.is_empty() || local_error.is_some();
 
     FanOutOutcome {
         entries,
         local_error,
-        attempted_any,
     }
 }

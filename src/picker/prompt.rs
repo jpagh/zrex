@@ -1,9 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::env;
-use std::future::Future;
 use std::io::{self, Write};
-use std::pin::Pin;
 use std::time::Duration;
 
 use crossterm::{
@@ -18,7 +16,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     ManageScope, ManageTarget, ProgramState, SessionChoice, StyleRole, StyledSpan, Target,
-    styled_scope_row, styled_server_row,
+    format_warnings_summary, styled_scope_row, styled_server_row,
 };
 use crate::config::DetachKey;
 use crate::text::truncate_with_ellipsis;
@@ -41,7 +39,9 @@ pub(super) struct FocusTarget {
 pub(super) enum StepEvent {
     Cancel,
     Selected(Selection),
-    Refreshed(super::DiscoveryOutcome),
+    Discovery(super::ServerDiscoveryEvent),
+    DiscoveryFinished,
+    FlushPending,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -247,8 +247,11 @@ pub(super) struct PickerState {
     view: AttachView,
     mode: Mode,
     feedback: Option<Feedback>,
+    discovery_warnings: Vec<String>,
     pending_focus: Option<FocusTarget>,
     refreshing: bool,
+    loading: Vec<String>,
+    loading_is_refresh: bool,
     detach_key: DetachKey,
 }
 
@@ -272,8 +275,11 @@ impl PickerState {
             view: AttachView::All,
             mode: Mode::Attach,
             feedback: None,
+            discovery_warnings: Vec::new(),
             pending_focus: None,
             refreshing: false,
+            loading: Vec::new(),
+            loading_is_refresh: false,
             detach_key: DetachKey::default(),
         };
         state.recompute_matches();
@@ -288,10 +294,19 @@ impl PickerState {
         matches!(self.mode, Mode::Attach)
     }
 
-    pub(super) fn clear_refreshing(&mut self) {
-        self.refreshing = false;
+    pub(super) fn set_loading(&mut self, servers: Vec<String>, is_refresh: bool) {
+        self.loading = servers;
+        self.loading_is_refresh = is_refresh;
+        self.refreshing = !self.loading.is_empty();
     }
 
+    pub(super) fn finish_loading(&mut self) {
+        self.loading.clear();
+        self.refreshing = false;
+        self.pending_focus = None;
+    }
+
+    #[cfg(test)]
     pub(super) fn set_feedback(&mut self, feedback: Feedback) {
         self.feedback = Some(feedback);
     }
@@ -316,12 +331,33 @@ impl PickerState {
         }
         self.pending_focus = focus;
         self.feedback = feedback;
+        self.discovery_warnings.clear();
+        self.loading.clear();
+        self.loading_is_refresh = true;
         self.refreshing = true;
+    }
+
+    /// Applies an incremental server discovery update while preserving the
+    /// user's active filter query, selection, and pending focus (until either
+    /// the target arrives, the user interacts, or all servers finish).
+    pub(super) fn apply_server_update(
+        &mut self,
+        targets: Vec<Target>,
+        sessions: Vec<SessionChoice>,
+        servers: Vec<String>,
+        warning: Option<String>,
+        still_loading: bool,
+    ) {
+        self.update_entries(targets, sessions, Some(servers), still_loading);
+        if let Some(warning) = warning {
+            self.discovery_warnings.push(warning);
+        }
     }
 
     /// Applies a full server-discovery refresh while preserving the user's
     /// active filter query and selection (or focusing `pending_focus` if the
     /// user has not navigated since returning from attach).
+    #[cfg(test)]
     pub(super) fn apply_discovery(
         &mut self,
         targets: Vec<Target>,
@@ -329,17 +365,11 @@ impl PickerState {
         servers: Vec<String>,
         warning: Option<Feedback>,
     ) {
-        self.update_entries(targets, sessions, Some(servers));
-        if self.feedback.is_none() {
-            self.feedback = warning;
-        }
-    }
-
-    pub(super) fn finish_refresh_error(&mut self, feedback: Feedback) {
-        self.pending_focus = None;
+        self.update_entries(targets, sessions, Some(servers), false);
+        self.loading.clear();
         self.refreshing = false;
         if self.feedback.is_none() {
-            self.feedback = Some(feedback);
+            self.feedback = warning;
         }
     }
 
@@ -350,8 +380,10 @@ impl PickerState {
         feedback: Feedback,
     ) {
         self.pending_focus = None;
+        self.discovery_warnings.clear();
         self.mode = Mode::Attach;
-        self.update_entries(targets, sessions, None);
+        let still_loading = !self.loading.is_empty();
+        self.update_entries(targets, sessions, None, still_loading);
         self.feedback = Some(feedback);
     }
 
@@ -360,10 +392,10 @@ impl PickerState {
         targets: Vec<Target>,
         sessions: Vec<SessionChoice>,
         servers: Option<Vec<String>>,
+        still_loading: bool,
     ) {
         let prev = self.selected_identity();
         let prev_selected = self.attach_selected;
-        let pending_focus = self.pending_focus.take();
 
         self.targets = targets;
         self.sessions = sessions;
@@ -373,29 +405,37 @@ impl PickerState {
         self.labels = self.targets.iter().map(Target::search_text).collect();
         self.recompute_matches();
 
-        if let Some(focus) = pending_focus
-            && let Some(pos) = self.find_focus_target(&focus)
+        if let Some(focus) = self.pending_focus.as_ref()
+            && let Some(pos) = self.find_focus_target(focus)
         {
             self.attach_selected = pos;
-        } else if let Some((prev_server, prev_key)) = prev {
-            if let Some(pos) = self.matches.iter().position(|&(index, _)| {
-                let target = &self.targets[index];
-                self.is_on_server(target, &prev_server) && prev_key.matches_block(target)
-            }) {
-                self.attach_selected = pos;
-            } else if let Some(pos) = self.matches.iter().position(|&(index, _)| {
-                let target = &self.targets[index];
-                self.is_on_server(target, &prev_server) && prev_key.matches_window(target)
-            }) {
-                self.attach_selected = pos;
+            self.pending_focus = None;
+        } else {
+            if !still_loading {
+                self.pending_focus = None;
+            }
+            if let Some((prev_server, prev_key)) = prev {
+                if let Some(pos) = self.matches.iter().position(|&(index, _)| {
+                    let target = &self.targets[index];
+                    self.is_on_server(target, &prev_server) && prev_key.matches_block(target)
+                }) {
+                    self.attach_selected = pos;
+                } else if let Some(pos) = self.matches.iter().position(|&(index, _)| {
+                    let target = &self.targets[index];
+                    self.is_on_server(target, &prev_server) && prev_key.matches_window(target)
+                }) {
+                    self.attach_selected = pos;
+                } else if !self.matches.is_empty() {
+                    self.attach_selected = prev_selected.min(self.matches.len() - 1);
+                }
             } else if !self.matches.is_empty() {
                 self.attach_selected = prev_selected.min(self.matches.len() - 1);
             }
-        } else if !self.matches.is_empty() {
-            self.attach_selected = prev_selected.min(self.matches.len() - 1);
         }
 
-        self.refreshing = false;
+        if !still_loading {
+            self.refreshing = false;
+        }
     }
 
     fn is_on_server(&self, target: &Target, server_name: &str) -> bool {
@@ -628,6 +668,7 @@ impl PickerState {
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<Outcome> {
         self.feedback = None;
+        self.discovery_warnings.clear();
         self.pending_focus = None;
         if is_quit_key(code, modifiers, self.detach_key) {
             return Some(Outcome::Cancel);
@@ -912,6 +953,16 @@ impl PickerState {
         }
     }
 
+    fn loading_message(&self) -> Option<String> {
+        if !self.loading.is_empty() {
+            Some(format_loading(&self.loading, self.loading_is_refresh))
+        } else if self.refreshing {
+            Some("Refreshing…".to_owned())
+        } else {
+            None
+        }
+    }
+
     fn render(
         &mut self,
         out: &mut impl Write,
@@ -919,11 +970,29 @@ impl PickerState {
         rows: u16,
         use_color: bool,
     ) -> io::Result<()> {
+        let loading_in_body = matches!(self.mode, Mode::Attach)
+            && self.targets.is_empty()
+            && self.servers.is_empty()
+            && self.loading_message().is_some();
         let banner = self.feedback.clone().or_else(|| {
-            self.refreshing.then(|| Feedback {
-                text: "Refreshing…".to_owned(),
-                is_error: false,
-            })
+            if let Some(warn) = format_warnings_summary(&self.discovery_warnings) {
+                let text = if !loading_in_body && let Some(loading) = self.loading_message() {
+                    format!("{warn} · {loading}")
+                } else {
+                    warn
+                };
+                Some(Feedback {
+                    text,
+                    is_error: true,
+                })
+            } else if !loading_in_body {
+                self.loading_message().map(|text| Feedback {
+                    text,
+                    is_error: false,
+                })
+            } else {
+                None
+            }
         });
         self.render_with_banner(out, columns, rows, use_color, banner.as_ref())
     }
@@ -951,7 +1020,18 @@ impl PickerState {
                     scroll_first(self.attach_first, self.attach_selected, list_rows);
                 if rows > 1 && width > 2 {
                     if self.targets.is_empty() {
-                        let hint = if self.sessions.is_empty() {
+                        let loading_hint;
+                        let hint: &str = if self.servers.is_empty() {
+                            if !self.loading.is_empty() {
+                                loading_hint =
+                                    format_loading(&self.loading, self.loading_is_refresh);
+                                &loading_hint
+                            } else if self.refreshing {
+                                "Refreshing…"
+                            } else {
+                                "No reachable servers — press Esc to quit"
+                            }
+                        } else if self.sessions.is_empty() {
                             "No sessions yet — press Ctrl-N to create one"
                         } else {
                             "No open windows — Ctrl-T new window, Ctrl-N new session, Ctrl-R rename, Ctrl-K kill"
@@ -979,7 +1059,9 @@ impl PickerState {
                 }
                 let (prompt, prompt_color) = match self.view {
                     AttachView::All => {
-                        let prompt = if self.sessions.is_empty() {
+                        let prompt = if self.servers.is_empty() {
+                            choose_prompt(width, &["Attach (Esc)> ", "Attach> "])
+                        } else if self.sessions.is_empty() {
                             choose_prompt(
                                 width,
                                 &[
@@ -1002,7 +1084,9 @@ impl PickerState {
                         (prompt, Color::DarkCyan)
                     }
                     AttachView::Agents => {
-                        let prompt = if self.sessions.is_empty() {
+                        let prompt = if self.servers.is_empty() {
+                            choose_prompt(width, &["Agents (Ctrl-G all, Esc: back)> ", "Agents> "])
+                        } else if self.sessions.is_empty() {
                             choose_prompt(
                                 width,
                                 &[
@@ -1263,6 +1347,22 @@ fn step_selection(selected: &mut usize, len: usize, forward: bool) {
     }
 }
 
+fn format_loading(servers: &[String], is_refresh: bool) -> String {
+    let prefix = if is_refresh {
+        "Refreshing"
+    } else {
+        "Connecting to"
+    };
+    match servers {
+        [] => format!("{prefix}…"),
+        [one] => format!("{prefix} {one}…"),
+        [first, second] => format!("{prefix} {first}, {second}…"),
+        [first, second, rest @ ..] => {
+            format!("{prefix} {first}, {second}, +{} more…", rest.len())
+        }
+    }
+}
+
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
 }
@@ -1370,13 +1470,20 @@ impl Screen {
         state.render(out, columns, rows, self.use_color)
     }
 
-    pub(super) fn step(&mut self, state: &mut PickerState) -> io::Result<StepEvent> {
+    pub(super) fn step(
+        &mut self,
+        state: &mut PickerState,
+        has_pending_updates: bool,
+    ) -> io::Result<StepEvent> {
         let mut out = io::stdout();
         self.render(&mut out, state)?;
         loop {
             let (dirty, step) = handle_event(state, event::read()?);
             if let Some(step) = step {
                 return Ok(step);
+            }
+            if has_pending_updates && state.is_attach_mode() {
+                return Ok(StepEvent::FlushPending);
             }
             if dirty {
                 self.render(&mut out, state)?;
@@ -1387,7 +1494,8 @@ impl Screen {
     pub(super) async fn step_until(
         &mut self,
         state: &mut PickerState,
-        refresh: &mut Pin<Box<dyn Future<Output = super::DiscoveryOutcome>>>,
+        stream: &mut super::DiscoveryStream<'_>,
+        has_pending_updates: bool,
     ) -> io::Result<StepEvent> {
         let mut out = io::stdout();
         self.render(&mut out, state)?;
@@ -1397,13 +1505,21 @@ impl Screen {
         loop {
             tokio::select! {
                 biased;
-                refreshed = refresh.as_mut() => return Ok(StepEvent::Refreshed(refreshed)),
+                event = stream.next() => {
+                    return Ok(match event {
+                        Some(update) => StepEvent::Discovery(update),
+                        None => StepEvent::DiscoveryFinished,
+                    });
+                }
                 _ = tick.tick() => {
                     let mut dirty = false;
                     while event::poll(Duration::ZERO)? {
                         let (event_dirty, step) = handle_event(state, event::read()?);
                         if let Some(step) = step {
                             return Ok(step);
+                        }
+                        if has_pending_updates && state.is_attach_mode() {
+                            return Ok(StepEvent::FlushPending);
                         }
                         dirty |= event_dirty;
                     }
@@ -2866,5 +2982,141 @@ mod tests {
             state.handle_key(KeyCode::Char(']'), KeyModifiers::CONTROL),
             Some(Outcome::Cancel)
         );
+    }
+
+    #[test]
+    fn progressive_loading_renders_connecting_updates_and_timeout_warnings_and_preserves_focus() {
+        // 1. Instant startup with empty list shows "Connecting to ..." instead of "No sessions yet".
+        let mut state = PickerState::new(Vec::new(), Vec::new(), Vec::new());
+        state.set_loading(
+            vec!["local".to_owned(), "office".to_owned(), "lab".to_owned()],
+            false,
+        );
+        let mut buf = Vec::new();
+        state.render(&mut buf, 100, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("Connecting to local, office, +1 more…"));
+        assert!(!screen.contains("No sessions yet"));
+
+        // 2. Fast local server connects: its target appears immediately while remote servers still load.
+        let local_target = test_target(0, 0, "[local] work / 1 zsh", "session:1", "block:1");
+        let local_session = SessionChoice {
+            server_index: 0,
+            server_name: "local".to_owned(),
+            session_id: "session:1".to_owned(),
+            label: "work".to_owned(),
+        };
+        state.set_loading(vec!["office".to_owned(), "lab".to_owned()], false);
+        state.apply_server_update(
+            vec![local_target.clone()],
+            vec![local_session.clone()],
+            vec!["local".to_owned()],
+            None,
+            true,
+        );
+        let mut buf = Vec::new();
+        state.render(&mut buf, 100, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("[local]") && screen.contains("work") && screen.contains("1 zsh"));
+        assert!(screen.contains("Connecting to office, lab…"));
+
+        // 3. One remote server times out while the other is still connecting: banner notifies immediately.
+        state.set_loading(vec!["office".to_owned()], false);
+        state.apply_server_update(
+            vec![local_target.clone()],
+            vec![local_session.clone()],
+            vec!["local".to_owned()],
+            Some("lab: discovery timed out".to_owned()),
+            true,
+        );
+        let mut buf = Vec::new();
+        state.render(&mut buf, 100, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("lab: discovery timed out"));
+        assert!(screen.contains("Connecting to office…"));
+
+        // 4. Remaining remote server connects: banner settles to just the timeout warning.
+        let office_target = test_target(1, 1, "[office] api / 1 cargo", "session:2", "block:2");
+        let office_session = SessionChoice {
+            server_index: 1,
+            server_name: "office".to_owned(),
+            session_id: "session:2".to_owned(),
+            label: "api".to_owned(),
+        };
+        state.set_loading(Vec::new(), false);
+        state.apply_server_update(
+            vec![local_target.clone(), office_target.clone()],
+            vec![local_session.clone(), office_session.clone()],
+            vec!["local".to_owned(), "office".to_owned()],
+            None,
+            false,
+        );
+        state.finish_loading();
+        let mut buf = Vec::new();
+        state.render(&mut buf, 100, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(
+            screen.contains("[office]") && screen.contains("api") && screen.contains("1 cargo")
+        );
+        assert!(screen.contains("lab: discovery timed out"));
+        assert!(!screen.contains("Connecting to"));
+
+        // 5. Pending focus survives fast server arriving before the detached target's server.
+        state.reset_after_attach(
+            Some(FocusTarget {
+                server_name: "office".to_owned(),
+                session_id: "session:new".to_owned(),
+                block_id: "block:new".to_owned(),
+            }),
+            None,
+        );
+        state.set_loading(vec!["office".to_owned()], true);
+        // local refreshes first — pending_focus for office must stay armed.
+        state.apply_server_update(
+            vec![local_target.clone()],
+            vec![local_session.clone()],
+            vec!["local".to_owned()],
+            None,
+            true,
+        );
+        // office arrives next with the newly created block — it is focused automatically!
+        let new_office_target =
+            test_target(1, 1, "[office] fresh / 1 zsh", "session:new", "block:new");
+        let new_office_session = SessionChoice {
+            server_index: 1,
+            server_name: "office".to_owned(),
+            session_id: "session:new".to_owned(),
+            label: "fresh".to_owned(),
+        };
+        state.set_loading(Vec::new(), true);
+        state.apply_server_update(
+            vec![local_target, new_office_target],
+            vec![local_session, new_office_session],
+            vec!["local".to_owned(), "office".to_owned()],
+            None,
+            false,
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Outcome::Selected(Selection::Attach(
+                AttachSelection::Existing(1)
+            )))
+        );
+
+        // 6. When all servers fail on startup, body shows "No reachable servers" instead of Ctrl-N hint.
+        let mut empty = PickerState::new(Vec::new(), Vec::new(), Vec::new());
+        empty.apply_server_update(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some("remote: discovery timed out".to_owned()),
+            false,
+        );
+        empty.finish_loading();
+        let mut buf = Vec::new();
+        empty.render(&mut buf, 100, 10, false).unwrap();
+        let screen = String::from_utf8(buf).unwrap();
+        assert!(screen.contains("No reachable servers"));
+        assert!(screen.contains("remote: discovery timed out"));
     }
 }

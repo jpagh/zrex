@@ -12,7 +12,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app;
 use crate::config::{self, DISCOVERY_TIME, DetachKey, Server, ServerConfig};
-use crate::discovery::{LocalDiscovery, NO_SERVER_FOUND, fan_out, probe_local};
+use crate::discovery::{LocalDiscovery, NO_SERVER_FOUND, probe_local};
 use crate::rex::{BlockRef, ServerAddress, control::Control, proto::ApiError};
 use crate::session;
 use crate::text::{clean_one_line, clean_truncated, truncate_to_columns};
@@ -217,6 +217,7 @@ impl TargetLabel {
 }
 
 pub(super) struct DiscoveryOutcome {
+    server_slots: Vec<usize>,
     servers: Vec<Server>,
     sessions: Vec<SessionChoice>,
     choices: Vec<Target>,
@@ -231,10 +232,150 @@ struct LoadedServers {
     has_configured_sources: bool,
 }
 
-struct ServerDiscovery {
+pub(super) struct ServerDiscovery {
     sessions: Vec<(String, String)>,
     targets: Vec<Target>,
     missing_views: usize,
+}
+
+pub(super) struct ServerDiscoveryEvent {
+    pub(super) slot: usize,
+    pub(super) outcome: ServerProbeOutcome,
+}
+
+pub(super) enum ServerProbeOutcome {
+    Connected {
+        server: Server,
+        discovery: ServerDiscovery,
+    },
+    Skipped,
+    Failed {
+        warning: String,
+    },
+}
+
+pub(super) struct DiscoveryStream<'a> {
+    pending: Vec<(usize, String)>,
+    futures: FuturesUnordered<Pin<Box<dyn Future<Output = ServerDiscoveryEvent> + 'a>>>,
+}
+
+impl<'a> DiscoveryStream<'a> {
+    fn start(loaded: &LoadedServers) -> DiscoveryStream<'static> {
+        let servers = loaded.servers.clone();
+        let local_discovery = loaded.local_discovery;
+        let deadline = Instant::now() + DISCOVERY_TIME;
+        DiscoveryStream::new(
+            servers,
+            local_discovery,
+            async move |excluded| probe_local(local_discovery, excluded).await,
+            deadline,
+        )
+    }
+
+    fn new<F>(
+        servers: Vec<Server>,
+        local_discovery: LocalDiscovery,
+        local_probe: F,
+        deadline: Instant,
+    ) -> Self
+    where
+        F: AsyncFnOnce(&[ServerAddress]) -> Result<Option<(ServerAddress, Control)>> + 'a,
+    {
+        let saved_addresses: Vec<ServerAddress> = servers
+            .iter()
+            .map(|server| server.address.clone())
+            .collect();
+        let mut pending = Vec::with_capacity(servers.len() + 1);
+        let futures: FuturesUnordered<Pin<Box<dyn Future<Output = ServerDiscoveryEvent> + 'a>>> =
+            FuturesUnordered::new();
+
+        if local_discovery != LocalDiscovery::None {
+            pending.push((0, "local".to_owned()));
+            futures.push(Box::pin(async move {
+                let outcome = match timeout_at(deadline, local_probe(&saved_addresses)).await {
+                    Err(_) => ServerProbeOutcome::Failed {
+                        warning: "local server detection timed out".to_owned(),
+                    },
+                    Ok(Err(error)) => ServerProbeOutcome::Failed {
+                        warning: clean_one_line(&format!("{error:#}")),
+                    },
+                    Ok(Ok(None)) => match local_discovery {
+                        LocalDiscovery::Optional => ServerProbeOutcome::Skipped,
+                        LocalDiscovery::Required => ServerProbeOutcome::Failed {
+                            warning: "local: server is not running".to_owned(),
+                        },
+                        LocalDiscovery::None => unreachable!(),
+                    },
+                    Ok(Ok(Some((address, mut ctrl)))) => {
+                        if saved_addresses.contains(&address) {
+                            ServerProbeOutcome::Skipped
+                        } else {
+                            let server = Server {
+                                name: "local".to_owned(),
+                                address,
+                            };
+                            match discover_with_control(&mut ctrl, &server, deadline).await {
+                                Ok(discovery) => {
+                                    ServerProbeOutcome::Connected { server, discovery }
+                                }
+                                Err(error) => ServerProbeOutcome::Failed {
+                                    warning: format!(
+                                        "local: {}",
+                                        clean_one_line(&format!("{error:#}"))
+                                    ),
+                                },
+                            }
+                        }
+                    }
+                };
+                ServerDiscoveryEvent { slot: 0, outcome }
+            }));
+        }
+
+        for (idx, server) in servers.into_iter().enumerate() {
+            let slot = idx + 1;
+            let name = clean_one_line(&server.name);
+            pending.push((slot, name.clone()));
+            futures.push(Box::pin(async move {
+                let outcome = match timeout_at(deadline, Control::connect(&server.address, None))
+                    .await
+                    .context("discovery timed out")
+                {
+                    Ok(Ok((mut ctrl, _events))) => {
+                        match discover_with_control(&mut ctrl, &server, deadline).await {
+                            Ok(discovery) => ServerProbeOutcome::Connected { server, discovery },
+                            Err(error) => ServerProbeOutcome::Failed {
+                                warning: format!(
+                                    "{name}: {}",
+                                    clean_one_line(&format!("{error:#}"))
+                                ),
+                            },
+                        }
+                    }
+                    Ok(Err(error)) | Err(error) => ServerProbeOutcome::Failed {
+                        warning: format!("{name}: {}", clean_one_line(&format!("{error:#}"))),
+                    },
+                };
+                ServerDiscoveryEvent { slot, outcome }
+            }));
+        }
+
+        Self { pending, futures }
+    }
+
+    pub(super) fn pending_names(&self) -> Vec<String> {
+        self.pending.iter().map(|(_, name)| name.clone()).collect()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.futures.is_empty()
+    }
+
+    pub(super) async fn next(&mut self) -> Option<ServerDiscoveryEvent> {
+        let event = self.futures.next().await?;
+        self.pending.retain(|&(slot, _)| slot != event.slot);
+        Some(event)
+    }
 }
 
 fn missing_views_warning(server_name: &str, missing_views: usize) -> Option<String> {
@@ -243,14 +384,113 @@ fn missing_views_warning(server_name: &str, missing_views: usize) -> Option<Stri
 }
 
 impl DiscoveryOutcome {
+    fn empty() -> Self {
+        Self {
+            server_slots: Vec::new(),
+            servers: Vec::new(),
+            sessions: Vec::new(),
+            choices: Vec::new(),
+            warnings: Vec::new(),
+            attempted_any: false,
+        }
+    }
+
+    fn server_names(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .map(|server| clean_one_line(&server.name))
+            .collect()
+    }
+
     fn has_no_sources(&self, has_configured_sources: bool) -> bool {
         !has_configured_sources && !self.attempted_any
     }
 
+    #[cfg(test)]
     fn unreachable_error(&self) -> String {
         match self.warnings.as_slice() {
             [single] => single.clone(),
             _ => "no reachable servers".to_owned(),
+        }
+    }
+
+    fn upsert_server(
+        &mut self,
+        slot: usize,
+        server: Server,
+        discovery: ServerDiscovery,
+    ) -> Option<String> {
+        match self.server_slots.binary_search(&slot) {
+            Ok(server_index) => {
+                self.servers[server_index] = server;
+                self.replace_server(server_index, discovery)
+            }
+            Err(insert_idx) => {
+                self.server_slots.insert(insert_idx, slot);
+                self.servers.insert(insert_idx, server);
+                for session in &mut self.sessions {
+                    if session.server_index >= insert_idx {
+                        session.server_index += 1;
+                    }
+                }
+                for target in &mut self.choices {
+                    if target.server_index >= insert_idx {
+                        target.server_index += 1;
+                    }
+                }
+                self.replace_server(insert_idx, discovery)
+            }
+        }
+    }
+
+    fn remove_slot(&mut self, slot: usize) -> bool {
+        let Ok(remove_idx) = self.server_slots.binary_search(&slot) else {
+            return false;
+        };
+        let _ = self.replace_server(
+            remove_idx,
+            ServerDiscovery {
+                sessions: Vec::new(),
+                targets: Vec::new(),
+                missing_views: 0,
+            },
+        );
+        self.server_slots.remove(remove_idx);
+        self.servers.remove(remove_idx);
+        for session in &mut self.sessions {
+            if session.server_index > remove_idx {
+                session.server_index -= 1;
+            }
+        }
+        for target in &mut self.choices {
+            if target.server_index > remove_idx {
+                target.server_index -= 1;
+            }
+        }
+        true
+    }
+
+    fn apply_event(&mut self, event: ServerDiscoveryEvent) -> Option<String> {
+        if !matches!(event.outcome, ServerProbeOutcome::Skipped) {
+            self.attempted_any = true;
+        }
+        match event.outcome {
+            ServerProbeOutcome::Connected { server, discovery } => {
+                let warning = self.upsert_server(event.slot, server, discovery);
+                if let Some(warning) = &warning {
+                    self.warnings.push(warning.clone());
+                }
+                warning
+            }
+            ServerProbeOutcome::Skipped => {
+                self.remove_slot(event.slot);
+                None
+            }
+            ServerProbeOutcome::Failed { warning } => {
+                self.remove_slot(event.slot);
+                self.warnings.push(warning.clone());
+                Some(warning)
+            }
         }
     }
 
@@ -333,9 +573,9 @@ impl DiscoveryOutcome {
     }
 }
 
-fn discovery_warning_feedback(warnings: &[String]) -> Option<prompt::Feedback> {
+pub(super) fn format_warnings_summary(warnings: &[String]) -> Option<String> {
     let first = warnings.first()?;
-    let text = match warnings.len() {
+    Some(match warnings.len() {
         1 => first.clone(),
         len => {
             let rest = len - 1;
@@ -344,8 +584,12 @@ fn discovery_warning_feedback(warnings: &[String]) -> Option<prompt::Feedback> {
                 if rest == 1 { "" } else { "s" }
             )
         }
-    };
-    Some(prompt::Feedback {
+    })
+}
+
+#[cfg(test)]
+fn discovery_warning_feedback(warnings: &[String]) -> Option<prompt::Feedback> {
+    format_warnings_summary(warnings).map(|text| prompt::Feedback {
         text,
         is_error: true,
     })
@@ -390,7 +634,12 @@ fn classify_attach_result(
         Ok(app::AttachExit::Detached {
             double_detach: true,
             ..
-        }) => PostAttach::Quit,
+        })
+        | Ok(app::AttachExit::Cancelled { quit: true }) => PostAttach::Quit,
+        Ok(app::AttachExit::Cancelled { quit: false }) => PostAttach::Return {
+            focus: None,
+            feedback: None,
+        },
         Ok(app::AttachExit::Detached {
             session_id,
             block_id,
@@ -460,143 +709,103 @@ async fn execute_attach(
     }
 }
 
-type RefreshFuture = Pin<Box<dyn Future<Output = DiscoveryOutcome>>>;
-
-enum RefreshState {
-    Idle,
-    InFlight(RefreshFuture),
-    Ready(DiscoveryOutcome),
-}
-
-impl RefreshState {
-    fn clear(&mut self) {
-        *self = Self::Idle;
-    }
-
-    fn take_ready(&mut self) -> Option<DiscoveryOutcome> {
-        if matches!(self, Self::Ready(_)) {
-            match std::mem::replace(self, Self::Idle) {
-                Self::Ready(outcome) => Some(outcome),
-                _ => unreachable!(),
-            }
-        } else {
-            None
-        }
-    }
-}
-
-fn start_refresh(loaded: &LoadedServers) -> RefreshFuture {
-    let servers = loaded.servers.clone();
-    let local_discovery = loaded.local_discovery;
-    Box::pin(async move {
-        let deadline = Instant::now() + DISCOVERY_TIME;
-        discover_all(
-            servers,
-            local_discovery,
-            async move |excluded| probe_local(local_discovery, excluded).await,
-            deadline,
-        )
-        .await
-    })
-}
-
-fn apply_refresh_outcome(
+fn apply_discovery_event(
     outcome: &mut DiscoveryOutcome,
     state: &mut prompt::PickerState,
-    refreshed: DiscoveryOutcome,
+    event: ServerDiscoveryEvent,
+    still_loading: bool,
 ) {
-    if refreshed.servers.is_empty() {
-        let message = if refreshed.warnings.is_empty() {
-            "No Rex servers reachable".to_owned()
-        } else {
-            refreshed.unreachable_error()
-        };
-        state.finish_refresh_error(prompt::Feedback {
-            text: message,
-            is_error: true,
-        });
-        return;
-    }
-    let warning = discovery_warning_feedback(&refreshed.warnings);
-    let server_names: Vec<String> = refreshed
-        .servers
-        .iter()
-        .map(|server| clean_one_line(&server.name))
-        .collect();
-    *outcome = refreshed;
-    state.apply_discovery(
+    let warning = outcome.apply_event(event);
+    state.apply_server_update(
         outcome.choices.clone(),
         outcome.sessions.clone(),
-        server_names,
+        outcome.server_names(),
         warning,
+        still_loading,
     );
 }
 
 pub async fn run(server_config: &ServerConfig, detach_key: DetachKey) -> Result<()> {
     app::ensure_terminal()?;
     let loaded = load_servers(server_config).await?;
-    let mut outcome = start_refresh(&loaded).await;
-    if outcome.servers.is_empty() {
-        if outcome.has_no_sources(loaded.has_configured_sources) {
-            bail!("{NO_SERVER_FOUND}");
-        }
-        if outcome.warnings.len() > 1 {
-            for warning in &outcome.warnings {
-                eprintln!("zrex pick: {warning}");
-            }
-        }
-        bail!("{}", outcome.unreachable_error());
-    }
-    let initial_feedback = discovery_warning_feedback(&outcome.warnings);
-    for warning in outcome.warnings.drain(..) {
-        eprintln!("zrex pick: {warning}");
-    }
-
-    let server_names: Vec<String> = outcome
-        .servers
-        .iter()
-        .map(|server| clean_one_line(&server.name))
-        .collect();
 
     let raw_mode = prompt::RawModeGuard::enter()?;
     let mut screen = prompt::Screen::enter(&raw_mode)?;
-    let mut state = prompt::PickerState::new(
-        outcome.choices.clone(),
-        outcome.sessions.clone(),
-        server_names,
-    );
+    let mut outcome = DiscoveryOutcome::empty();
+    let mut state = prompt::PickerState::new(Vec::new(), Vec::new(), Vec::new());
     state.set_detach_key(detach_key);
-    if let Some(feedback) = initial_feedback {
-        state.set_feedback(feedback);
-    }
 
-    let mut refresh = RefreshState::Idle;
+    let initial_stream = DiscoveryStream::start(&loaded);
+    state.set_loading(initial_stream.pending_names(), false);
+    let mut stream: Option<DiscoveryStream<'static>> =
+        (!initial_stream.is_empty()).then_some(initial_stream);
+    let mut pending_updates: Vec<ServerDiscoveryEvent> = Vec::new();
+    let mut initial_pass = true;
 
     loop {
-        if state.is_attach_mode()
-            && let Some(refreshed) = refresh.take_ready()
-        {
-            apply_refresh_outcome(&mut outcome, &mut state, refreshed);
+        if state.is_attach_mode() && !pending_updates.is_empty() {
+            let still_loading = stream.is_some();
+            for event in pending_updates.drain(..) {
+                apply_discovery_event(&mut outcome, &mut state, event, still_loading);
+            }
+            if !still_loading {
+                state.finish_loading();
+            }
         }
 
-        let step = match &mut refresh {
-            RefreshState::InFlight(future) => screen.step_until(&mut state, future).await?,
-            RefreshState::Idle | RefreshState::Ready(_) => screen.step(&mut state)?,
+        if initial_pass && stream.is_none() && pending_updates.is_empty() {
+            initial_pass = false;
+            state.finish_loading();
+            if outcome.servers.is_empty() && outcome.has_no_sources(loaded.has_configured_sources) {
+                drop(screen);
+                drop(raw_mode);
+                bail!("{NO_SERVER_FOUND}");
+            }
+        }
+
+        let has_pending = !pending_updates.is_empty();
+        let step = match &mut stream {
+            Some(active) => screen.step_until(&mut state, active, has_pending).await?,
+            None => screen.step(&mut state, has_pending)?,
         };
 
         match step {
             prompt::StepEvent::Cancel => return Ok(()),
-            prompt::StepEvent::Refreshed(refreshed) => {
-                if state.is_attach_mode() {
-                    refresh.clear();
-                    apply_refresh_outcome(&mut outcome, &mut state, refreshed);
+            prompt::StepEvent::FlushPending => {}
+            prompt::StepEvent::Discovery(event) => {
+                let done = stream.as_ref().is_none_or(DiscoveryStream::is_empty);
+                let pending_names = if done {
+                    stream = None;
+                    Vec::new()
                 } else {
-                    state.clear_refreshing();
-                    refresh = RefreshState::Ready(refreshed);
+                    stream
+                        .as_ref()
+                        .map_or_else(Vec::new, DiscoveryStream::pending_names)
+                };
+                state.set_loading(pending_names, !initial_pass);
+                if state.is_attach_mode() {
+                    apply_discovery_event(&mut outcome, &mut state, event, !done);
+                    if done {
+                        state.finish_loading();
+                    }
+                } else {
+                    pending_updates.push(event);
+                }
+            }
+            prompt::StepEvent::DiscoveryFinished => {
+                stream = None;
+                state.set_loading(Vec::new(), !initial_pass);
+                if state.is_attach_mode() {
+                    for event in pending_updates.drain(..) {
+                        apply_discovery_event(&mut outcome, &mut state, event, false);
+                    }
+                    state.finish_loading();
                 }
             }
             prompt::StepEvent::Selected(prompt::Selection::Attach(selection)) => {
-                refresh.clear();
+                let _ = stream.take();
+                pending_updates.clear();
+                initial_pass = false;
                 drop(screen);
                 let (error_prefix, server_name, result) =
                     execute_attach(&outcome, selection, detach_key).await;
@@ -607,13 +816,16 @@ pub async fn run(server_config: &ServerConfig, detach_key: DetachKey) -> Result<
                             return Ok(());
                         }
                         screen = prompt::Screen::enter(&raw_mode)?;
+                        outcome.warnings.clear();
+                        let next_stream = DiscoveryStream::start(&loaded);
                         state.reset_after_attach(focus, feedback);
-                        refresh = RefreshState::InFlight(start_refresh(&loaded));
+                        state.set_loading(next_stream.pending_names(), true);
+                        stream = (!next_stream.is_empty()).then_some(next_stream);
                     }
                 }
             }
             prompt::StepEvent::Selected(prompt::Selection::Rename { target, label }) => {
-                refresh.clear();
+                initial_pass = false;
                 run_manage_op(
                     &mut screen,
                     &mut state,
@@ -626,7 +838,7 @@ pub async fn run(server_config: &ServerConfig, detach_key: DetachKey) -> Result<
                 .await?;
             }
             prompt::StepEvent::Selected(prompt::Selection::Kill { target }) => {
-                refresh.clear();
+                initial_pass = false;
                 run_manage_op(
                     &mut screen,
                     &mut state,
@@ -808,6 +1020,7 @@ fn finish_manage(
     }
 }
 
+#[cfg(test)]
 async fn discover_all<F>(
     servers: Vec<Server>,
     local_discovery: LocalDiscovery,
@@ -817,66 +1030,12 @@ async fn discover_all<F>(
 where
     F: AsyncFnOnce(&[ServerAddress]) -> Result<Option<(ServerAddress, Control)>>,
 {
-    let fan = fan_out(
-        servers,
-        local_discovery,
-        local_probe,
-        deadline,
-        "discovery timed out",
-        |server, mut ctrl, deadline| async move {
-            discover_with_control(&mut ctrl, &server, deadline).await
-        },
-    )
-    .await;
-
-    let mut warnings = Vec::new();
-    if let Some(error) = fan.local_error {
-        warnings.push(error);
+    let mut stream = DiscoveryStream::new(servers, local_discovery, local_probe, deadline);
+    let mut outcome = DiscoveryOutcome::empty();
+    while let Some(event) = stream.next().await {
+        outcome.apply_event(event);
     }
-
-    let mut reachable_servers = Vec::new();
-    let mut sessions = Vec::new();
-    let mut choices = Vec::new();
-    for (server, result) in fan.entries {
-        match result {
-            Ok(discovery) => {
-                let server_name = clean_one_line(&server.name);
-                if let Some(warning) = missing_views_warning(&server_name, discovery.missing_views)
-                {
-                    warnings.push(warning);
-                }
-                let server_index = reachable_servers.len();
-                let session_offset = sessions.len();
-                for (session_id, label) in discovery.sessions {
-                    sessions.push(SessionChoice {
-                        server_index,
-                        server_name: server_name.clone(),
-                        session_id,
-                        label,
-                    });
-                }
-                for mut target in discovery.targets {
-                    target.server_index = server_index;
-                    target.session_index += session_offset;
-                    choices.push(target);
-                }
-                reachable_servers.push(server);
-            }
-            Err(error) => warnings.push(format!(
-                "{}: {}",
-                clean_one_line(&server.name),
-                clean_one_line(&format!("{error:#}"))
-            )),
-        }
-    }
-
-    DiscoveryOutcome {
-        servers: reachable_servers,
-        sessions,
-        choices,
-        warnings,
-        attempted_any: fan.attempted_any,
-    }
+    outcome
 }
 
 async fn load_servers(server_config: &ServerConfig) -> Result<LoadedServers> {
@@ -2568,6 +2727,7 @@ mod tests {
             .await
             .unwrap();
         let mut outcome = DiscoveryOutcome {
+            server_slots: vec![1, 2],
             servers: vec![
                 Server {
                     name: server.name.clone(),
@@ -3103,8 +3263,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_refresh_outcome_updates_targets_and_handles_unreachable_servers() {
+    fn apply_discovery_event_updates_incrementally_and_handles_timeouts() {
         let mut outcome = DiscoveryOutcome {
+            server_slots: vec![0],
             servers: vec![Server {
                 name: "local".to_owned(),
                 address: "http://127.0.0.1:7297".parse().unwrap(),
@@ -3139,46 +3300,49 @@ mod tests {
             None,
         );
 
-        // If refresh finds no reachable servers, keep the existing server list and report the error.
-        let unreachable = DiscoveryOutcome {
-            servers: Vec::new(),
-            sessions: Vec::new(),
-            choices: Vec::new(),
-            warnings: vec!["local: connection refused".to_owned()],
-            attempted_any: true,
-        };
-        apply_refresh_outcome(&mut outcome, &mut state, unreachable);
+        // If a remote server times out while local is still reachable, local stays intact and
+        // the timeout warning is surfaced immediately.
+        apply_discovery_event(
+            &mut outcome,
+            &mut state,
+            ServerDiscoveryEvent {
+                slot: 1,
+                outcome: ServerProbeOutcome::Failed {
+                    warning: "remote: discovery timed out".to_owned(),
+                },
+            },
+            true,
+        );
         assert_eq!(outcome.servers.len(), 1);
         assert_eq!(outcome.choices.len(), 1);
+        assert_eq!(outcome.warnings, vec!["remote: discovery timed out"]);
 
-        // A subsequent successful refresh replaces outcome and exposes newly discovered sessions.
-        let refreshed = DiscoveryOutcome {
-            servers: vec![Server {
-                name: "local".to_owned(),
-                address: "http://127.0.0.1:7297".parse().unwrap(),
-            }],
-            sessions: vec![
-                SessionChoice {
-                    server_index: 0,
-                    server_name: "local".to_owned(),
-                    session_id: "session:1".to_owned(),
-                    label: "work".to_owned(),
+        // A subsequent successful update for local replaces slot 0 in place and exposes new sessions.
+        apply_discovery_event(
+            &mut outcome,
+            &mut state,
+            ServerDiscoveryEvent {
+                slot: 0,
+                outcome: ServerProbeOutcome::Connected {
+                    server: Server {
+                        name: "local".to_owned(),
+                        address: "http://127.0.0.1:7297".parse().unwrap(),
+                    },
+                    discovery: ServerDiscovery {
+                        sessions: vec![
+                            ("session:1".to_owned(), "work".to_owned()),
+                            ("session:2".to_owned(), "fresh".to_owned()),
+                        ],
+                        targets: vec![
+                            test_target(0, 0, "[local] work / 1 zsh", "session:1", "block:1"),
+                            test_target(0, 1, "[local] fresh / 1 zsh", "session:2", "block:2"),
+                        ],
+                        missing_views: 0,
+                    },
                 },
-                SessionChoice {
-                    server_index: 0,
-                    server_name: "local".to_owned(),
-                    session_id: "session:2".to_owned(),
-                    label: "fresh".to_owned(),
-                },
-            ],
-            choices: vec![
-                test_target(0, 0, "[local] work / 1 zsh", "session:1", "block:1"),
-                test_target(0, 1, "[local] fresh / 1 zsh", "session:2", "block:2"),
-            ],
-            warnings: Vec::new(),
-            attempted_any: true,
-        };
-        apply_refresh_outcome(&mut outcome, &mut state, refreshed);
+            },
+            false,
+        );
         assert_eq!(outcome.choices.len(), 2);
         assert_eq!(outcome.sessions.len(), 2);
     }
@@ -3229,5 +3393,249 @@ mod tests {
         })
         .collect();
         assert_eq!(ranks, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn discovery_stream_yields_fast_servers_immediately_before_slow_server_times_out() {
+        use futures_util::SinkExt;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_hdr_async;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        // Fast server responds immediately.
+        let fast_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast_addr = fast_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = fast_listener.accept().await.unwrap();
+            #[allow(
+                clippy::result_large_err,
+                reason = "tungstenite fixes the callback error type"
+            )]
+            let mut ws = accept_hdr_async(stream, |req: &Request, mut res: Response| {
+                if let Some(proto) = req.headers().get("Sec-WebSocket-Protocol") {
+                    res.headers_mut()
+                        .insert("Sec-WebSocket-Protocol", proto.clone());
+                }
+                Ok(res)
+            })
+            .await
+            .unwrap();
+            let _ = ws.next().await;
+            ws.send(Message::text(
+                json!({"type": "welcome", "api_revision": crate::rex::proto::API_REVISION})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let req: Value = serde_json::from_str(&text).unwrap();
+                let id = req["id"].as_str().unwrap();
+                let payload = match req["method"].as_str().unwrap() {
+                    "session.attach_all" => {
+                        json!({"sessions": [{"session_id": "session:fast", "label": "work"}]})
+                    }
+                    "session.view" => json!({
+                        "active_window_id": "window:1",
+                        "windows": [{
+                            "window_id": "window:1",
+                            "label": "dev",
+                            "focused_block_id": "block:1",
+                            "layers": [{"blocks": [{"block_id": "block:1", "label": "shell"}]}]
+                        }]
+                    }),
+                    "com.superlogical.terminal.title" => json!({"title": ""}),
+                    "com.superlogical.terminal.program_status" => json!({"records": []}),
+                    "com.superlogical.terminal.process" => {
+                        json!({"foreground": null, "child": null})
+                    }
+                    other => panic!("unexpected method {other}"),
+                };
+                ws.send(Message::text(
+                    json!({"type": "response", "id": id, "seq": 0, "payload": payload}).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+
+        // Slow/rebooting server accepts TCP and never responds.
+        let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow_listener.local_addr().unwrap();
+        let slow_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = slow_listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let servers = vec![
+            Server {
+                name: "rebooting".to_owned(),
+                address: format!("http://{slow_addr}").parse().unwrap(),
+            },
+            Server {
+                name: "fast".to_owned(),
+                address: format!("http://{fast_addr}").parse().unwrap(),
+            },
+        ];
+
+        let started = Instant::now();
+        let mut stream = DiscoveryStream::new(
+            servers,
+            LocalDiscovery::None,
+            async |_| Ok(None),
+            started + Duration::from_millis(300),
+        );
+        assert_eq!(stream.pending_names(), vec!["rebooting", "fast"]);
+
+        // First event is the fast server, arriving well before the 300ms timeout.
+        let first = stream.next().await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "fast server waited {:?}",
+            started.elapsed()
+        );
+        assert_eq!(first.slot, 2);
+        assert!(matches!(
+            first.outcome,
+            ServerProbeOutcome::Connected { .. }
+        ));
+        assert_eq!(stream.pending_names(), vec!["rebooting"]);
+
+        let mut outcome = DiscoveryOutcome::empty();
+        assert_eq!(outcome.apply_event(first), None);
+        assert_eq!(outcome.server_names(), vec!["fast"]);
+        assert_eq!(outcome.choices.len(), 1);
+
+        // Second event is the slow server timing out at the deadline.
+        let second = stream.next().await.unwrap();
+        assert_eq!(second.slot, 1);
+        assert!(stream.pending_names().is_empty());
+        assert!(stream.is_empty());
+        let warning = outcome.apply_event(second).unwrap();
+        assert!(
+            warning.contains("rebooting:") && warning.contains("timed out"),
+            "unexpected warning: {warning}"
+        );
+        assert_eq!(outcome.server_names(), vec!["fast"]);
+        assert!(stream.next().await.is_none());
+        slow_task.abort();
+    }
+
+    #[test]
+    fn discovery_outcome_maintains_canonical_order_and_removes_timed_out_servers() {
+        let mut outcome = DiscoveryOutcome::empty();
+
+        // Slot 2 arrives first, then slot 0, then slot 1: servers/sessions/choices stay ordered.
+        outcome.apply_event(ServerDiscoveryEvent {
+            slot: 2,
+            outcome: ServerProbeOutcome::Connected {
+                server: Server {
+                    name: "beta".to_owned(),
+                    address: "http://10.0.0.2:7297".parse().unwrap(),
+                },
+                discovery: ServerDiscovery {
+                    sessions: vec![("s:beta".to_owned(), "b".to_owned())],
+                    targets: vec![test_target(0, 0, "[beta] b / 1 zsh", "s:beta", "b:beta")],
+                    missing_views: 0,
+                },
+            },
+        });
+        outcome.apply_event(ServerDiscoveryEvent {
+            slot: 0,
+            outcome: ServerProbeOutcome::Connected {
+                server: Server {
+                    name: "local".to_owned(),
+                    address: "http://127.0.0.1:7297".parse().unwrap(),
+                },
+                discovery: ServerDiscovery {
+                    sessions: vec![("s:local".to_owned(), "l".to_owned())],
+                    targets: vec![test_target(0, 0, "[local] l / 1 zsh", "s:local", "b:local")],
+                    missing_views: 0,
+                },
+            },
+        });
+        outcome.apply_event(ServerDiscoveryEvent {
+            slot: 1,
+            outcome: ServerProbeOutcome::Connected {
+                server: Server {
+                    name: "alpha".to_owned(),
+                    address: "http://10.0.0.1:7297".parse().unwrap(),
+                },
+                discovery: ServerDiscovery {
+                    sessions: vec![("s:alpha".to_owned(), "a".to_owned())],
+                    targets: vec![test_target(0, 0, "[alpha] a / 1 zsh", "s:alpha", "b:alpha")],
+                    missing_views: 0,
+                },
+            },
+        });
+
+        assert_eq!(outcome.server_names(), vec!["local", "alpha", "beta"]);
+        assert_eq!(
+            outcome
+                .sessions
+                .iter()
+                .map(|s| (s.server_index, s.server_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "local"), (1, "alpha"), (2, "beta")]
+        );
+        assert_eq!(
+            outcome
+                .choices
+                .iter()
+                .map(|t| (t.server_index, t.session_index, t.block_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, "b:local"), (1, 1, "b:alpha"), (2, 2, "b:beta")]
+        );
+
+        // If alpha later times out on refresh, its stale entries are removed and beta reindexes cleanly.
+        let warning = outcome.apply_event(ServerDiscoveryEvent {
+            slot: 1,
+            outcome: ServerProbeOutcome::Failed {
+                warning: "alpha: discovery timed out".to_owned(),
+            },
+        });
+        assert_eq!(warning.as_deref(), Some("alpha: discovery timed out"));
+        assert_eq!(outcome.server_names(), vec!["local", "beta"]);
+        assert_eq!(
+            outcome
+                .sessions
+                .iter()
+                .map(|s| (s.server_index, s.server_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "local"), (1, "beta")]
+        );
+        assert_eq!(
+            outcome
+                .choices
+                .iter()
+                .map(|t| (t.server_index, t.session_index, t.block_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, "b:local"), (1, 1, "b:beta")]
+        );
+    }
+
+    #[test]
+    fn classify_attach_result_handles_cancelled_pre_attach() {
+        assert_eq!(
+            classify_attach_result(
+                "Attach failed",
+                "remote".to_owned(),
+                Ok(app::AttachExit::Cancelled { quit: false }),
+            ),
+            PostAttach::Return {
+                focus: None,
+                feedback: None,
+            }
+        );
+        assert_eq!(
+            classify_attach_result(
+                "Attach failed",
+                "remote".to_owned(),
+                Ok(app::AttachExit::Cancelled { quit: true }),
+            ),
+            PostAttach::Quit
+        );
     }
 }
