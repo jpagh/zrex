@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and package without creating a release
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -46,7 +52,8 @@ jobs:
 
       - name: Package
         run: |
-          name="zrex-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # A branch ref contains slashes, which would break the upload glob.
+          name="zrex-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/zrex" "dist/${name}/"
           cp README.md "dist/${name}/"
@@ -60,6 +67,8 @@ jobs:
 
   release:
     needs: build
+    # Publish on a tag push, or on a dispatch that leaves dry_run off.
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || inputs.dry_run == false }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
