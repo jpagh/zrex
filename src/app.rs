@@ -2895,8 +2895,8 @@ mod tests {
         let probed = probe_theme_with(
             &mut query_wr,
             &mut reply_rd,
-            Duration::from_millis(100),
             Duration::from_millis(500),
+            Duration::from_millis(2000),
         );
         drop(query_wr);
         terminal.join().unwrap();
@@ -2907,21 +2907,49 @@ mod tests {
 
         // 2) If a batch times out mid-OSC-4 right before `5f\x07`, probing
         // stops after that batch and returns `da1_seen == false` + the tail.
+        // The reply follows the query instead of a fixed sleep, so a loaded
+        // runner neither lands it before the stale-input drain nor after the
+        // batch gives up.
+        struct SignalOnWrite<'a> {
+            out: &'a mut Vec<u8>,
+            written: std::sync::mpsc::Sender<()>,
+        }
+
+        impl std::io::Write for SignalOnWrite<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                let written = self.out.write(buf)?;
+                let _ = self.written.send(());
+                Ok(written)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.out.flush()
+            }
+        }
+
         let (mut in_rd, mut in_wr) = std::io::pipe().unwrap();
+        let (written, written_rd) = std::sync::mpsc::channel();
+        let (release, release_rd) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
+            written_rd.recv().unwrap();
             in_wr
                 .write_all(b"\x1b]10;rgb:1111/2222/3333\x1b\\\x1b]4;149;rgb:afaf/d7d7/5f")
                 .unwrap();
-            std::thread::sleep(Duration::from_millis(80));
+            // Hold the pipe open until the probe gives up, so the batch ends by
+            // its idle timeout and not by end-of-file.
+            release_rd.recv().unwrap();
         });
         let mut out = Vec::new();
         let probed = probe_theme_with(
-            &mut out,
+            &mut SignalOnWrite {
+                out: &mut out,
+                written,
+            },
             &mut in_rd,
-            Duration::from_millis(25),
-            Duration::from_millis(70),
+            Duration::from_millis(250),
+            Duration::from_millis(750),
         );
+        let _ = release.send(());
         writer.join().unwrap();
         assert!(!probed.da1_seen);
         assert_eq!(probed.tail, b"\x1b]4;149;rgb:afaf/d7d7/5f");
