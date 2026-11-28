@@ -8,6 +8,11 @@ mod text;
 
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -29,7 +34,7 @@ Usage:
   zrex [--server SERVER] [--detach-key KEY] p|pick
   zrex [--server SERVER] [--detach-key KEY] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]
   zrex [--server SERVER] kill SESSION
-  zrex completion zsh|bash|fish
+  zrex completion zsh|bash|fish [--install [--dir DIR]]
   zrex --help | --version
 
 The server comes from --server (-S), or from REX_SERVER, and may be a saved
@@ -54,7 +59,9 @@ running local server and saved servers from ~/.config/zrex/config.toml (or
 $XDG_CONFIG_HOME/zrex/config.toml), skipping an absent local server when saved
 servers are configured and returning an error when neither is available.
 completion prints a shell completion script that completes server names, session
-labels, window numbers and labels, and block numbers and labels. pick (or p)
+labels, window numbers and labels, and block numbers and labels. Pass --install
+(optionally with --dir DIR) to write it to the shell's user completion directory.
+pick (or p)
 fuzzy-searches existing sessions, windows, and splits on the default (when
 running) and saved servers (~/.config/zrex/config.toml, or
 $XDG_CONFIG_HOME/zrex/config.toml). With --server it searches only that server.
@@ -93,8 +100,17 @@ enum Command {
     Kill {
         target: String,
     },
-    Completion(Shell),
+    Completion {
+        shell: Shell,
+        mode: CompletionMode,
+    },
     Unknown(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CompletionMode {
+    Print,
+    Install { dir: Option<PathBuf> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,7 +137,7 @@ impl Subcommand {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shell {
     Zsh,
     Bash,
@@ -140,13 +156,74 @@ impl Shell {
         }
     }
 
-    fn script(&self) -> &'static str {
+    fn script(self) -> &'static str {
         match self {
             Self::Zsh => include_str!("../completions/zrex.zsh"),
             Self::Bash => include_str!("../completions/zrex.bash"),
             Self::Fish => include_str!("../completions/zrex.fish"),
         }
     }
+
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Zsh => "_zrex",
+            Self::Bash => "zrex",
+            Self::Fish => "zrex.fish",
+        }
+    }
+
+    fn default_install_dir(self, env: &InstallEnv) -> Result<PathBuf> {
+        let dir = match self {
+            Self::Bash => env
+                .data_home()
+                .map(|dir| dir.join("bash-completion/completions")),
+            Self::Fish => env.config_home().map(|dir| dir.join("fish/completions")),
+            Self::Zsh => env.data_home().map(|dir| dir.join("zsh/site-functions")),
+        };
+        dir.ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not determine completion directory (HOME is not set); pass --dir DIR"
+            )
+        })
+    }
+}
+
+struct InstallEnv {
+    xdg_config_home: Option<OsString>,
+    xdg_data_home: Option<OsString>,
+    home_dir: Option<PathBuf>,
+    fpath: Option<OsString>,
+}
+
+impl InstallEnv {
+    fn from_env() -> Self {
+        Self {
+            xdg_config_home: env::var_os("XDG_CONFIG_HOME"),
+            xdg_data_home: env::var_os("XDG_DATA_HOME"),
+            home_dir: env::home_dir(),
+            fpath: env::var_os("FPATH"),
+        }
+    }
+
+    fn config_home(&self) -> Option<PathBuf> {
+        absolute_env_dir(self.xdg_config_home.as_deref())
+            .or_else(|| self.home_dir.as_ref().map(|home| home.join(".config")))
+    }
+
+    fn data_home(&self) -> Option<PathBuf> {
+        absolute_env_dir(self.xdg_data_home.as_deref())
+            .or_else(|| self.home_dir.as_ref().map(|home| home.join(".local/share")))
+    }
+
+    fn fpath_contains(&self, dir: &Path) -> bool {
+        self.fpath
+            .as_deref()
+            .is_some_and(|raw| env::split_paths(raw).any(|entry| entry == dir))
+    }
+}
+
+fn absolute_env_dir(raw: Option<&OsStr>) -> Option<PathBuf> {
+    raw.map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
 #[derive(Clone, Copy)]
@@ -155,6 +232,7 @@ enum ValueOption {
     Window,
     Block,
     DetachKey,
+    Dir,
 }
 
 #[derive(Default)]
@@ -165,6 +243,8 @@ struct Arguments {
     window: Option<String>,
     block: Option<String>,
     detach_key: Option<String>,
+    install: bool,
+    dir: Option<String>,
     pending: Option<ValueOption>,
     early_command: Option<Command>,
 }
@@ -181,6 +261,7 @@ impl Arguments {
                     ValueOption::Window => &mut parsed.window,
                     ValueOption::Block => &mut parsed.block,
                     ValueOption::DetachKey => &mut parsed.detach_key,
+                    ValueOption::Dir => &mut parsed.dir,
                 };
                 *slot = Some(arg);
                 continue;
@@ -192,6 +273,8 @@ impl Arguments {
                 "-w" | "--window" => parsed.pending = Some(ValueOption::Window),
                 "-b" | "--block" => parsed.pending = Some(ValueOption::Block),
                 "-d" | "--detach-key" => parsed.pending = Some(ValueOption::DetachKey),
+                "--install" => parsed.install = true,
+                "--dir" => parsed.pending = Some(ValueOption::Dir),
                 _ if parsed.command.is_none() => parsed.command = Some(arg),
                 _ if parsed.target.is_none() => parsed.target = Some(arg),
                 _ => anyhow::bail!("unexpected argument {arg}"),
@@ -215,6 +298,8 @@ fn parse_args(
         window,
         block,
         detach_key,
+        install,
+        dir,
         pending,
         early_command,
     } = Arguments::scan(args)?;
@@ -231,30 +316,54 @@ fn parse_args(
         Some(ValueOption::DetachKey) => {
             anyhow::bail!("--detach-key needs a key such as ctrl-\\, ctrl-], or none")
         }
+        Some(ValueOption::Dir) => anyhow::bail!("--dir needs a directory path"),
         None => {}
     }
     let cmd = match command.as_deref() {
         Some(name) => match Subcommand::parse(name) {
             Some(Subcommand::List) => {
-                if target.is_some() || window.is_some() || block.is_some() || detach_key.is_some() {
+                if target.is_some()
+                    || window.is_some()
+                    || block.is_some()
+                    || detach_key.is_some()
+                    || install
+                    || dir.is_some()
+                {
                     anyhow::bail!("usage: zrex [--server SERVER] ls");
                 }
                 Command::List
             }
             Some(Subcommand::Pick) => {
-                if target.is_some() || window.is_some() || block.is_some() {
+                if target.is_some()
+                    || window.is_some()
+                    || block.is_some()
+                    || install
+                    || dir.is_some()
+                {
                     anyhow::bail!("usage: zrex [--server SERVER] [--detach-key KEY] p|pick");
                 }
                 Command::Pick { detach_key }
             }
-            Some(Subcommand::Attach) => Command::Attach {
-                target,
-                window,
-                block,
-                detach_key,
-            },
+            Some(Subcommand::Attach) => {
+                if install || dir.is_some() {
+                    anyhow::bail!(
+                        "usage: zrex [--server SERVER] [--detach-key KEY] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]"
+                    );
+                }
+                Command::Attach {
+                    target,
+                    window,
+                    block,
+                    detach_key,
+                }
+            }
             Some(Subcommand::Kill) => {
-                if window.is_some() || block.is_some() || detach_key.is_some() {
+                if window.is_some()
+                    || block.is_some()
+                    || detach_key.is_some()
+                    || install
+                    || dir.is_some()
+                {
                     anyhow::bail!("usage: zrex [--server SERVER] kill SESSION");
                 }
                 match target {
@@ -263,12 +372,19 @@ fn parse_args(
                 }
             }
             Some(Subcommand::Completion) => {
-                if window.is_some() || block.is_some() || detach_key.is_some() {
-                    anyhow::bail!("usage: zrex completion zsh|bash|fish");
+                if window.is_some()
+                    || block.is_some()
+                    || detach_key.is_some()
+                    || (dir.is_some() && !install)
+                {
+                    anyhow::bail!("usage: zrex completion zsh|bash|fish [--install [--dir DIR]]");
                 }
-                match target.as_deref() {
+                if dir.as_deref() == Some("") {
+                    anyhow::bail!("--dir needs a directory path");
+                }
+                let shell = match target.as_deref() {
                     Some(other) => match Shell::parse(other) {
-                        Some(shell) => Command::Completion(shell),
+                        Some(shell) => shell,
                         None => {
                             anyhow::bail!(
                                 "no completion script for {other}; use zsh, bash, or fish"
@@ -276,7 +392,15 @@ fn parse_args(
                         }
                     },
                     None => anyhow::bail!("completion needs zsh, bash, or fish"),
-                }
+                };
+                let mode = if install {
+                    CompletionMode::Install {
+                        dir: dir.map(PathBuf::from),
+                    }
+                } else {
+                    CompletionMode::Print
+                };
+                Command::Completion { shell, mode }
             }
             None => Command::Unknown(name.to_owned()),
         },
@@ -328,10 +452,17 @@ async fn main() -> Result<()> {
             app::attach(&server_config, target, window, block, detach_key).await
         }
         Command::Kill { target } => kill(&server_config, &target).await,
-        Command::Completion(shell) => {
-            print!("{}", shell.script());
-            Ok(())
-        }
+        Command::Completion { shell, mode } => match mode {
+            CompletionMode::Print => {
+                print!("{}", shell.script());
+                Ok(())
+            }
+            CompletionMode::Install { dir } => {
+                let message = install_completion(shell, dir.as_deref(), &InstallEnv::from_env())?;
+                println!("{message}");
+                Ok(())
+            }
+        },
         Command::Unknown(other) => {
             eprintln!("unknown command {other}\n\n{USAGE}");
             std::process::exit(2);
@@ -627,6 +758,86 @@ fn clean_title(title: &str) -> String {
     clean_truncated(title, 80)
 }
 
+fn install_completion(shell: Shell, dir: Option<&Path>, env: &InstallEnv) -> Result<String> {
+    let target_dir = match dir {
+        Some(dir) => dir.to_path_buf(),
+        None => shell.default_install_dir(env)?,
+    };
+    fs::create_dir_all(&target_dir)
+        .with_context(|| format!("could not create {}", target_dir.display()))?;
+    let target_path = target_dir.join(shell.filename());
+    write_file_atomic(&target_dir, &target_path, shell.script().as_bytes())?;
+
+    let mut message = format!("installed {}", target_path.display());
+    if shell == Shell::Zsh {
+        if env.fpath_contains(&target_dir) {
+            message.push_str(
+                "\nRestart zsh or run `autoload -Uz compinit && compinit` to load the updated completion.",
+            );
+        } else {
+            let dir_display = target_dir.display().to_string();
+            let quoted_dir = zsh_quote(&dir_display);
+            message.push_str(&format!(
+                "\nEnsure {dir_display} is in $fpath before compinit in ~/.zshrc:\n  fpath=({quoted_dir} $fpath)\n  autoload -Uz compinit && compinit"
+            ));
+        }
+    }
+    Ok(message)
+}
+
+fn write_file_atomic(dir: &Path, path: &Path, contents: &[u8]) -> Result<()> {
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("completion");
+    let mut opened = None;
+    for _ in 0..16 {
+        let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(".{name}.tmp.{pid}.{seq}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("could not write {}", path.display()));
+            }
+        }
+    }
+    let Some((tmp_path, mut file)) = opened else {
+        anyhow::bail!("could not create temporary file in {}", dir.display());
+    };
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| format!("could not write {}", path.display()));
+    }
+    Ok(())
+}
+
+fn zsh_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '-' | '_' | '+' | ':' | '@')
+        })
+    {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 const COMPLETION_TIME: Duration = Duration::from_secs(2);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -639,6 +850,7 @@ enum Completion {
     Flags {
         attach: bool,
         detach_key: bool,
+        completion: bool,
     },
     Windows {
         session: Option<String>,
@@ -657,6 +869,7 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
     match parsed.pending {
         Some(ValueOption::Server) => return Completion::Servers,
         Some(ValueOption::DetachKey) => return Completion::DetachKeys,
+        Some(ValueOption::Dir) => return Completion::Nothing,
         Some(ValueOption::Window) => {
             return Completion::Windows {
                 session: parsed.target.clone(),
@@ -676,8 +889,13 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
         subcommand,
         None | Some(Some(Subcommand::Attach | Subcommand::Pick))
     );
+    let completion = matches!(subcommand, Some(Some(Subcommand::Completion)));
     if current.starts_with('-') {
-        return Completion::Flags { attach, detach_key };
+        return Completion::Flags {
+            attach,
+            detach_key,
+            completion,
+        };
     }
     match subcommand {
         None => Completion::Commands,
@@ -688,17 +906,23 @@ fn completion_context(current: &str, parsed: &Arguments) -> Completion {
         Some(Some(Subcommand::Attach)) => Completion::Flags {
             attach: true,
             detach_key: true,
+            completion: false,
         },
         Some(Some(Subcommand::Pick)) => Completion::Flags {
             attach: false,
             detach_key: true,
+            completion: false,
         },
-        Some(Some(Subcommand::Kill | Subcommand::List | Subcommand::Completion)) => {
-            Completion::Flags {
-                attach: false,
-                detach_key: false,
-            }
-        }
+        Some(Some(Subcommand::Completion)) => Completion::Flags {
+            attach: false,
+            detach_key: false,
+            completion: true,
+        },
+        Some(Some(Subcommand::Kill | Subcommand::List)) => Completion::Flags {
+            attach: false,
+            detach_key: false,
+            completion: false,
+        },
         Some(None) => Completion::Nothing,
     }
 }
@@ -723,7 +947,11 @@ async fn complete(mut args: impl Iterator<Item = String>) {
             .into_iter()
             .map(str::to_owned)
             .collect(),
-        Completion::Flags { attach, detach_key } => flags(attach, detach_key),
+        Completion::Flags {
+            attach,
+            detach_key,
+            completion,
+        } => flags(attach, detach_key, completion),
         context => {
             let server_config =
                 ServerConfig::from_sources(parsed.server, env::var("REX_SERVER").ok());
@@ -769,11 +997,18 @@ fn filter_completion_candidates(candidates: Vec<String>, current: &str) -> Vec<S
         .collect()
 }
 
-fn flags(attach: bool, detach_key: bool) -> Vec<String> {
-    let mut flags: Vec<String> = ["-S", "--server", "-h", "--help", "-V", "--version"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
+fn flags(attach: bool, detach_key: bool, completion: bool) -> Vec<String> {
+    let mut flags: Vec<String> = if completion {
+        ["--install", "--dir", "-h", "--help", "-V", "--version"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        ["-S", "--server", "-h", "--help", "-V", "--version"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    };
     if detach_key {
         flags.extend(["-d", "--detach-key"].map(str::to_owned));
     }
@@ -1041,10 +1276,63 @@ mod tests {
 
         assert_eq!(
             parse_args(args(&["completion", "zsh"]), None).unwrap().1,
-            Command::Completion(Shell::Zsh)
+            Command::Completion {
+                shell: Shell::Zsh,
+                mode: CompletionMode::Print,
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["completion", "bash", "--install"]), None)
+                .unwrap()
+                .1,
+            Command::Completion {
+                shell: Shell::Bash,
+                mode: CompletionMode::Install { dir: None },
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["completion", "--install", "zsh"]), None)
+                .unwrap()
+                .1,
+            Command::Completion {
+                shell: Shell::Zsh,
+                mode: CompletionMode::Install { dir: None },
+            }
+        );
+        assert_eq!(
+            parse_args(
+                args(&["completion", "zsh", "--install", "--dir", "/tmp/zfunc"]),
+                None
+            )
+            .unwrap()
+            .1,
+            Command::Completion {
+                shell: Shell::Zsh,
+                mode: CompletionMode::Install {
+                    dir: Some(PathBuf::from("/tmp/zfunc")),
+                },
+            }
+        );
+        assert_eq!(
+            parse_args(
+                args(&["completion", "--install", "--dir", "/tmp/fish", "fish"]),
+                None
+            )
+            .unwrap()
+            .1,
+            Command::Completion {
+                shell: Shell::Fish,
+                mode: CompletionMode::Install {
+                    dir: Some(PathBuf::from("/tmp/fish")),
+                },
+            }
         );
         assert!(parse_args(args(&["completion", "powershell"]), None).is_err());
         assert!(parse_args(args(&["completion"]), None).is_err());
+        assert!(parse_args(args(&["completion", "--install"]), None).is_err());
+        assert!(parse_args(args(&["completion", "zsh", "--dir", "/tmp/zfunc"]), None).is_err());
+        assert!(parse_args(args(&["completion", "zsh", "--install", "--dir"]), None).is_err());
+        assert!(parse_args(args(&["completion", "zsh", "--install", "--dir", ""]), None).is_err());
     }
 
     #[test]
@@ -1161,28 +1449,32 @@ mod tests {
             completion_context("--w", &args(&["a", "work"])),
             Completion::Flags {
                 attach: true,
-                detach_key: true
+                detach_key: true,
+                completion: false,
             }
         );
         assert_eq!(
             completion_context("--server", &[]),
             Completion::Flags {
                 attach: false,
-                detach_key: true
+                detach_key: true,
+                completion: false,
             }
         );
         assert_eq!(
             completion_context("-", &[]),
             Completion::Flags {
                 attach: false,
-                detach_key: true
+                detach_key: true,
+                completion: false,
             }
         );
         assert_eq!(
             completion_context("-", &args(&["a"])),
             Completion::Flags {
                 attach: true,
-                detach_key: true
+                detach_key: true,
+                completion: false,
             }
         );
         assert_eq!(
@@ -1200,11 +1492,24 @@ mod tests {
             Completion::Shells
         );
         assert_eq!(
+            completion_context("-", &args(&["completion"])),
+            Completion::Flags {
+                attach: false,
+                detach_key: false,
+                completion: true,
+            }
+        );
+        assert_eq!(
             completion_context("", &args(&["completion", "zsh"])),
             Completion::Flags {
                 attach: false,
-                detach_key: false
+                detach_key: false,
+                completion: true,
             }
+        );
+        assert_eq!(
+            completion_context("", &args(&["completion", "zsh", "--install", "--dir"])),
+            Completion::Nothing
         );
         assert_eq!(
             completion_context("", &args(&["--server", "http://example.com"])),
@@ -1235,18 +1540,24 @@ mod tests {
             completion_context("", &args(&["p"])),
             Completion::Flags {
                 attach: false,
-                detach_key: true
+                detach_key: true,
+                completion: false,
             }
         );
         assert_eq!(
             completion_context("", &args(&["pick"])),
             Completion::Flags {
                 attach: false,
-                detach_key: true
+                detach_key: true,
+                completion: false,
             }
         );
         assert!(Subcommand::COMPLETION_NAMES.contains(&"p"));
         assert!(Subcommand::COMPLETION_NAMES.contains(&"pick"));
+        assert!(flags(false, false, true).contains(&"--install".to_owned()));
+        assert!(flags(false, false, true).contains(&"--dir".to_owned()));
+        assert!(!flags(false, false, false).contains(&"--install".to_owned()));
+        assert!(!flags(false, false, false).contains(&"--dir".to_owned()));
     }
 
     #[test]
@@ -1491,9 +1802,30 @@ mod tests {
             args(&["ls", "-w", "1"]),
             args(&["ls", "--block", "1"]),
             args(&["ls", "-b", "1"]),
+            args(&["ls", "--install"]),
+            args(&["ls", "--dir", "/tmp"]),
         ] {
             let err = parse_args(bad_ls, None).unwrap_err();
             assert_eq!(err.to_string(), "usage: zrex [--server SERVER] ls");
+        }
+
+        for bad_pick in [args(&["pick", "--install"]), args(&["p", "--dir", "/tmp"])] {
+            let err = parse_args(bad_pick, None).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "usage: zrex [--server SERVER] [--detach-key KEY] p|pick"
+            );
+        }
+
+        for bad_attach in [
+            args(&["a", "work", "--install"]),
+            args(&["attach", "--dir", "/tmp"]),
+        ] {
+            let err = parse_args(bad_attach, None).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "usage: zrex [--server SERVER] [--detach-key KEY] a|attach [SESSION] [--window SELECTOR] [--block SELECTOR]"
+            );
         }
 
         for bad_kill in [
@@ -1502,6 +1834,8 @@ mod tests {
             args(&["kill", "work", "--block", "1"]),
             args(&["kill", "work", "-b", "1"]),
             args(&["kill", "--window", "1"]),
+            args(&["kill", "work", "--install"]),
+            args(&["kill", "work", "--dir", "/tmp"]),
         ] {
             let err = parse_args(bad_kill, None).unwrap_err();
             assert_eq!(
@@ -1516,9 +1850,14 @@ mod tests {
             args(&["completion", "bash", "--block", "1"]),
             args(&["completion", "fish", "-b", "1"]),
             args(&["completion", "--window", "1"]),
+            args(&["completion", "zsh", "--dir", "/tmp/zfunc"]),
+            args(&["completion", "--dir", "/tmp/zfunc"]),
         ] {
             let err = parse_args(bad_completion, None).unwrap_err();
-            assert_eq!(err.to_string(), "usage: zrex completion zsh|bash|fish");
+            assert_eq!(
+                err.to_string(),
+                "usage: zrex completion zsh|bash|fish [--install [--dir DIR]]"
+            );
         }
     }
 
@@ -1673,5 +2012,239 @@ mod tests {
             ),
             vec!["alpha [31m"]
         );
+    }
+
+    #[test]
+    fn embedded_completion_scripts_are_non_empty_and_use_complete_backend() {
+        for name in Shell::NAMES {
+            let shell = Shell::parse(name).unwrap_or_else(|| panic!("unknown shell {name}"));
+            let script = shell.script();
+            assert!(!script.trim().is_empty(), "{name} script must not be empty");
+            assert!(
+                script.contains("__complete"),
+                "{name} script must call `__complete`"
+            );
+            match shell {
+                Shell::Zsh => {
+                    assert!(script.starts_with("#compdef zrex\n"));
+                    assert!(script.contains("funcstack[1]"));
+                    assert!(script.contains("compdef _zrex zrex"));
+                }
+                Shell::Bash => {
+                    assert!(script.contains("_zrex_complete()"));
+                    assert!(script.contains("complete -F _zrex_complete zrex"));
+                }
+                Shell::Fish => {
+                    assert!(script.contains("function __zrex_complete"));
+                    assert!(script.contains("complete -c zrex"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completion_names_stay_in_sync_with_parsers() {
+        let mut seen_subcommands = HashSet::new();
+        let mut covered_variants = Vec::new();
+        for name in Subcommand::COMPLETION_NAMES {
+            assert!(
+                seen_subcommands.insert(name),
+                "duplicate subcommand completion name `{name}`"
+            );
+            let parsed = Subcommand::parse(name)
+                .unwrap_or_else(|| panic!("COMPLETION_NAMES entry `{name}` does not parse"));
+            covered_variants.push(parsed);
+        }
+        // Exhaustively verify every Subcommand variant appears in COMPLETION_NAMES.
+        for variant in [
+            Subcommand::List,
+            Subcommand::Pick,
+            Subcommand::Attach,
+            Subcommand::Kill,
+            Subcommand::Completion,
+        ] {
+            match variant {
+                Subcommand::List
+                | Subcommand::Pick
+                | Subcommand::Attach
+                | Subcommand::Kill
+                | Subcommand::Completion => {
+                    assert!(
+                        covered_variants.contains(&variant),
+                        "Subcommand::{variant:?} missing from COMPLETION_NAMES"
+                    );
+                }
+            }
+        }
+
+        let mut seen_shells = HashSet::new();
+        let mut covered_shells = Vec::new();
+        for name in Shell::NAMES {
+            assert!(seen_shells.insert(name), "duplicate shell name `{name}`");
+            let parsed = Shell::parse(name)
+                .unwrap_or_else(|| panic!("Shell::NAMES entry `{name}` does not parse"));
+            covered_shells.push(parsed);
+        }
+        for variant in [Shell::Zsh, Shell::Bash, Shell::Fish] {
+            match variant {
+                Shell::Zsh | Shell::Bash | Shell::Fish => {
+                    assert!(
+                        covered_shells.contains(&variant),
+                        "Shell::{variant:?} missing from Shell::NAMES"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completion_install_resolves_xdg_and_home_paths() {
+        let home_only = InstallEnv {
+            xdg_config_home: None,
+            xdg_data_home: None,
+            home_dir: Some(PathBuf::from("/home/alice")),
+            fpath: None,
+        };
+        assert_eq!(
+            Shell::Bash.default_install_dir(&home_only).unwrap(),
+            PathBuf::from("/home/alice/.local/share/bash-completion/completions")
+        );
+        assert_eq!(
+            Shell::Fish.default_install_dir(&home_only).unwrap(),
+            PathBuf::from("/home/alice/.config/fish/completions")
+        );
+        assert_eq!(
+            Shell::Zsh.default_install_dir(&home_only).unwrap(),
+            PathBuf::from("/home/alice/.local/share/zsh/site-functions")
+        );
+
+        let with_xdg = InstallEnv {
+            xdg_config_home: Some(OsString::from("/xdg/config")),
+            xdg_data_home: Some(OsString::from("/xdg/data")),
+            home_dir: Some(PathBuf::from("/home/alice")),
+            fpath: None,
+        };
+        assert_eq!(
+            Shell::Bash.default_install_dir(&with_xdg).unwrap(),
+            PathBuf::from("/xdg/data/bash-completion/completions")
+        );
+        assert_eq!(
+            Shell::Fish.default_install_dir(&with_xdg).unwrap(),
+            PathBuf::from("/xdg/config/fish/completions")
+        );
+        assert_eq!(
+            Shell::Zsh.default_install_dir(&with_xdg).unwrap(),
+            PathBuf::from("/xdg/data/zsh/site-functions")
+        );
+
+        // Relative XDG vars are ignored per XDG Base Directory Specification.
+        let relative_xdg = InstallEnv {
+            xdg_config_home: Some(OsString::from("relative/config")),
+            xdg_data_home: Some(OsString::from("relative/data")),
+            home_dir: Some(PathBuf::from("/home/alice")),
+            fpath: None,
+        };
+        assert_eq!(
+            Shell::Bash.default_install_dir(&relative_xdg).unwrap(),
+            PathBuf::from("/home/alice/.local/share/bash-completion/completions")
+        );
+        assert_eq!(
+            Shell::Fish.default_install_dir(&relative_xdg).unwrap(),
+            PathBuf::from("/home/alice/.config/fish/completions")
+        );
+
+        let missing = InstallEnv {
+            xdg_config_home: None,
+            xdg_data_home: None,
+            home_dir: None,
+            fpath: None,
+        };
+        for shell in [Shell::Zsh, Shell::Bash, Shell::Fish] {
+            let err = shell.default_install_dir(&missing).unwrap_err();
+            assert!(err.to_string().contains("--dir"));
+        }
+    }
+
+    #[test]
+    fn install_completion_writes_files_and_prints_zsh_hints() {
+        static NEXT_DIR_ID: AtomicU64 = AtomicU64::new(0);
+        let root = env::temp_dir().join(format!(
+            "zrex-completion-test-{}-{}",
+            std::process::id(),
+            NEXT_DIR_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let install_env = InstallEnv {
+            xdg_config_home: Some(root.join("cfg").into_os_string()),
+            xdg_data_home: Some(root.join("data").into_os_string()),
+            home_dir: Some(root.join("home")),
+            fpath: None,
+        };
+
+        // Bash default install.
+        let bash_msg = install_completion(Shell::Bash, None, &install_env).unwrap();
+        let bash_path = root.join("data/bash-completion/completions/zrex");
+        assert_eq!(bash_msg, format!("installed {}", bash_path.display()));
+        assert_eq!(
+            fs::read_to_string(&bash_path).unwrap(),
+            Shell::Bash.script()
+        );
+
+        // Fish default install.
+        let fish_msg = install_completion(Shell::Fish, None, &install_env).unwrap();
+        let fish_path = root.join("cfg/fish/completions/zrex.fish");
+        assert_eq!(fish_msg, format!("installed {}", fish_path.display()));
+        assert_eq!(
+            fs::read_to_string(&fish_path).unwrap(),
+            Shell::Fish.script()
+        );
+
+        // Zsh default install without FPATH prints fpath + compinit hint.
+        let zsh_msg = install_completion(Shell::Zsh, None, &install_env).unwrap();
+        let zsh_dir = root.join("data/zsh/site-functions");
+        let zsh_path = zsh_dir.join("_zrex");
+        assert!(zsh_msg.starts_with(&format!("installed {}", zsh_path.display())));
+        assert!(zsh_msg.contains("fpath=("));
+        assert!(zsh_msg.contains("autoload -Uz compinit && compinit"));
+        assert_eq!(fs::read_to_string(&zsh_path).unwrap(), Shell::Zsh.script());
+
+        // Zsh install into a directory already on FPATH prints the shorter reload hint.
+        let custom_dir = root.join("custom dir/o'neil");
+        let zsh_with_fpath = InstallEnv {
+            xdg_config_home: None,
+            xdg_data_home: None,
+            home_dir: None,
+            fpath: Some(custom_dir.clone().into_os_string()),
+        };
+        let fpath_msg = install_completion(Shell::Zsh, Some(&custom_dir), &zsh_with_fpath).unwrap();
+        assert!(fpath_msg.contains("Restart zsh or run `autoload -Uz compinit && compinit`"));
+        assert!(!fpath_msg.contains("fpath=("));
+        assert_eq!(
+            fs::read_to_string(custom_dir.join("_zrex")).unwrap(),
+            Shell::Zsh.script()
+        );
+
+        // Zsh install into a spaced/quoted directory not on FPATH quotes the path in fpath=(...).
+        let quoted_msg = install_completion(Shell::Zsh, Some(&custom_dir), &install_env).unwrap();
+        let expected_quoted = zsh_quote(&custom_dir.display().to_string());
+        assert!(expected_quoted.starts_with('\''));
+        assert!(expected_quoted.contains("o'\\''neil"));
+        assert!(quoted_msg.contains(&format!("fpath=({expected_quoted} $fpath)")));
+
+        // Overwriting an existing file replaces it cleanly with no leftover temp files.
+        fs::write(&bash_path, "stale").unwrap();
+        install_completion(Shell::Bash, None, &install_env).unwrap();
+        assert_eq!(
+            fs::read_to_string(&bash_path).unwrap(),
+            Shell::Bash.script()
+        );
+        let entries: Vec<_> = fs::read_dir(bash_path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![OsString::from("zrex")]);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

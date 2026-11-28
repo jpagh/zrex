@@ -113,6 +113,20 @@ source <(zrex completion bash)
 zrex completion fish | source
 ```
 
+You can also install the completion file directly with `--install` (or `--install --dir DIR` to choose a target directory):
+
+```sh
+# Installs to ~/.local/share/bash-completion/completions/zrex (or $XDG_DATA_HOME)
+zrex completion bash --install
+
+# Installs to ~/.config/fish/completions/zrex.fish (or $XDG_CONFIG_HOME)
+zrex completion fish --install
+
+# Installs to ~/.local/share/zsh/site-functions/_zrex (or $XDG_DATA_HOME);
+# prints the fpath + compinit snippet if that directory is not already in $fpath.
+zrex completion zsh --install
+```
+
 ## Controls While Attached
 
 | Input | Action |
